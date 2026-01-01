@@ -2,6 +2,14 @@
 
 Small persoanl toolbox. The name means nothing - just designed to be easy to type and not clash with other tools.
 
+## Commands TLDR
+
+```sh
+kd yt thumb resize image.png
+kd gh repo apply-preferred-settings scode/foo
+kd gh repo apply-preferred-settings --all
+```
+
 ## Logging
 
 Default log level is INFO.
