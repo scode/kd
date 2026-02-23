@@ -57,10 +57,10 @@ pub fn run(args: ApplyPreferredSettingsArgs) -> anyhow::Result<()> {
     let sh = Shell::new()?;
 
     if args.all {
-        run_all(&sh, args.force)
+        run_all(&sh, args.force, args.dry_run, args.yes)
     } else {
         let repo = args.repo.expect("repo required when --all not specified");
-        check_and_apply(&sh, &repo, args.force, false)
+        check_and_apply(&sh, &repo, args.force, false, args.dry_run, args.yes)
     }
 }
 
@@ -69,7 +69,14 @@ fn get_settings(sh: &Shell, repo: &str) -> anyhow::Result<RepoSettings> {
     Ok(serde_json::from_str(&output)?)
 }
 
-fn check_and_apply(sh: &Shell, repo: &str, force: bool, prompt: bool) -> anyhow::Result<()> {
+fn check_and_apply(
+    sh: &Shell,
+    repo: &str,
+    force: bool,
+    prompt: bool,
+    dry_run: bool,
+    yes: bool,
+) -> anyhow::Result<()> {
     let settings = get_settings(sh, repo)?;
     let deltas = settings.deltas();
 
@@ -85,7 +92,19 @@ fn check_and_apply(sh: &Shell, repo: &str, force: bool, prompt: bool) -> anyhow:
         }
     }
 
-    if prompt && !confirm(&format!("Apply settings to {}?", repo))? {
+    if dry_run {
+        if deltas.is_empty() {
+            info!(
+                "Dry run: {} already matches preferred settings; no changes would be applied",
+                repo
+            );
+        } else {
+            info!("Dry run: would apply settings to {}", repo);
+        }
+        return Ok(());
+    }
+
+    if should_prompt(prompt, yes, dry_run) && !confirm(&format!("Apply settings to {}?", repo))? {
         info!("Skipping {}", repo);
         return Ok(());
     }
@@ -93,7 +112,7 @@ fn check_and_apply(sh: &Shell, repo: &str, force: bool, prompt: bool) -> anyhow:
     apply_settings(sh, repo)
 }
 
-fn run_all(sh: &Shell, force: bool) -> anyhow::Result<()> {
+fn run_all(sh: &Shell, force: bool, dry_run: bool, yes: bool) -> anyhow::Result<()> {
     info!("Fetching repository list...");
     let output = cmd!(
         sh,
@@ -110,10 +129,14 @@ fn run_all(sh: &Shell, force: bool) -> anyhow::Result<()> {
     info!("Found {} eligible repositories", eligible.len());
 
     for repo in eligible {
-        check_and_apply(sh, &repo.name_with_owner, force, true)?;
+        check_and_apply(sh, &repo.name_with_owner, force, true, dry_run, yes)?;
     }
 
     Ok(())
+}
+
+fn should_prompt(prompt: bool, yes: bool, dry_run: bool) -> bool {
+    prompt && !yes && !dry_run
 }
 
 // NOTE: If you change the settings below, update RepoSettings::deltas() to match!
@@ -147,7 +170,7 @@ fn confirm(prompt: &str) -> anyhow::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::RepoSettings;
+    use super::{RepoSettings, should_prompt};
 
     fn preferred_settings() -> RepoSettings {
         RepoSettings {
@@ -175,5 +198,20 @@ mod tests {
             settings.deltas(),
             vec!["delete_branch_on_merge: false -> true".to_string()]
         );
+    }
+
+    #[test]
+    fn should_prompt_for_all_repos_by_default() {
+        assert!(should_prompt(true, false, false));
+    }
+
+    #[test]
+    fn should_not_prompt_when_yes_is_set() {
+        assert!(!should_prompt(true, true, false));
+    }
+
+    #[test]
+    fn should_not_prompt_for_dry_run() {
+        assert!(!should_prompt(true, false, true));
     }
 }
