@@ -15,6 +15,14 @@ pub struct ApplyPreferredSettingsArgs {
     /// Force update even if settings already match
     #[arg(short, long)]
     pub force: bool,
+
+    /// Show settings changes without applying them
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Skip confirmation prompts (useful with --all)
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Subcommand)]
