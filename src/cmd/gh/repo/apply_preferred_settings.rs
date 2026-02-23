@@ -19,6 +19,7 @@ struct RepoSettings {
     squash_merge_commit_title: String,
     squash_merge_commit_message: String,
     allow_rebase_merge: bool,
+    delete_branch_on_merge: bool,
 }
 
 impl RepoSettings {
@@ -44,6 +45,9 @@ impl RepoSettings {
         }
         if self.allow_rebase_merge {
             deltas.push("allow_rebase_merge: true -> false".to_string());
+        }
+        if !self.delete_branch_on_merge {
+            deltas.push("delete_branch_on_merge: false -> true".to_string());
         }
         deltas
     }
@@ -122,7 +126,8 @@ fn apply_settings(sh: &Shell, repo: &str) -> anyhow::Result<()> {
             -f allow_squash_merge=true
             -f squash_merge_commit_title=PR_TITLE
             -f squash_merge_commit_message=PR_BODY
-            -f allow_rebase_merge=false"
+            -f allow_rebase_merge=false
+            -f delete_branch_on_merge=true"
     )
     .ignore_stdout()
     .run()?;
@@ -138,4 +143,37 @@ fn confirm(prompt: &str) -> anyhow::Result<bool> {
     io::stdin().read_line(&mut input)?;
 
     Ok(matches!(input.trim().to_lowercase().as_str(), "y" | "yes"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RepoSettings;
+
+    fn preferred_settings() -> RepoSettings {
+        RepoSettings {
+            allow_merge_commit: false,
+            allow_squash_merge: true,
+            squash_merge_commit_title: "PR_TITLE".to_string(),
+            squash_merge_commit_message: "PR_BODY".to_string(),
+            allow_rebase_merge: false,
+            delete_branch_on_merge: true,
+        }
+    }
+
+    #[test]
+    fn deltas_is_empty_when_repo_matches_preferred_settings() {
+        let settings = preferred_settings();
+        assert!(settings.deltas().is_empty());
+    }
+
+    #[test]
+    fn deltas_reports_delete_branch_on_merge_when_disabled() {
+        let mut settings = preferred_settings();
+        settings.delete_branch_on_merge = false;
+
+        assert_eq!(
+            settings.deltas(),
+            vec!["delete_branch_on_merge: false -> true".to_string()]
+        );
+    }
 }
