@@ -1,3 +1,6 @@
+//! GitHub operations — repo configuration, branch protection, etc.
+//! All commands shell out to the `gh` CLI and require it to be authenticated.
+
 pub mod repo;
 
 use clap::Subcommand;

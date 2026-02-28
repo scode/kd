@@ -1,9 +1,18 @@
+//! Iteratively scale an image down until it fits under YouTube's 2 MB
+//! thumbnail upload limit. Uses ImageMagick (`magick`) for the actual
+//! resizing so we get high-quality output across all image formats.
+
 use std::path::PathBuf;
 use tracing::{debug, info};
 use xshell::{Shell, cmd};
 
-const MAX_SIZE: u64 = 2 * 1024 * 1024; // 2 MB
+/// YouTube's maximum thumbnail file size.
+const MAX_SIZE: u64 = 2 * 1024 * 1024;
 
+/// Scale the image down in 3% decrements (from 100%) until it fits
+/// under `MAX_SIZE`, then replace the original file. The step size is
+/// a trade-off: small enough to land close to the limit without
+/// unnecessary quality loss, large enough to converge quickly.
 pub fn run(file: &PathBuf) -> anyhow::Result<()> {
     if !file.exists() {
         anyhow::bail!("File does not exist: {}", file.display());
@@ -21,6 +30,8 @@ pub fn run(file: &PathBuf) -> anyhow::Result<()> {
     }
 
     let sh = Shell::new()?;
+    // Write to a temp file so we don't clobber the original until we
+    // know we have a good result.
     let temp_file = file.with_extension("tmp.resized");
 
     let file_str = file

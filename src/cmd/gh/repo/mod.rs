@@ -1,3 +1,6 @@
+//! Repository-level GitHub commands. Shared helpers for repo resolution
+//! live here; individual commands are in submodules.
+
 pub mod apply_preferred_settings;
 pub mod main_protect;
 
@@ -50,6 +53,9 @@ pub enum Commands {
     MainProtect(MainProtectArgs),
 }
 
+/// Determine the `owner/repo` to operate on. If the user passed one
+/// explicitly, use it; otherwise auto-detect by parsing the `origin`
+/// remote URL from the git config in `dir`.
 pub fn resolve_repo(repo_arg: Option<&str>, dir: &Path) -> anyhow::Result<String> {
     match repo_arg {
         Some(r) => Ok(r.to_string()),
@@ -69,6 +75,9 @@ pub fn resolve_repo(repo_arg: Option<&str>, dir: &Path) -> anyhow::Result<String
     }
 }
 
+/// Extract the `url` value from the `[remote "origin"]` section of a
+/// `.git/config` file. We do minimal INI-style parsing rather than
+/// shelling out to `git config` so this works without a git binary.
 fn parse_origin_url(config: &str) -> anyhow::Result<String> {
     let mut in_origin = false;
     for line in config.lines() {
@@ -84,8 +93,9 @@ fn parse_origin_url(config: &str) -> anyhow::Result<String> {
     bail!("no origin remote found in git config");
 }
 
+/// Turn a GitHub remote URL into `owner/repo`. Supports SSH, HTTPS,
+/// and `ssh://` URL forms, with or without a `.git` suffix.
 fn parse_github_remote(url: &str) -> anyhow::Result<String> {
-    // git@github.com:owner/repo.git or https://github.com/owner/repo.git
     let path = url
         .strip_prefix("git@github.com:")
         .or_else(|| url.strip_prefix("https://github.com/"))

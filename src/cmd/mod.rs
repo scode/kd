@@ -1,3 +1,5 @@
+//! Top-level command dispatch. Each submodule owns a domain of functionality.
+
 pub mod gh;
 pub mod yt;
 
