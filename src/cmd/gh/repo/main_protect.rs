@@ -1,4 +1,4 @@
-use super::MainProtectArgs;
+use super::{MainProtectArgs, resolve_repo};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -108,21 +108,6 @@ fn rules_with_checks(checks: &[StatusCheckParam]) -> Vec<RulePayload> {
         rules.push(make_status_checks_rule(checks));
     }
     rules
-}
-
-fn resolve_repo(sh: &Shell, repo_arg: Option<&str>) -> anyhow::Result<String> {
-    match repo_arg {
-        Some(r) => Ok(r.to_string()),
-        None => {
-            let output = cmd!(sh, "gh repo view --json nameWithOwner -q .nameWithOwner").read()?;
-            let repo = output.trim().to_string();
-            if repo.is_empty() {
-                bail!("could not detect repository from current directory");
-            }
-            info!("Detected repository: {}", repo);
-            Ok(repo)
-        }
-    }
 }
 
 fn find_ruleset(sh: &Shell, repo: &str) -> anyhow::Result<Option<u64>> {
@@ -298,7 +283,7 @@ fn prompt_for_checks(
 
 pub fn run(args: MainProtectArgs) -> anyhow::Result<()> {
     let sh = Shell::new()?;
-    let repo = resolve_repo(&sh, args.repo.as_deref())?;
+    let repo = resolve_repo(args.repo.as_deref(), &std::env::current_dir()?)?;
 
     let ruleset_id = match find_ruleset(&sh, &repo)? {
         Some(id) => {
