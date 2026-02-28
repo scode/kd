@@ -1,4 +1,4 @@
-use super::ApplyPreferredSettingsArgs;
+use super::{ApplyPreferredSettingsArgs, resolve_repo};
 use serde::Deserialize;
 use std::io::{self, Write};
 use tracing::info;
@@ -59,7 +59,7 @@ pub fn run(args: ApplyPreferredSettingsArgs) -> anyhow::Result<()> {
     if args.all {
         run_all(&sh, args.force, args.dry_run, args.yes)
     } else {
-        let repo = args.repo.expect("repo required when --all not specified");
+        let repo = resolve_repo(args.repo.as_deref(), &std::env::current_dir()?)?;
         check_and_apply(&sh, &repo, args.force, false, args.dry_run, args.yes)
     }
 }
