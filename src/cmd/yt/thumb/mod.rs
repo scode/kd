@@ -1,3 +1,6 @@
+//! YouTube thumbnail operations. Thumbnails have a 2 MB upload limit,
+//! so the main operation here is resizing images to fit.
+
 pub mod resize;
 
 use clap::Subcommand;

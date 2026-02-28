@@ -1,3 +1,11 @@
+//! Create or update a GitHub repository ruleset that protects the default
+//! branch. The ruleset enforces linear history (no merge commits), blocks
+//! force-pushes, and optionally requires selected CI status checks to pass
+//! before merging.
+//!
+//! Uses the GitHub Rulesets API (not the older Branch Protection API) because
+//! rulesets are more flexible and can apply to `~DEFAULT_BRANCH` symbolically.
+
 use super::{MainProtectArgs, resolve_repo};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
@@ -6,18 +14,25 @@ use std::io::{self, Write};
 use tracing::info;
 use xshell::{Shell, cmd};
 
+// ── GitHub Rulesets API types ──────────────────────────────────────────
+
+/// Abbreviated ruleset listing used to find our ruleset by name.
 #[derive(Deserialize)]
 struct RulesetSummary {
     id: u64,
     name: String,
 }
 
+/// Full ruleset detail, needed to inspect the current enforcement state
+/// and which rules are already configured.
 #[derive(Deserialize)]
 struct RulesetDetail {
     enforcement: String,
     rules: Vec<RuleRaw>,
 }
 
+/// A single rule within a ruleset. The `parameters` value is rule-type
+/// specific, so we keep it as raw JSON.
 #[derive(Deserialize, Clone)]
 struct RuleRaw {
     #[serde(rename = "type")]
@@ -25,11 +40,15 @@ struct RuleRaw {
     parameters: Option<Value>,
 }
 
+/// Typed view of the parameters for a `required_status_checks` rule.
 #[derive(Deserialize)]
 struct StatusCheckParameters {
     required_status_checks: Vec<StatusCheckParam>,
 }
 
+/// A single required status check entry. `integration_id` is the GitHub
+/// App that owns the check; we omit it when creating checks via the CLI
+/// since GitHub fills it in automatically.
 #[derive(Deserialize, Serialize, Clone)]
 struct StatusCheckParam {
     context: String,
@@ -37,10 +56,14 @@ struct StatusCheckParam {
     integration_id: Option<i64>,
 }
 
+/// Subset of the check-runs API response, used to discover available
+/// CI check names for the interactive picker.
 #[derive(Deserialize)]
 struct CheckRun {
     name: String,
 }
+
+// ── Request payloads ──────────────────────────────────────────────────
 
 #[derive(Serialize)]
 struct CreateRulesetPayload {
@@ -68,6 +91,8 @@ struct RulePayload {
 
 const RULESET_NAME: &str = "main-protect";
 
+/// The ruleset applies to the repo's default branch (usually `main`).
+/// `~DEFAULT_BRANCH` is a GitHub symbolic ref that tracks renames.
 fn conditions() -> Value {
     serde_json::json!({
         "ref_name": {
@@ -77,6 +102,7 @@ fn conditions() -> Value {
     })
 }
 
+/// Build a `required_status_checks` rule payload from the selected checks.
 fn make_status_checks_rule(checks: &[StatusCheckParam]) -> RulePayload {
     RulePayload {
         rule_type: "required_status_checks".to_string(),
@@ -87,6 +113,8 @@ fn make_status_checks_rule(checks: &[StatusCheckParam]) -> RulePayload {
     }
 }
 
+/// The non-negotiable rules every protected branch gets: linear history
+/// (forces squash/rebase merges) and no force-pushes.
 fn base_rules() -> Vec<RulePayload> {
     vec![
         RulePayload {
@@ -100,6 +128,7 @@ fn base_rules() -> Vec<RulePayload> {
     ]
 }
 
+/// Combine base rules with optional status checks into a full rule set.
 fn rules_with_checks(checks: &[StatusCheckParam]) -> Vec<RulePayload> {
     let mut rules = base_rules();
     // GitHub rejects required_status_checks with an empty checks list (HTTP 422),
@@ -110,6 +139,7 @@ fn rules_with_checks(checks: &[StatusCheckParam]) -> Vec<RulePayload> {
     rules
 }
 
+/// Look up our ruleset by name; returns its ID if it already exists.
 fn find_ruleset(sh: &Shell, repo: &str) -> anyhow::Result<Option<u64>> {
     let output = cmd!(sh, "gh api repos/{repo}/rulesets").read()?;
     let rulesets: Vec<RulesetSummary> = serde_json::from_str(&output)?;
@@ -119,12 +149,15 @@ fn find_ruleset(sh: &Shell, repo: &str) -> anyhow::Result<Option<u64>> {
         .map(|r| r.id))
 }
 
+/// Fetch the full detail of a ruleset so we can inspect its current state.
 fn get_ruleset(sh: &Shell, repo: &str, id: u64) -> anyhow::Result<RulesetDetail> {
     let id_str = id.to_string();
     let output = cmd!(sh, "gh api repos/{repo}/rulesets/{id_str}").read()?;
     Ok(serde_json::from_str(&output)?)
 }
 
+/// Create a new ruleset with the base rules (no status checks yet).
+/// Returns the newly created ruleset's ID.
 fn create_ruleset(sh: &Shell, repo: &str) -> anyhow::Result<u64> {
     let payload = CreateRulesetPayload {
         name: RULESET_NAME.to_string(),
@@ -141,6 +174,8 @@ fn create_ruleset(sh: &Shell, repo: &str) -> anyhow::Result<u64> {
     Ok(created.id)
 }
 
+/// Overwrite the ruleset with the full set of rules (base + checks).
+/// This is a PUT, so it replaces everything — we always include all rules.
 fn update_ruleset(
     sh: &Shell,
     repo: &str,
@@ -161,16 +196,21 @@ fn update_ruleset(
     Ok(())
 }
 
+/// Check whether a specific rule type is present in the ruleset.
 fn has_rule(detail: &RulesetDetail, rule_type: &str) -> bool {
     detail.rules.iter().any(|r| r.rule_type == rule_type)
 }
 
+/// Determine whether the existing ruleset is missing any of the base
+/// protections and needs to be updated to bring it into compliance.
 fn needs_fix(detail: &RulesetDetail) -> bool {
     detail.enforcement != "active"
         || !has_rule(detail, "required_linear_history")
         || !has_rule(detail, "non_fast_forward")
 }
 
+/// Pull out the currently-configured required status checks from an
+/// existing ruleset, so we can preserve them across updates.
 fn extract_current_checks(detail: &RulesetDetail) -> Vec<StatusCheckParam> {
     for rule in &detail.rules {
         if rule.rule_type == "required_status_checks"
@@ -183,11 +223,13 @@ fn extract_current_checks(detail: &RulesetDetail) -> Vec<StatusCheckParam> {
     Vec::new()
 }
 
+/// Ask GitHub for the repo's default branch name (usually `main`).
 fn get_default_branch(sh: &Shell, repo: &str) -> anyhow::Result<String> {
     let output = cmd!(sh, "gh api repos/{repo} --jq .default_branch").read()?;
     Ok(output.trim().to_string())
 }
 
+/// List the CI check names that ran against a specific commit/ref.
 fn get_check_names_for_ref(sh: &Shell, repo: &str, git_ref: &str) -> anyhow::Result<Vec<String>> {
     let output = cmd!(
         sh,
@@ -198,6 +240,8 @@ fn get_check_names_for_ref(sh: &Shell, repo: &str, git_ref: &str) -> anyhow::Res
     Ok(check_runs.into_iter().map(|c| c.name).collect())
 }
 
+/// Find the head commit SHA of the most recently merged PR, if any.
+/// Used to discover PR-only checks that don't run on the default branch.
 fn get_latest_merged_pr_sha(sh: &Shell, repo: &str) -> anyhow::Result<Option<String>> {
     let output = cmd!(
         sh,
@@ -227,6 +271,10 @@ fn get_check_names(sh: &Shell, repo: &str, branch: &str) -> anyhow::Result<Vec<S
     Ok(names)
 }
 
+/// Present an interactive menu of available CI checks. The user can
+/// add/remove individual checks by number, select `all`/`none`, or
+/// press Enter to leave things unchanged. Returns `None` if the user
+/// chose to skip (empty input).
 fn prompt_for_checks(
     available: &[String],
     current_blocking: &[StatusCheckParam],

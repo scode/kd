@@ -1,9 +1,17 @@
+//! Enforce a consistent set of merge/branch settings across GitHub repos.
+//!
+//! The "preferred" configuration is squash-merge-only using the PR title and
+//! body, merge commits and rebase disabled, and head branches auto-deleted
+//! after merge. These choices keep the commit history linear and tidy while
+//! preserving PR context in each squashed commit message.
+
 use super::{ApplyPreferredSettingsArgs, resolve_repo};
 use serde::Deserialize;
 use std::io::{self, Write};
 use tracing::info;
 use xshell::{Shell, cmd};
 
+/// Subset of `gh repo list --json` output used to filter repos for batch mode.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RepoListEntry {
@@ -12,6 +20,7 @@ struct RepoListEntry {
     is_archived: bool,
 }
 
+/// The merge/branch settings we care about, as returned by `gh api repos/{repo}`.
 #[derive(Deserialize)]
 struct RepoSettings {
     allow_merge_commit: bool,
@@ -23,6 +32,9 @@ struct RepoSettings {
 }
 
 impl RepoSettings {
+    /// Compare the current settings against the preferred values and return
+    /// human-readable descriptions of each difference. An empty result means
+    /// the repo already matches.
     fn deltas(&self) -> Vec<String> {
         let mut deltas = Vec::new();
         if self.allow_merge_commit {
@@ -64,11 +76,15 @@ pub fn run(args: ApplyPreferredSettingsArgs) -> anyhow::Result<()> {
     }
 }
 
+/// Fetch the repo's current merge/branch settings from the GitHub API.
 fn get_settings(sh: &Shell, repo: &str) -> anyhow::Result<RepoSettings> {
     let output = cmd!(sh, "gh api repos/{repo}").read()?;
     Ok(serde_json::from_str(&output)?)
 }
 
+/// Check whether a single repo needs updating and, if so, apply the
+/// preferred settings. When `prompt` is true (batch mode), the user is
+/// asked for confirmation per-repo unless `--yes` or `--dry-run` are set.
 fn check_and_apply(
     sh: &Shell,
     repo: &str,
@@ -112,6 +128,8 @@ fn check_and_apply(
     apply_settings(sh, repo)
 }
 
+/// Apply preferred settings across every repo the authenticated user owns,
+/// skipping forks (not ours to configure) and archived repos (read-only).
 fn run_all(sh: &Shell, force: bool, dry_run: bool, yes: bool) -> anyhow::Result<()> {
     info!("Fetching repository list...");
     let output = cmd!(
@@ -135,10 +153,13 @@ fn run_all(sh: &Shell, force: bool, dry_run: bool, yes: bool) -> anyhow::Result<
     Ok(())
 }
 
+/// Only prompt interactively when in batch mode (`prompt`), and the user
+/// hasn't opted out of prompts (`--yes`) or actual changes (`--dry-run`).
 fn should_prompt(prompt: bool, yes: bool, dry_run: bool) -> bool {
     prompt && !yes && !dry_run
 }
 
+/// Push the preferred settings to the repo via `gh api`.
 // NOTE: If you change the settings below, update RepoSettings::deltas() to match!
 fn apply_settings(sh: &Shell, repo: &str) -> anyhow::Result<()> {
     info!("Configuring {}...", repo);

@@ -1,3 +1,5 @@
+//! YouTube-related utilities (thumbnail processing, etc.).
+
 pub mod thumb;
 
 use clap::Subcommand;

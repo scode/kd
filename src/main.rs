@@ -1,3 +1,6 @@
+//! `kd` — a small personal CLI toolbox for GitHub repo management
+//! and YouTube thumbnail operations.
+
 mod cmd;
 
 use clap::{ArgAction, Parser};
@@ -22,6 +25,8 @@ struct Cli {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // Map the -v/-q flag counts to a tracing level. The two flags
+    // are mutually exclusive; using both is an error.
     let level = match (cli.verbose, cli.quiet) {
         (0, 0) => LevelFilter::INFO,
         (1, 0) => LevelFilter::DEBUG,
@@ -32,6 +37,7 @@ fn main() -> anyhow::Result<()> {
         _ => anyhow::bail!("Cannot use both --verbose and --quiet"),
     };
 
+    // Log to stderr so stdout remains clean for machine-readable output.
     tracing_subscriber::fmt()
         .with_max_level(level)
         .with_writer(std::io::stderr)
