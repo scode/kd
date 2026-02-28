@@ -188,14 +188,40 @@ fn get_default_branch(sh: &Shell, repo: &str) -> anyhow::Result<String> {
     Ok(output.trim().to_string())
 }
 
-fn get_check_names(sh: &Shell, repo: &str, branch: &str) -> anyhow::Result<Vec<String>> {
+fn get_check_names_for_ref(sh: &Shell, repo: &str, git_ref: &str) -> anyhow::Result<Vec<String>> {
     let output = cmd!(
         sh,
-        "gh api repos/{repo}/commits/{branch}/check-runs --jq .check_runs"
+        "gh api repos/{repo}/commits/{git_ref}/check-runs --jq .check_runs"
     )
     .read()?;
     let check_runs: Vec<CheckRun> = serde_json::from_str(&output)?;
-    let mut names: Vec<String> = check_runs.into_iter().map(|c| c.name).collect();
+    Ok(check_runs.into_iter().map(|c| c.name).collect())
+}
+
+fn get_latest_merged_pr_sha(sh: &Shell, repo: &str) -> anyhow::Result<Option<String>> {
+    let output = cmd!(
+        sh,
+        "gh pr list --repo {repo} --state merged --limit 1 --json headRefOid --jq .[0].headRefOid"
+    )
+    .read()?;
+    let sha = output.trim();
+    if sha.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(sha.to_string()))
+    }
+}
+
+/// Collect check names from both the default branch HEAD and the latest merged PR.
+/// The default branch only has CI checks; PR-triggered checks (e.g. conventional-commit)
+/// never run on main, so we need the PR's head commit to discover those.
+fn get_check_names(sh: &Shell, repo: &str, branch: &str) -> anyhow::Result<Vec<String>> {
+    let mut names = get_check_names_for_ref(sh, repo, branch)?;
+
+    if let Some(sha) = get_latest_merged_pr_sha(sh, repo)? {
+        names.extend(get_check_names_for_ref(sh, repo, &sha)?);
+    }
+
     names.sort();
     names.dedup();
     Ok(names)
