@@ -1,14 +1,50 @@
 # kd
 
-Small persoanl toolbox. The name means nothing - just designed to be easy to type and not clash with other tools.
+Small personal toolbox. The name means nothing; it is just designed to be easy to type and not clash with other tools.
 
 ## Commands TLDR
 
 ```sh
+# Resize an image in place until it fits under YouTube's 2 MB thumbnail limit.
 kd yt thumb resize image.png
+
+# Apply my preferred merge settings to the repo in the current directory,
+# or to an explicit owner/repo.
+kd gh repo apply-preferred-settings
 kd gh repo apply-preferred-settings scode/foo
+
+# See what would change without touching anything.
+kd gh repo apply-preferred-settings --dry-run
+kd gh repo apply-preferred-settings --dry-run scode/foo
+
+# Re-apply settings even if the repo already looks correct.
+kd gh repo apply-preferred-settings --force scode/foo
+
+# Apply the same settings to every non-fork, non-archived repo I own.
 kd gh repo apply-preferred-settings --all
+kd gh repo apply-preferred-settings --all --dry-run
+kd gh repo apply-preferred-settings --all --yes
+
+# Create or repair the main-protect ruleset, then interactively choose
+# which CI checks should block merges.
+kd gh repo main-protect
+kd gh repo main-protect scode/foo
 ```
+
+## Command Notes
+
+`kd yt thumb resize` rewrites the file you pass it. If the image is already below 2 MB, it does nothing. This shells out to ImageMagick, so you need `magick` installed.
+
+`kd gh repo apply-preferred-settings` shells out to the GitHub CLI, so `gh` needs to be installed and authenticated. If you omit `owner/repo`, it tries to detect the repo from the current directory's `origin` remote. The preferred settings are:
+
+- squash merge enabled
+- squash commit title set to `PR_TITLE`
+- squash commit message set to `PR_BODY`
+- merge commits disabled
+- rebase merges disabled
+- delete branch on merge enabled
+
+`kd gh repo main-protect` also uses `gh`, and it also auto-detects `owner/repo` from the current directory when you omit it. It ensures a ruleset named `main-protect` exists on the default branch, enforces linear history, blocks force-pushes, and then lets you interactively choose required status checks from checks it finds on the default branch and the latest merged PR.
 
 ## Logging
 
