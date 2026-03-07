@@ -10,6 +10,7 @@ use super::{MainProtectArgs, resolve_repo};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use tracing::info;
 use xshell::{Shell, cmd};
@@ -61,6 +62,24 @@ struct StatusCheckParam {
 #[derive(Deserialize)]
 struct CheckRun {
     name: String,
+    details_url: Option<String>,
+}
+
+/// Minimal workflow run metadata used to make GitHub Actions checks look
+/// like the checks list in the GitHub UI without changing the stored
+/// required-check context.
+#[derive(Deserialize)]
+struct WorkflowRun {
+    name: Option<String>,
+    event: String,
+}
+
+/// A single selectable status check. `context` is the value GitHub rulesets
+/// store and enforce; `display_name` is only for the interactive picker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AvailableCheck {
+    context: String,
+    display_name: String,
 }
 
 // ── Request payloads ──────────────────────────────────────────────────
@@ -229,15 +248,14 @@ fn get_default_branch(sh: &Shell, repo: &str) -> anyhow::Result<String> {
     Ok(output.trim().to_string())
 }
 
-/// List the CI check names that ran against a specific commit/ref.
-fn get_check_names_for_ref(sh: &Shell, repo: &str, git_ref: &str) -> anyhow::Result<Vec<String>> {
+/// List the CI check runs that ran against a specific commit/ref.
+fn get_check_runs_for_ref(sh: &Shell, repo: &str, git_ref: &str) -> anyhow::Result<Vec<CheckRun>> {
     let output = cmd!(
         sh,
         "gh api repos/{repo}/commits/{git_ref}/check-runs --jq .check_runs"
     )
     .read()?;
-    let check_runs: Vec<CheckRun> = serde_json::from_str(&output)?;
-    Ok(check_runs.into_iter().map(|c| c.name).collect())
+    Ok(serde_json::from_str(&output)?)
 }
 
 /// Find the head commit SHA of the most recently merged PR, if any.
@@ -256,19 +274,109 @@ fn get_latest_merged_pr_sha(sh: &Shell, repo: &str) -> anyhow::Result<Option<Str
     }
 }
 
+/// Parse a workflow run ID out of a GitHub Actions details URL.
+fn parse_workflow_run_id(details_url: &str) -> Option<u64> {
+    let mut parts = details_url.split('/');
+    while let Some(part) = parts.next() {
+        if part == "runs" {
+            return parts.next()?.parse().ok();
+        }
+    }
+    None
+}
+
+/// Build a display label that matches GitHub's checks UI more closely while
+/// keeping the underlying ruleset context unchanged.
+fn format_check_display_name(context: &str, workflow_run: Option<&WorkflowRun>) -> String {
+    match workflow_run {
+        Some(run) => match run.name.as_deref() {
+            Some(workflow_name) if !workflow_name.is_empty() => {
+                format!("{workflow_name} / {context} ({})", run.event)
+            }
+            _ => context.to_string(),
+        },
+        _ => context.to_string(),
+    }
+}
+
+/// Fetch workflow-run metadata for each unique GitHub Actions run referenced
+/// by the discovered check runs. Failures are ignored because the metadata is
+/// only used to improve display labels.
+fn get_workflow_runs(sh: &Shell, repo: &str, check_runs: &[CheckRun]) -> HashMap<u64, WorkflowRun> {
+    let run_ids: HashSet<u64> = check_runs
+        .iter()
+        .filter_map(|check_run| check_run.details_url.as_deref())
+        .filter_map(parse_workflow_run_id)
+        .collect();
+
+    let mut workflow_runs = HashMap::new();
+    for run_id in run_ids {
+        let run_id_str = run_id.to_string();
+        let output = match cmd!(sh, "gh api repos/{repo}/actions/runs/{run_id_str}").read() {
+            Ok(output) => output,
+            Err(_) => continue,
+        };
+        let workflow_run = match serde_json::from_str::<WorkflowRun>(&output) {
+            Ok(workflow_run) => workflow_run,
+            Err(_) => continue,
+        };
+        workflow_runs.insert(run_id, workflow_run);
+    }
+    workflow_runs
+}
+
+/// Convert raw check runs into selectable check entries, preserving the
+/// ruleset context while enriching the display label where possible.
+fn build_available_checks(
+    check_runs: Vec<CheckRun>,
+    workflow_runs: &HashMap<u64, WorkflowRun>,
+) -> Vec<AvailableCheck> {
+    let mut checks_by_context: HashMap<String, AvailableCheck> = HashMap::new();
+
+    for check_run in check_runs {
+        let workflow_run = check_run
+            .details_url
+            .as_deref()
+            .and_then(parse_workflow_run_id)
+            .and_then(|run_id| workflow_runs.get(&run_id));
+        let available = AvailableCheck {
+            context: check_run.name.clone(),
+            display_name: format_check_display_name(&check_run.name, workflow_run),
+        };
+
+        checks_by_context
+            .entry(available.context.clone())
+            .and_modify(|existing| {
+                if existing.display_name == existing.context
+                    && available.display_name != available.context
+                {
+                    existing.display_name = available.display_name.clone();
+                }
+            })
+            .or_insert(available);
+    }
+
+    let mut checks: Vec<AvailableCheck> = checks_by_context.into_values().collect();
+    checks.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+    checks
+}
+
 /// Collect check names from both the default branch HEAD and the latest merged PR.
 /// The default branch only has CI checks; PR-triggered checks (e.g. conventional-commit)
 /// never run on main, so we need the PR's head commit to discover those.
-fn get_check_names(sh: &Shell, repo: &str, branch: &str) -> anyhow::Result<Vec<String>> {
-    let mut names = get_check_names_for_ref(sh, repo, branch)?;
+fn get_available_checks(
+    sh: &Shell,
+    repo: &str,
+    branch: &str,
+) -> anyhow::Result<Vec<AvailableCheck>> {
+    let mut check_runs = get_check_runs_for_ref(sh, repo, branch)?;
 
     if let Some(sha) = get_latest_merged_pr_sha(sh, repo)? {
-        names.extend(get_check_names_for_ref(sh, repo, &sha)?);
+        check_runs.extend(get_check_runs_for_ref(sh, repo, &sha)?);
     }
 
-    names.sort();
-    names.dedup();
-    Ok(names)
+    let workflow_runs = get_workflow_runs(sh, repo, &check_runs);
+    Ok(build_available_checks(check_runs, &workflow_runs))
 }
 
 /// Present an interactive menu of available CI checks. The user can
@@ -276,22 +384,22 @@ fn get_check_names(sh: &Shell, repo: &str, branch: &str) -> anyhow::Result<Vec<S
 /// press Enter to leave things unchanged. Returns `None` if the user
 /// chose to skip (empty input).
 fn prompt_for_checks(
-    available: &[String],
+    available: &[AvailableCheck],
     current_blocking: &[StatusCheckParam],
 ) -> anyhow::Result<Option<Vec<StatusCheckParam>>> {
-    let blocking_set: std::collections::HashSet<&str> = current_blocking
+    let blocking_set: HashSet<&str> = current_blocking
         .iter()
         .map(|c| c.context.as_str())
         .collect();
 
     println!();
-    for (i, name) in available.iter().enumerate() {
-        let tag = if blocking_set.contains(name.as_str()) {
+    for (i, check) in available.iter().enumerate() {
+        let tag = if blocking_set.contains(check.context.as_str()) {
             "[BLOCKING]"
         } else {
             "[ ]"
         };
-        println!("  {}. {} {}", i + 1, tag, name);
+        println!("  {}. {} {}", i + 1, tag, check.display_name);
     }
     println!();
 
@@ -314,8 +422,8 @@ fn prompt_for_checks(
         return Ok(Some(
             available
                 .iter()
-                .map(|name| StatusCheckParam {
-                    context: name.clone(),
+                .map(|check| StatusCheckParam {
+                    context: check.context.clone(),
                     integration_id: None,
                 })
                 .collect(),
@@ -335,7 +443,7 @@ fn prompt_for_checks(
         if num == 0 || num > available.len() {
             bail!("number {} out of range (1-{})", num, available.len());
         }
-        let name = available[num - 1].as_str();
+        let name = available[num - 1].context.as_str();
         if remove {
             result.remove(name);
         } else {
@@ -345,9 +453,9 @@ fn prompt_for_checks(
 
     let selected: Vec<StatusCheckParam> = available
         .iter()
-        .filter(|name| result.contains(name.as_str()))
-        .map(|name| StatusCheckParam {
-            context: name.clone(),
+        .filter(|check| result.contains(check.context.as_str()))
+        .map(|check| StatusCheckParam {
+            context: check.context.clone(),
             integration_id: None,
         })
         .collect();
@@ -379,9 +487,9 @@ pub fn run(args: MainProtectArgs) -> anyhow::Result<()> {
     };
 
     let default_branch = get_default_branch(&sh, &repo)?;
-    let check_names = get_check_names(&sh, &repo, &default_branch)?;
+    let available_checks = get_available_checks(&sh, &repo, &default_branch)?;
 
-    if check_names.is_empty() {
+    if available_checks.is_empty() {
         info!(
             "No check runs found on '{}'; skipping status check selection",
             default_branch
@@ -392,7 +500,7 @@ pub fn run(args: MainProtectArgs) -> anyhow::Result<()> {
     let detail = get_ruleset(&sh, &repo, ruleset_id)?;
     let current_checks = extract_current_checks(&detail);
 
-    if let Some(selected) = prompt_for_checks(&check_names, &current_checks)? {
+    if let Some(selected) = prompt_for_checks(&available_checks, &current_checks)? {
         update_ruleset(&sh, &repo, ruleset_id, &selected)?;
         info!(
             "Updated required status checks ({} blocking)",
@@ -403,4 +511,94 @@ pub fn run(args: MainProtectArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_workflow_run_id_reads_actions_run_urls() {
+        assert_eq!(
+            parse_workflow_run_id(
+                "https://github.com/example-owner/example-repo/actions/runs/123456789/job/1"
+            ),
+            Some(123456789)
+        );
+    }
+
+    #[test]
+    fn parse_workflow_run_id_rejects_non_actions_urls() {
+        assert_eq!(
+            parse_workflow_run_id("https://github.com/example-owner/example-repo/checks/123"),
+            None
+        );
+    }
+
+    #[test]
+    fn format_check_display_name_uses_workflow_and_event() {
+        let workflow_run = WorkflowRun {
+            name: Some("CI".to_string()),
+            event: "push".to_string(),
+        };
+
+        assert_eq!(
+            format_check_display_name("clippy", Some(&workflow_run)),
+            "CI / clippy (push)"
+        );
+    }
+
+    #[test]
+    fn build_available_checks_prefers_richer_display_names() {
+        let check_runs = vec![
+            CheckRun {
+                name: "clippy".to_string(),
+                details_url: None,
+            },
+            CheckRun {
+                name: "clippy".to_string(),
+                details_url: Some(
+                    "https://github.com/example-owner/example-repo/actions/runs/42/job/100"
+                        .to_string(),
+                ),
+            },
+            CheckRun {
+                name: "fmt".to_string(),
+                details_url: Some(
+                    "https://github.com/example-owner/example-repo/actions/runs/99/job/101"
+                        .to_string(),
+                ),
+            },
+        ];
+        let workflow_runs = HashMap::from([
+            (
+                42,
+                WorkflowRun {
+                    name: Some("CI".to_string()),
+                    event: "push".to_string(),
+                },
+            ),
+            (
+                99,
+                WorkflowRun {
+                    name: Some("CI".to_string()),
+                    event: "pull_request".to_string(),
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            build_available_checks(check_runs, &workflow_runs),
+            vec![
+                AvailableCheck {
+                    context: "clippy".to_string(),
+                    display_name: "CI / clippy (push)".to_string(),
+                },
+                AvailableCheck {
+                    context: "fmt".to_string(),
+                    display_name: "CI / fmt (pull_request)".to_string(),
+                },
+            ]
+        );
+    }
 }
