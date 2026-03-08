@@ -231,15 +231,22 @@ fn needs_fix(detail: &RulesetDetail) -> bool {
 /// Pull out the currently-configured required status checks from an
 /// existing ruleset, so we can preserve them across updates.
 fn extract_current_checks(detail: &RulesetDetail) -> Vec<StatusCheckParam> {
-    for rule in &detail.rules {
-        if rule.rule_type == "required_status_checks"
-            && let Some(params) = &rule.parameters
-            && let Ok(parsed) = serde_json::from_value::<StatusCheckParameters>(params.clone())
-        {
-            return parsed.required_status_checks;
-        }
-    }
-    Vec::new()
+    detail
+        .rules
+        .iter()
+        .find_map(|rule| {
+            if rule.rule_type != "required_status_checks" {
+                return None;
+            }
+
+            rule.parameters
+                .as_ref()
+                .and_then(|params| {
+                    serde_json::from_value::<StatusCheckParameters>(params.clone()).ok()
+                })
+                .map(|parsed| parsed.required_status_checks)
+        })
+        .unwrap_or_default()
 }
 
 /// Ask GitHub for the repo's default branch name (usually `main`).
