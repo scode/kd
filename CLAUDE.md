@@ -8,7 +8,8 @@ Run `cargo fmt`, `cargo clippy`, and `cargo test` before considering work comple
 
 ## Style
 
-Comment generously — the codebase should be easy to skim for intent and functionality. Focus on *why* and *what the purpose is*, not restating the code.
+Comment generously — the codebase should be easy to skim for intent and functionality. Focus on _why_ and _what the
+purpose is_, not restating the code.
 
 ## Conventional Commits
 
