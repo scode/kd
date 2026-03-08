@@ -33,9 +33,12 @@ kd gh repo main-protect scode/foo
 
 ## Command Notes
 
-`kd yt thumb resize` rewrites the file you pass it. If the image is already below 2 MB, it does nothing. This shells out to ImageMagick, so you need `magick` installed.
+`kd yt thumb resize` rewrites the file you pass it. If the image is already below 2 MB, it does nothing. This shells out
+to ImageMagick, so you need `magick` installed.
 
-`kd gh repo apply-preferred-settings` shells out to the GitHub CLI, so `gh` needs to be installed and authenticated. If you omit `owner/repo`, it tries to detect the repo from the current directory's `origin` remote. The preferred settings are:
+`kd gh repo apply-preferred-settings` shells out to the GitHub CLI, so `gh` needs to be installed and authenticated. If
+you omit `owner/repo`, it tries to detect the repo from the current directory's `origin` remote. The preferred settings
+are:
 
 - squash merge enabled
 - squash commit title set to `PR_TITLE`
@@ -44,19 +47,22 @@ kd gh repo main-protect scode/foo
 - rebase merges disabled
 - delete branch on merge enabled
 
-`kd gh repo main-protect` also uses `gh`, and it also auto-detects `owner/repo` from the current directory when you omit it. It ensures a ruleset named `main-protect` exists on the default branch, enforces linear history, blocks force-pushes, and then lets you interactively choose required status checks from checks it finds on the default branch and the latest merged PR.
+`kd gh repo main-protect` also uses `gh`, and it also auto-detects `owner/repo` from the current directory when you omit
+it. It ensures a ruleset named `main-protect` exists on the default branch, enforces linear history, blocks
+force-pushes, and then lets you interactively choose required status checks from checks it finds on the default branch
+and the latest merged PR.
 
 ## Logging
 
 Default log level is INFO.
 
-| Flag | Level |
-|------|-------|
-| `-v` | DEBUG |
-| `-vv` | TRACE |
-| `-q` | WARN |
-| `-qq` | ERROR |
-| `-qqq` | OFF |
+| Flag   | Level |
+| ------ | ----- |
+| `-v`   | DEBUG |
+| `-vv`  | TRACE |
+| `-q`   | WARN  |
+| `-qq`  | ERROR |
+| `-qqq` | OFF   |
 
 ```sh
 kd -v yt thumb resize image.png   # debug output
