@@ -2,7 +2,7 @@
 //! thumbnail upload limit. Uses ImageMagick (`magick`) for the actual
 //! resizing so we get high-quality output across all image formats.
 
-use std::path::PathBuf;
+use std::path::Path;
 use tracing::{debug, info};
 use xshell::{Shell, cmd};
 
@@ -13,7 +13,7 @@ const MAX_SIZE: u64 = 2 * 1024 * 1024;
 /// under `MAX_SIZE`, then replace the original file. The step size is
 /// a trade-off: small enough to land close to the limit without
 /// unnecessary quality loss, large enough to converge quickly.
-pub fn run(file: &PathBuf) -> anyhow::Result<()> {
+pub fn run(file: &Path) -> anyhow::Result<()> {
     if !file.exists() {
         anyhow::bail!("File does not exist: {}", file.display());
     }
