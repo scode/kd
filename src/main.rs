@@ -22,12 +22,10 @@ struct Cli {
     command: cmd::Commands,
 }
 
-fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-
-    // Map the -v/-q flag counts to a tracing level. The two flags
-    // are mutually exclusive; using both is an error.
-    let level = match (cli.verbose, cli.quiet) {
+/// Resolve log verbosity from the mutually-exclusive `-v/--verbose`
+/// and `-q/--quiet` flags so `main` can stay focused on orchestration.
+fn resolve_log_level(verbose: u8, quiet: u8) -> anyhow::Result<LevelFilter> {
+    let level = match (verbose, quiet) {
         (0, 0) => LevelFilter::INFO,
         (1, 0) => LevelFilter::DEBUG,
         (_, 0) => LevelFilter::TRACE,
@@ -36,6 +34,13 @@ fn main() -> anyhow::Result<()> {
         (0, _) => LevelFilter::OFF,
         _ => anyhow::bail!("Cannot use both --verbose and --quiet"),
     };
+
+    Ok(level)
+}
+
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let level = resolve_log_level(cli.verbose, cli.quiet)?;
 
     // Log to stderr so stdout remains clean for machine-readable output.
     tracing_subscriber::fmt()
