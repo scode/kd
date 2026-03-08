@@ -319,13 +319,11 @@ fn get_workflow_runs(sh: &Shell, repo: &str, check_runs: &[CheckRun]) -> HashMap
     let mut workflow_runs = HashMap::new();
     for run_id in run_ids {
         let run_id_str = run_id.to_string();
-        let output = match cmd!(sh, "gh api repos/{repo}/actions/runs/{run_id_str}").read() {
-            Ok(output) => output,
-            Err(_) => continue,
+        let Ok(output) = cmd!(sh, "gh api repos/{repo}/actions/runs/{run_id_str}").read() else {
+            continue;
         };
-        let workflow_run = match serde_json::from_str::<WorkflowRun>(&output) {
-            Ok(workflow_run) => workflow_run,
-            Err(_) => continue,
+        let Ok(workflow_run) = serde_json::from_str::<WorkflowRun>(&output) else {
+            continue;
         };
         workflow_runs.insert(run_id, workflow_run);
     }
