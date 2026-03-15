@@ -4,7 +4,8 @@ Requires ImageMagick (`magick` command) at runtime for image operations.
 
 ## Before finishing work
 
-Run `cargo fmt`, `cargo clippy`, and `cargo test` before considering work complete or creating a PR. All must pass.
+Run `cargo fmt`, `cargo clippy`, `cargo test`, and `dprint fmt` before considering work complete or creating a PR. All
+must pass.
 
 ## Style
 
