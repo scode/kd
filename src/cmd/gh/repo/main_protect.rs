@@ -553,6 +553,69 @@ mod tests {
         );
     }
 
+    fn ruleset_detail(enforcement: &str, rule_types: &[&str]) -> RulesetDetail {
+        RulesetDetail {
+            enforcement: enforcement.to_string(),
+            rules: rule_types
+                .iter()
+                .map(|t| RuleRaw {
+                    rule_type: t.to_string(),
+                    parameters: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn needs_fix_false_when_all_base_rules_active() {
+        let detail = ruleset_detail("active", &["required_linear_history", "non_fast_forward"]);
+        assert!(!needs_fix(&detail));
+    }
+
+    #[test]
+    fn needs_fix_true_when_enforcement_disabled() {
+        let detail = ruleset_detail("disabled", &["required_linear_history", "non_fast_forward"]);
+        assert!(needs_fix(&detail));
+    }
+
+    #[test]
+    fn needs_fix_true_when_linear_history_missing() {
+        let detail = ruleset_detail("active", &["non_fast_forward"]);
+        assert!(needs_fix(&detail));
+    }
+
+    #[test]
+    fn needs_fix_true_when_non_fast_forward_missing() {
+        let detail = ruleset_detail("active", &["required_linear_history"]);
+        assert!(needs_fix(&detail));
+    }
+
+    #[test]
+    fn extract_current_checks_returns_empty_when_no_status_check_rule() {
+        let detail = ruleset_detail("active", &["required_linear_history"]);
+        assert!(extract_current_checks(&detail).is_empty());
+    }
+
+    #[test]
+    fn extract_current_checks_returns_configured_checks() {
+        let detail = RulesetDetail {
+            enforcement: "active".to_string(),
+            rules: vec![RuleRaw {
+                rule_type: "required_status_checks".to_string(),
+                parameters: Some(serde_json::json!({
+                    "required_status_checks": [
+                        {"context": "ci/test", "integration_id": 1},
+                        {"context": "ci/lint"}
+                    ]
+                })),
+            }],
+        };
+        let checks = extract_current_checks(&detail);
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[0].context, "ci/test");
+        assert_eq!(checks[1].context, "ci/lint");
+    }
+
     #[test]
     fn build_available_checks_prefers_richer_display_names() {
         let check_runs = vec![
