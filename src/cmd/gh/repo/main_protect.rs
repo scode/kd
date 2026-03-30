@@ -553,6 +553,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rules_with_checks_omits_status_checks_when_empty() {
+        let rules = rules_with_checks(&[]);
+        assert_eq!(rules.len(), 2);
+        assert!(
+            rules
+                .iter()
+                .all(|r| r.rule_type != "required_status_checks")
+        );
+    }
+
+    #[test]
+    fn rules_with_checks_includes_status_checks_when_present() {
+        let checks = vec![StatusCheckParam {
+            context: "ci/test".to_string(),
+            integration_id: None,
+        }];
+        let rules = rules_with_checks(&checks);
+        assert_eq!(rules.len(), 3);
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.rule_type == "required_status_checks")
+        );
+    }
+
     fn ruleset_detail(enforcement: &str, rule_types: &[&str]) -> RulesetDetail {
         RulesetDetail {
             enforcement: enforcement.to_string(),
