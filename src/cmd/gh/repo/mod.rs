@@ -215,4 +215,19 @@ mod tests {
     fn parse_github_remote_rejects_non_github() {
         assert!(parse_github_remote("git@gitlab.com:owner/repo.git").is_err());
     }
+
+    #[test]
+    fn parse_github_remote_rejects_extra_path_segments() {
+        assert!(parse_github_remote("git@github.com:owner/repo/extra.git").is_err());
+    }
+
+    #[test]
+    fn parse_github_remote_rejects_missing_owner() {
+        assert!(parse_github_remote("git@github.com:repo.git").is_err());
+    }
+
+    #[test]
+    fn parse_github_remote_rejects_empty_path() {
+        assert!(parse_github_remote("https://github.com/").is_err());
+    }
 }
