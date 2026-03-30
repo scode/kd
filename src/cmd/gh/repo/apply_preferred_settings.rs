@@ -222,6 +222,47 @@ mod tests {
     }
 
     #[test]
+    fn deltas_reports_allow_merge_commit_when_enabled() {
+        let mut settings = preferred_settings();
+        settings.allow_merge_commit = true;
+        assert_eq!(settings.deltas(), vec!["allow_merge_commit: true -> false"]);
+    }
+
+    #[test]
+    fn deltas_reports_allow_squash_merge_when_disabled() {
+        let mut settings = preferred_settings();
+        settings.allow_squash_merge = false;
+        assert_eq!(settings.deltas(), vec!["allow_squash_merge: false -> true"]);
+    }
+
+    #[test]
+    fn deltas_reports_squash_merge_commit_title_mismatch() {
+        let mut settings = preferred_settings();
+        settings.squash_merge_commit_title = "COMMIT_OR_PR_TITLE".to_string();
+        assert_eq!(
+            settings.deltas(),
+            vec!["squash_merge_commit_title: COMMIT_OR_PR_TITLE -> PR_TITLE"]
+        );
+    }
+
+    #[test]
+    fn deltas_reports_squash_merge_commit_message_mismatch() {
+        let mut settings = preferred_settings();
+        settings.squash_merge_commit_message = "BLANK".to_string();
+        assert_eq!(
+            settings.deltas(),
+            vec!["squash_merge_commit_message: BLANK -> PR_BODY"]
+        );
+    }
+
+    #[test]
+    fn deltas_reports_allow_rebase_merge_when_enabled() {
+        let mut settings = preferred_settings();
+        settings.allow_rebase_merge = true;
+        assert_eq!(settings.deltas(), vec!["allow_rebase_merge: true -> false"]);
+    }
+
+    #[test]
     fn should_prompt_for_all_repos_by_default() {
         assert!(should_prompt(true, false, false));
     }
