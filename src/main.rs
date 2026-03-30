@@ -38,6 +38,47 @@ fn resolve_log_level(verbose: u8, quiet: u8) -> anyhow::Result<LevelFilter> {
     Ok(level)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing_subscriber::filter::LevelFilter;
+
+    #[test]
+    fn default_is_info() {
+        assert_eq!(resolve_log_level(0, 0).unwrap(), LevelFilter::INFO);
+    }
+
+    #[test]
+    fn single_verbose_is_debug() {
+        assert_eq!(resolve_log_level(1, 0).unwrap(), LevelFilter::DEBUG);
+    }
+
+    #[test]
+    fn double_verbose_is_trace() {
+        assert_eq!(resolve_log_level(2, 0).unwrap(), LevelFilter::TRACE);
+    }
+
+    #[test]
+    fn single_quiet_is_warn() {
+        assert_eq!(resolve_log_level(0, 1).unwrap(), LevelFilter::WARN);
+    }
+
+    #[test]
+    fn double_quiet_is_error() {
+        assert_eq!(resolve_log_level(0, 2).unwrap(), LevelFilter::ERROR);
+    }
+
+    #[test]
+    fn triple_quiet_is_off() {
+        assert_eq!(resolve_log_level(0, 3).unwrap(), LevelFilter::OFF);
+    }
+
+    #[test]
+    fn verbose_and_quiet_conflicts() {
+        assert!(resolve_log_level(1, 1).is_err());
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let level = resolve_log_level(cli.verbose, cli.quiet)?;
