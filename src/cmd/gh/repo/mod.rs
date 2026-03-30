@@ -204,6 +204,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_github_remote_ssh_url_form() {
+        assert_eq!(
+            parse_github_remote("ssh://git@github.com/owner/repo.git").unwrap(),
+            "owner/repo"
+        );
+    }
+
+    #[test]
     fn parse_github_remote_rejects_non_github() {
         assert!(parse_github_remote("git@gitlab.com:owner/repo.git").is_err());
     }
