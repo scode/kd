@@ -38,6 +38,19 @@ fn resolve_log_level(verbose: u8, quiet: u8) -> anyhow::Result<LevelFilter> {
     Ok(level)
 }
 
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let level = resolve_log_level(cli.verbose, cli.quiet)?;
+
+    // Log to stderr so stdout remains clean for machine-readable output.
+    tracing_subscriber::fmt()
+        .with_max_level(level)
+        .with_writer(std::io::stderr)
+        .init();
+
+    cli.command.run()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,17 +90,4 @@ mod tests {
     fn verbose_and_quiet_conflicts() {
         assert!(resolve_log_level(1, 1).is_err());
     }
-}
-
-fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    let level = resolve_log_level(cli.verbose, cli.quiet)?;
-
-    // Log to stderr so stdout remains clean for machine-readable output.
-    tracing_subscriber::fmt()
-        .with_max_level(level)
-        .with_writer(std::io::stderr)
-        .init();
-
-    cli.command.run()
 }
