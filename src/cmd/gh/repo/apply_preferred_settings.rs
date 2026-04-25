@@ -31,6 +31,14 @@ struct RepoSettings {
     delete_branch_on_merge: bool,
 }
 
+#[derive(Debug, PartialEq)]
+enum ApplyDecision {
+    AlreadyConfigured,
+    DryRun,
+    Confirm,
+    Apply,
+}
+
 impl RepoSettings {
     /// Compare the current settings against the preferred values and return
     /// human-readable descriptions of each difference. An empty result means
@@ -95,8 +103,9 @@ fn check_and_apply(
 ) -> anyhow::Result<()> {
     let settings = get_settings(sh, repo)?;
     let deltas = settings.deltas();
+    let decision = decide_apply(!deltas.is_empty(), force, prompt, dry_run, yes);
 
-    if deltas.is_empty() && !force {
+    if matches!(decision, ApplyDecision::AlreadyConfigured) {
         info!("{} already configured correctly", repo);
         return Ok(());
     }
@@ -108,7 +117,7 @@ fn check_and_apply(
         }
     }
 
-    if dry_run {
+    if matches!(decision, ApplyDecision::DryRun) {
         if deltas.is_empty() {
             info!(
                 "Dry run: {} already matches preferred settings; no changes would be applied",
@@ -120,7 +129,9 @@ fn check_and_apply(
         return Ok(());
     }
 
-    if prompt && !yes && !confirm(&format!("Apply settings to {}?", repo))? {
+    if matches!(decision, ApplyDecision::Confirm)
+        && !confirm(&format!("Apply settings to {}?", repo))?
+    {
         info!("Skipping {}", repo);
         return Ok(());
     }
@@ -151,6 +162,28 @@ fn run_all(sh: &Shell, force: bool, dry_run: bool, yes: bool) -> anyhow::Result<
     }
 
     Ok(())
+}
+
+fn decide_apply(
+    has_deltas: bool,
+    force: bool,
+    prompt: bool,
+    dry_run: bool,
+    yes: bool,
+) -> ApplyDecision {
+    if !has_deltas && !force {
+        return ApplyDecision::AlreadyConfigured;
+    }
+
+    if dry_run {
+        return ApplyDecision::DryRun;
+    }
+
+    if prompt && !yes {
+        return ApplyDecision::Confirm;
+    }
+
+    ApplyDecision::Apply
 }
 
 /// Push the preferred settings to the repo via `gh api`.
@@ -185,7 +218,7 @@ fn confirm(prompt: &str) -> anyhow::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::RepoSettings;
+    use super::{ApplyDecision, RepoSettings, decide_apply};
 
     fn preferred_settings() -> RepoSettings {
         RepoSettings {
@@ -254,5 +287,52 @@ mod tests {
         let mut settings = preferred_settings();
         settings.allow_rebase_merge = true;
         assert_eq!(settings.deltas(), vec!["allow_rebase_merge: true -> false"]);
+    }
+    #[test]
+    fn decide_apply_skips_when_repo_is_already_configured() {
+        assert_eq!(
+            decide_apply(false, false, false, false, false),
+            ApplyDecision::AlreadyConfigured
+        );
+    }
+
+    #[test]
+    fn decide_apply_returns_dry_run_before_patch() {
+        assert_eq!(
+            decide_apply(true, false, false, true, false),
+            ApplyDecision::DryRun
+        );
+    }
+
+    #[test]
+    fn decide_apply_forces_patch_even_without_deltas() {
+        assert_eq!(
+            decide_apply(false, true, false, false, false),
+            ApplyDecision::Apply
+        );
+    }
+
+    #[test]
+    fn decide_apply_confirms_before_batch_patch() {
+        assert_eq!(
+            decide_apply(true, false, true, false, false),
+            ApplyDecision::Confirm
+        );
+    }
+
+    #[test]
+    fn decide_apply_bypasses_confirmation_when_yes_is_set() {
+        assert_eq!(
+            decide_apply(true, false, true, false, true),
+            ApplyDecision::Apply
+        );
+    }
+
+    #[test]
+    fn decide_apply_patches_changed_settings() {
+        assert_eq!(
+            decide_apply(true, false, false, false, false),
+            ApplyDecision::Apply
+        );
     }
 }
