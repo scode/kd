@@ -80,9 +80,17 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn require_magick(sh: &Shell) -> bool {
+        cmd!(sh, "magick -version").quiet().run().is_ok()
+    }
+
     #[test]
     fn test_resize_reduces_large_image() {
         let sh = Shell::new().unwrap();
+        if !require_magick(&sh) {
+            return;
+        }
+
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.png");
         let path_str = path.to_str().unwrap();
@@ -101,6 +109,10 @@ mod tests {
     #[test]
     fn test_small_image_unchanged() {
         let sh = Shell::new().unwrap();
+        if !require_magick(&sh) {
+            return;
+        }
+
         let dir = tempdir().unwrap();
         let path = dir.path().join("small.png");
         let path_str = path.to_str().unwrap();
