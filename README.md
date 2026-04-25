@@ -50,7 +50,7 @@ are:
 `kd gh repo main-protect` also uses `gh`, and it also auto-detects `owner/repo` from the current directory when you omit
 it. It ensures a ruleset named `main-protect` exists on the default branch, enforces linear history, blocks
 force-pushes, and then lets you interactively choose required status checks from checks it finds on the default branch
-and the latest merged PR.
+and a recent merged PR returned by `gh pr list`.
 
 ## Logging
 
