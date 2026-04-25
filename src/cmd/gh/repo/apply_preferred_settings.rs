@@ -120,7 +120,7 @@ fn check_and_apply(
         return Ok(());
     }
 
-    if should_prompt(prompt, yes, dry_run) && !confirm(&format!("Apply settings to {}?", repo))? {
+    if prompt && !yes && !confirm(&format!("Apply settings to {}?", repo))? {
         info!("Skipping {}", repo);
         return Ok(());
     }
@@ -151,12 +151,6 @@ fn run_all(sh: &Shell, force: bool, dry_run: bool, yes: bool) -> anyhow::Result<
     }
 
     Ok(())
-}
-
-/// Only prompt interactively when in batch mode (`prompt`), and the user
-/// hasn't opted out of prompts (`--yes`) or actual changes (`--dry-run`).
-fn should_prompt(prompt: bool, yes: bool, dry_run: bool) -> bool {
-    prompt && !yes && !dry_run
 }
 
 /// Push the preferred settings to the repo via `gh api`.
@@ -191,7 +185,7 @@ fn confirm(prompt: &str) -> anyhow::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RepoSettings, should_prompt};
+    use super::RepoSettings;
 
     fn preferred_settings() -> RepoSettings {
         RepoSettings {
@@ -260,20 +254,5 @@ mod tests {
         let mut settings = preferred_settings();
         settings.allow_rebase_merge = true;
         assert_eq!(settings.deltas(), vec!["allow_rebase_merge: true -> false"]);
-    }
-
-    #[test]
-    fn should_prompt_for_all_repos_by_default() {
-        assert!(should_prompt(true, false, false));
-    }
-
-    #[test]
-    fn should_not_prompt_when_yes_is_set() {
-        assert!(!should_prompt(true, true, false));
-    }
-
-    #[test]
-    fn should_not_prompt_for_dry_run() {
-        assert!(!should_prompt(true, false, true));
     }
 }
