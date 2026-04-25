@@ -234,23 +234,23 @@ fn needs_fix(detail: &RulesetDetail) -> bool {
 
 /// Pull out the currently-configured required status checks from an
 /// existing ruleset, so we can preserve them across updates.
-fn extract_current_checks(detail: &RulesetDetail) -> Vec<StatusCheckParam> {
-    detail
+fn extract_current_checks(detail: &RulesetDetail) -> anyhow::Result<Vec<StatusCheckParam>> {
+    let Some(rule) = detail
         .rules
         .iter()
-        .find_map(|rule| {
-            if rule.rule_type != "required_status_checks" {
-                return None;
-            }
+        .find(|rule| rule.rule_type == "required_status_checks")
+    else {
+        return Ok(Vec::new());
+    };
 
-            rule.parameters
-                .as_ref()
-                .and_then(|params| {
-                    serde_json::from_value::<StatusCheckParameters>(params.clone()).ok()
-                })
-                .map(|parsed| parsed.required_status_checks)
-        })
-        .unwrap_or_default()
+    let parsed = serde_json::from_value::<StatusCheckParameters>(
+        rule.parameters
+            .clone()
+            .context("required_status_checks rule is missing parameters")?,
+    )
+    .context("failed to parse required_status_checks parameters")?;
+
+    Ok(parsed.required_status_checks)
 }
 
 /// Ask GitHub for the repo's default branch name (usually `main`).
@@ -530,7 +530,7 @@ pub fn run(args: MainProtectArgs) -> anyhow::Result<()> {
         Some(id) => {
             info!("Found existing '{}' ruleset (id={})", RULESET_NAME, id);
             let detail = get_ruleset(&sh, &repo, id)?;
-            let current_checks = extract_current_checks(&detail);
+            let current_checks = extract_current_checks(&detail)?;
             if needs_fix(&detail) {
                 info!("Fixing ruleset enforcement/rules...");
                 update_ruleset(&sh, &repo, id, &current_checks)?;
@@ -557,7 +557,7 @@ pub fn run(args: MainProtectArgs) -> anyhow::Result<()> {
     }
 
     let detail = get_ruleset(&sh, &repo, ruleset_id)?;
-    let current_checks = extract_current_checks(&detail);
+    let current_checks = extract_current_checks(&detail)?;
 
     if let Some(selected) = prompt_for_checks(&available_checks, &current_checks)? {
         update_ruleset(&sh, &repo, ruleset_id, &selected)?;
@@ -696,7 +696,7 @@ mod tests {
     #[test]
     fn extract_current_checks_returns_empty_when_no_status_check_rule() {
         let detail = ruleset_detail("active", &["required_linear_history"]);
-        assert!(extract_current_checks(&detail).is_empty());
+        assert!(extract_current_checks(&detail).unwrap().is_empty());
     }
 
     #[test]
@@ -715,10 +715,54 @@ mod tests {
                 })),
             }],
         };
-        let checks = extract_current_checks(&detail);
+        let checks = extract_current_checks(&detail).unwrap();
         assert_eq!(checks.len(), 2);
         assert_eq!(checks[0].context, "ci/test");
         assert_eq!(checks[1].context, "ci/lint");
+    }
+
+    #[test]
+    fn extract_current_checks_errors_when_parameters_are_missing() {
+        let detail = RulesetDetail {
+            target: "branch".to_string(),
+            enforcement: "active".to_string(),
+            conditions: conditions(),
+            rules: vec![RuleRaw {
+                rule_type: "required_status_checks".to_string(),
+                parameters: None,
+            }],
+        };
+        let err = extract_current_checks(&detail).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("required_status_checks rule is missing parameters"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn extract_current_checks_errors_on_malformed_parameters() {
+        let detail = RulesetDetail {
+            target: "branch".to_string(),
+            enforcement: "active".to_string(),
+            conditions: conditions(),
+            rules: vec![RuleRaw {
+                rule_type: "required_status_checks".to_string(),
+                parameters: Some(serde_json::json!({
+                    "required_status_checks": "not a list"
+                })),
+            }],
+        };
+        let err = extract_current_checks(&detail).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("failed to parse required_status_checks parameters"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
