@@ -52,7 +52,7 @@ struct StatusCheckParameters {
 /// A single required status check entry. `integration_id` is the GitHub
 /// App that owns the check; we omit it when creating checks via the CLI
 /// since GitHub fills it in automatically.
-#[derive(Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize, Clone)]
 struct StatusCheckParam {
     context: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -419,6 +419,20 @@ fn prompt_for_checks(
     io::stdin().read_line(&mut input)?;
     let input = input.trim();
 
+    parse_check_selection(input, available, current_blocking)
+}
+
+/// Parse the status-check picker input without touching stdin/stdout.
+///
+/// Empty input means "leave the ruleset unchanged" and returns `None`.
+/// `none` clears all required checks, `all` selects every currently
+/// discoverable check, and comma-separated numbers add/remove entries
+/// relative to the current blocking set. A leading `-` removes a check.
+fn parse_check_selection(
+    input: &str,
+    available: &[AvailableCheck],
+    current_blocking: &[StatusCheckParam],
+) -> anyhow::Result<Option<Vec<StatusCheckParam>>> {
     if input.is_empty() {
         return Ok(None);
     }
@@ -441,7 +455,10 @@ fn prompt_for_checks(
 
     // Start from current blocking set, then apply additions/removals.
     // Comma-separated entries; a leading '-' means remove, otherwise add.
-    let mut result = blocking_set.clone();
+    let mut result: HashSet<&str> = current_blocking
+        .iter()
+        .map(|c| c.context.as_str())
+        .collect();
     for part in input.split(',') {
         let part = part.trim();
         let (remove, num_str) = match part.strip_prefix('-') {
@@ -722,6 +739,102 @@ mod tests {
                     display_name: "CI / fmt (pull_request)".to_string(),
                 },
             ]
+        );
+    }
+
+    fn available_check(context: &str) -> AvailableCheck {
+        AvailableCheck {
+            context: context.to_string(),
+            display_name: context.to_string(),
+        }
+    }
+
+    fn status_check(context: &str) -> StatusCheckParam {
+        StatusCheckParam {
+            context: context.to_string(),
+            integration_id: None,
+        }
+    }
+
+    #[test]
+    fn parse_check_selection_empty_input_skips_update() {
+        let available = vec![available_check("ci/test")];
+
+        assert_eq!(parse_check_selection("", &available, &[]).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_check_selection_none_clears_blocking_checks() {
+        let available = vec![available_check("ci/test")];
+
+        assert!(
+            parse_check_selection("none", &available, &[status_check("ci/test")])
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn parse_check_selection_all_selects_every_available_check() {
+        let available = vec![available_check("ci/test"), available_check("ci/lint")];
+        let selected = parse_check_selection("all", &available, &[])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(selected[0].context, "ci/test");
+        assert_eq!(selected[1].context, "ci/lint");
+    }
+
+    #[test]
+    fn parse_check_selection_adds_and_removes_by_number() {
+        let available = vec![
+            available_check("ci/test"),
+            available_check("ci/lint"),
+            available_check("ci/fmt"),
+        ];
+        let current = vec![status_check("ci/test"), status_check("ci/lint")];
+        let selected = parse_check_selection("3,-1", &available, &current)
+            .unwrap()
+            .unwrap();
+        let contexts: Vec<_> = selected.into_iter().map(|check| check.context).collect();
+
+        assert_eq!(contexts, vec!["ci/lint", "ci/fmt"]);
+    }
+
+    #[test]
+    fn parse_check_selection_rejects_out_of_range_numbers() {
+        let available = vec![available_check("ci/test")];
+        let err = parse_check_selection("2", &available, &[]).unwrap_err();
+
+        assert!(
+            err.to_string().contains("out of range"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_check_selection_rejects_zero() {
+        let available = vec![available_check("ci/test")];
+        let err = parse_check_selection("0", &available, &[]).unwrap_err();
+
+        assert!(
+            err.to_string().contains("out of range"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_check_selection_rejects_invalid_tokens() {
+        let available = vec![available_check("ci/test")];
+        let err = parse_check_selection("wat", &available, &[]).unwrap_err();
+
+        assert!(
+            err.to_string().contains("invalid number"),
+            "unexpected error: {}",
+            err
         );
     }
 }
