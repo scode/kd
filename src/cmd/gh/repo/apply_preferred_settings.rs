@@ -150,10 +150,7 @@ fn run_all(sh: &Shell, force: bool, dry_run: bool, yes: bool) -> anyhow::Result<
     .read()?;
 
     let repos: Vec<RepoListEntry> = serde_json::from_str(&output)?;
-    let eligible: Vec<_> = repos
-        .into_iter()
-        .filter(|r| !r.is_fork && !r.is_archived)
-        .collect();
+    let eligible = eligible_repos(repos);
 
     info!("Found {} eligible repositories", eligible.len());
 
@@ -162,6 +159,13 @@ fn run_all(sh: &Shell, force: bool, dry_run: bool, yes: bool) -> anyhow::Result<
     }
 
     Ok(())
+}
+
+fn eligible_repos(repos: Vec<RepoListEntry>) -> Vec<RepoListEntry> {
+    repos
+        .into_iter()
+        .filter(|r| !r.is_fork && !r.is_archived)
+        .collect()
 }
 
 fn decide_apply(
@@ -218,7 +222,7 @@ fn confirm(prompt: &str) -> anyhow::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApplyDecision, RepoSettings, decide_apply};
+    use super::{ApplyDecision, RepoListEntry, RepoSettings, decide_apply, eligible_repos};
 
     fn preferred_settings() -> RepoSettings {
         RepoSettings {
@@ -334,5 +338,33 @@ mod tests {
             decide_apply(true, false, false, false, false),
             ApplyDecision::Apply
         );
+    }
+
+    #[test]
+    fn eligible_repos_excludes_forks_and_archives() {
+        let repos = vec![
+            RepoListEntry {
+                name_with_owner: "owner/active".to_string(),
+                is_fork: false,
+                is_archived: false,
+            },
+            RepoListEntry {
+                name_with_owner: "owner/fork".to_string(),
+                is_fork: true,
+                is_archived: false,
+            },
+            RepoListEntry {
+                name_with_owner: "owner/archive".to_string(),
+                is_fork: false,
+                is_archived: true,
+            },
+        ];
+
+        let names: Vec<_> = eligible_repos(repos)
+            .into_iter()
+            .map(|repo| repo.name_with_owner)
+            .collect();
+
+        assert_eq!(names, vec!["owner/active"]);
     }
 }
