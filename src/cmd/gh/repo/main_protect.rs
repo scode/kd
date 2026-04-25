@@ -425,9 +425,10 @@ fn prompt_for_checks(
 /// Parse the status-check picker input without touching stdin/stdout.
 ///
 /// Empty input means "leave the ruleset unchanged" and returns `None`.
-/// `none` clears all required checks, `all` selects every currently
-/// discoverable check, and comma-separated numbers add/remove entries
-/// relative to the current blocking set. A leading `-` removes a check.
+/// `none` clears all required checks, `all` selects every discoverable
+/// check plus any currently blocking check that was not rediscovered, and
+/// comma-separated numbers add/remove entries relative to the current
+/// blocking set. A leading `-` removes a check.
 fn parse_check_selection(
     input: &str,
     available: &[AvailableCheck],
@@ -442,15 +443,16 @@ fn parse_check_selection(
     }
 
     if input == "all" {
-        return Ok(Some(
-            available
-                .iter()
-                .map(|check| StatusCheckParam {
-                    context: check.context.clone(),
-                    integration_id: None,
-                })
-                .collect(),
-        ));
+        let result: HashSet<&str> = available
+            .iter()
+            .map(|check| check.context.as_str())
+            .chain(current_blocking.iter().map(|check| check.context.as_str()))
+            .collect();
+        return Ok(Some(selected_checks_from_contexts(
+            &result,
+            available,
+            current_blocking,
+        )));
     }
 
     // Start from current blocking set, then apply additions/removals.
@@ -477,16 +479,47 @@ fn parse_check_selection(
         }
     }
 
-    let selected: Vec<StatusCheckParam> = available
+    Ok(Some(selected_checks_from_contexts(
+        &result,
+        available,
+        current_blocking,
+    )))
+}
+
+/// Build the ruleset check list from selected context names.
+///
+/// Undiscovered checks that are already blocking keep their original
+/// `integration_id`; rediscovered checks intentionally omit it because
+/// GitHub can fill that value in from the check context.
+fn selected_checks_from_contexts(
+    selected_contexts: &HashSet<&str>,
+    available: &[AvailableCheck],
+    current_blocking: &[StatusCheckParam],
+) -> Vec<StatusCheckParam> {
+    let available_contexts: HashSet<&str> = available
         .iter()
-        .filter(|check| result.contains(check.context.as_str()))
-        .map(|check| StatusCheckParam {
-            context: check.context.clone(),
-            integration_id: None,
+        .map(|check| check.context.as_str())
+        .collect();
+    let mut selected: Vec<StatusCheckParam> = current_blocking
+        .iter()
+        .filter(|check| {
+            !available_contexts.contains(check.context.as_str())
+                && selected_contexts.contains(check.context.as_str())
         })
+        .cloned()
         .collect();
 
-    Ok(Some(selected))
+    selected.extend(
+        available
+            .iter()
+            .filter(|check| selected_contexts.contains(check.context.as_str()))
+            .map(|check| StatusCheckParam {
+                context: check.context.clone(),
+                integration_id: None,
+            }),
+    );
+
+    selected
 }
 
 pub fn run(args: MainProtectArgs) -> anyhow::Result<()> {
@@ -756,6 +789,13 @@ mod tests {
         }
     }
 
+    fn status_check_with_integration(context: &str, integration_id: i64) -> StatusCheckParam {
+        StatusCheckParam {
+            context: context.to_string(),
+            integration_id: Some(integration_id),
+        }
+    }
+
     #[test]
     fn parse_check_selection_empty_input_skips_update() {
         let available = vec![available_check("ci/test")];
@@ -787,6 +827,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_check_selection_all_preserves_undiscovered_blocking_checks() {
+        let available = vec![available_check("ci/test"), available_check("ci/lint")];
+        let current = vec![status_check_with_integration("external/deploy", 123)];
+        let selected = parse_check_selection("all", &available, &current)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            selected,
+            vec![
+                StatusCheckParam {
+                    context: "external/deploy".to_string(),
+                    integration_id: Some(123),
+                },
+                StatusCheckParam {
+                    context: "ci/test".to_string(),
+                    integration_id: None,
+                },
+                StatusCheckParam {
+                    context: "ci/lint".to_string(),
+                    integration_id: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn parse_check_selection_adds_and_removes_by_number() {
         let available = vec![
             available_check("ci/test"),
@@ -800,6 +867,18 @@ mod tests {
         let contexts: Vec<_> = selected.into_iter().map(|check| check.context).collect();
 
         assert_eq!(contexts, vec!["ci/lint", "ci/fmt"]);
+    }
+
+    #[test]
+    fn parse_check_selection_preserves_undiscovered_blocking_checks() {
+        let available = vec![available_check("ci/test"), available_check("ci/lint")];
+        let current = vec![status_check("external/deploy"), status_check("ci/test")];
+        let selected = parse_check_selection("2", &available, &current)
+            .unwrap()
+            .unwrap();
+        let contexts: Vec<_> = selected.into_iter().map(|check| check.context).collect();
+
+        assert_eq!(contexts, vec!["external/deploy", "ci/test", "ci/lint"]);
     }
 
     #[test]
