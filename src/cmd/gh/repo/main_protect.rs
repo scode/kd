@@ -24,11 +24,13 @@ struct RulesetSummary {
     name: String,
 }
 
-/// Full ruleset detail, needed to inspect the current enforcement state
-/// and which rules are already configured.
+/// Full ruleset detail, needed to inspect whether an existing ruleset
+/// actually protects the default branch with the required base rules.
 #[derive(Deserialize)]
 struct RulesetDetail {
+    target: String,
     enforcement: String,
+    conditions: Value,
     rules: Vec<RuleRaw>,
 }
 
@@ -223,7 +225,9 @@ fn has_rule(detail: &RulesetDetail, rule_type: &str) -> bool {
 /// Determine whether the existing ruleset is missing any of the base
 /// protections and needs to be updated to bring it into compliance.
 fn needs_fix(detail: &RulesetDetail) -> bool {
-    detail.enforcement != "active"
+    detail.target != "branch"
+        || detail.enforcement != "active"
+        || detail.conditions != conditions()
         || !has_rule(detail, "required_linear_history")
         || !has_rule(detail, "non_fast_forward")
 }
@@ -581,7 +585,9 @@ mod tests {
 
     fn ruleset_detail(enforcement: &str, rule_types: &[&str]) -> RulesetDetail {
         RulesetDetail {
+            target: "branch".to_string(),
             enforcement: enforcement.to_string(),
+            conditions: conditions(),
             rules: rule_types
                 .iter()
                 .map(|t| RuleRaw {
@@ -601,6 +607,27 @@ mod tests {
     #[test]
     fn needs_fix_true_when_enforcement_disabled() {
         let detail = ruleset_detail("disabled", &["required_linear_history", "non_fast_forward"]);
+        assert!(needs_fix(&detail));
+    }
+
+    #[test]
+    fn needs_fix_true_when_target_is_not_branch() {
+        let mut detail = ruleset_detail("active", &["required_linear_history", "non_fast_forward"]);
+        detail.target = "tag".to_string();
+
+        assert!(needs_fix(&detail));
+    }
+
+    #[test]
+    fn needs_fix_true_when_conditions_do_not_target_default_branch() {
+        let mut detail = ruleset_detail("active", &["required_linear_history", "non_fast_forward"]);
+        detail.conditions = serde_json::json!({
+            "ref_name": {
+                "include": ["refs/heads/release"],
+                "exclude": []
+            }
+        });
+
         assert!(needs_fix(&detail));
     }
 
@@ -625,7 +652,9 @@ mod tests {
     #[test]
     fn extract_current_checks_returns_configured_checks() {
         let detail = RulesetDetail {
+            target: "branch".to_string(),
             enforcement: "active".to_string(),
+            conditions: conditions(),
             rules: vec![RuleRaw {
                 rule_type: "required_status_checks".to_string(),
                 parameters: Some(serde_json::json!({
