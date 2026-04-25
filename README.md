@@ -36,9 +36,9 @@ kd gh repo main-protect scode/foo
 `kd yt thumb resize` rewrites the file you pass it. If the image is already below 2 MB, it does nothing. This shells out
 to ImageMagick, so you need `magick` installed.
 
-`kd gh repo apply-preferred-settings` shells out to the GitHub CLI, so `gh` needs to be installed and authenticated. If
-you omit `owner/repo`, it tries to detect the repo from the current directory's `origin` remote. The preferred settings
-are:
+`kd gh repo apply-preferred-settings` shells out to the GitHub CLI, so `gh` needs to be installed and authenticated. In
+single-repo mode, if you omit `owner/repo`, run it from the repo root; it reads `.git/config` there and uses the
+`origin` remote. The preferred settings are:
 
 - squash merge enabled
 - squash commit title set to `PR_TITLE`
@@ -47,10 +47,10 @@ are:
 - rebase merges disabled
 - delete branch on merge enabled
 
-`kd gh repo main-protect` also uses `gh`, and it also auto-detects `owner/repo` from the current directory when you omit
-it. It ensures a ruleset named `main-protect` exists on the default branch, enforces linear history, blocks
-force-pushes, and then lets you interactively choose required status checks from checks it finds on the default branch
-and a recent merged PR returned by `gh pr list`.
+`kd gh repo main-protect` also uses `gh`, and it uses the same repo-root auto-detection when you omit `owner/repo`. It
+ensures a ruleset named `main-protect` exists on the default branch, enforces linear history, blocks force-pushes, and
+then lets you interactively choose required status checks from checks it finds on the default branch and a recent merged
+PR returned by `gh pr list`.
 
 ## Logging
 
