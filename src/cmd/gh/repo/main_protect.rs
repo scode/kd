@@ -265,7 +265,7 @@ fn get_check_runs_for_ref(sh: &Shell, repo: &str, git_ref: &str) -> anyhow::Resu
     Ok(serde_json::from_str(&output)?)
 }
 
-/// Find the head commit SHA of the most recently merged PR, if any.
+/// Find the head commit SHA from a recent merged PR, if any.
 /// Used to discover PR-only checks that don't run on the default branch.
 fn get_latest_merged_pr_sha(sh: &Shell, repo: &str) -> anyhow::Result<Option<String>> {
     let output = cmd!(
