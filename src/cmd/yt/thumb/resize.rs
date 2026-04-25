@@ -32,7 +32,7 @@ pub fn run(file: &Path) -> anyhow::Result<()> {
     let sh = Shell::new()?;
     // Write to a temp file so we don't clobber the original until we
     // know we have a good result.
-    let temp_file = file.with_extension("tmp.resized");
+    let temp_file = temp_output_path(file)?;
 
     let file_str = file
         .to_str()
@@ -75,6 +75,18 @@ pub fn run(file: &Path) -> anyhow::Result<()> {
     }
 }
 
+fn temp_output_path(file: &Path) -> anyhow::Result<std::path::PathBuf> {
+    let extension = file
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .ok_or_else(|| anyhow::anyhow!("Image file must have an extension"))?;
+    file.file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| anyhow::anyhow!("Invalid image file name"))?;
+
+    Ok(file.with_extension(format!("tmp.{extension}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +94,25 @@ mod tests {
 
     fn require_magick(sh: &Shell) -> bool {
         cmd!(sh, "magick -version").quiet().run().is_ok()
+    }
+
+    #[test]
+    fn temp_output_path_keeps_original_extension() {
+        assert_eq!(
+            temp_output_path(Path::new("/tmp/image.png")).unwrap(),
+            Path::new("/tmp/image.tmp.png")
+        );
+    }
+
+    #[test]
+    fn temp_output_path_rejects_extensionless_images() {
+        let err = temp_output_path(Path::new("/tmp/image")).unwrap_err();
+
+        assert!(
+            err.to_string().contains("must have an extension"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
