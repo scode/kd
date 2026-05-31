@@ -16,8 +16,7 @@ pub enum Commands {
 
 impl Commands {
     pub fn run(self) -> anyhow::Result<()> {
-        match self {
-            Commands::Repo { cmd } => cmd.run(),
-        }
+        let Commands::Repo { cmd } = self;
+        cmd.run()
     }
 }

@@ -17,8 +17,7 @@ pub enum Commands {
 
 impl Commands {
     pub fn run(self) -> anyhow::Result<()> {
-        match self {
-            Commands::Resize { file } => resize::run(&file),
-        }
+        let Commands::Resize { file } = self;
+        resize::run(&file)
     }
 }
