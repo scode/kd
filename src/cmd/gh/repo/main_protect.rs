@@ -162,12 +162,21 @@ fn rules_with_checks(checks: &[StatusCheckParam]) -> Vec<RulePayload> {
 
 /// Look up our ruleset by name; returns its ID if it already exists.
 fn find_ruleset(sh: &Shell, repo: &str) -> anyhow::Result<Option<u64>> {
-    let output = cmd!(sh, "gh api repos/{repo}/rulesets").read()?;
+    let endpoint = repo_rulesets_endpoint(repo);
+    let output = cmd!(sh, "gh api {endpoint}").read()?;
     let rulesets: Vec<RulesetSummary> = serde_json::from_str(&output)?;
     Ok(rulesets
         .into_iter()
         .find(|r| r.name == RULESET_NAME)
         .map(|r| r.id))
+}
+
+/// Parent rulesets are inherited policy, not repo-owned configuration.
+/// Including them here can make an org-level `main-protect` look like the
+/// ruleset this command should update, but repository ruleset writes only work
+/// for rulesets owned by the repository itself.
+fn repo_rulesets_endpoint(repo: &str) -> String {
+    format!("repos/{repo}/rulesets?includes_parents=false")
 }
 
 /// Fetch the full detail of a ruleset so we can inspect its current state.
@@ -583,6 +592,14 @@ mod tests {
                 "https://github.com/example-owner/example-repo/actions/runs/123456789/job/1"
             ),
             Some(123456789)
+        );
+    }
+
+    #[test]
+    fn repo_rulesets_endpoint_excludes_parent_rulesets() {
+        assert_eq!(
+            repo_rulesets_endpoint("owner/repo"),
+            "repos/owner/repo/rulesets?includes_parents=false"
         );
     }
 
