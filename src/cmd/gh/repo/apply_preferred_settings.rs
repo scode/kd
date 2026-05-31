@@ -39,6 +39,14 @@ enum ApplyDecision {
     Apply,
 }
 
+#[derive(Clone, Copy)]
+struct ApplyOptions {
+    force: bool,
+    prompt: bool,
+    dry_run: bool,
+    yes: bool,
+}
+
 impl RepoSettings {
     /// Compare the current settings against the preferred values and return
     /// human-readable descriptions of each difference. An empty result means
@@ -102,8 +110,43 @@ fn check_and_apply(
     yes: bool,
 ) -> anyhow::Result<()> {
     let settings = get_settings(sh, repo)?;
+    check_and_apply_settings(
+        repo,
+        &settings,
+        ApplyOptions {
+            force,
+            prompt,
+            dry_run,
+            yes,
+        },
+        confirm,
+        || apply_settings(sh, repo),
+    )
+}
+
+/// Drive the command-level apply decision after the live repo settings have
+/// been loaded. Keeping the GitHub reads and writes outside this function is
+/// what makes the safety properties testable: dry-runs and declined prompts
+/// must not be able to reach the PATCH call by accident.
+fn check_and_apply_settings<C, A>(
+    repo: &str,
+    settings: &RepoSettings,
+    options: ApplyOptions,
+    mut confirm: C,
+    mut apply: A,
+) -> anyhow::Result<()>
+where
+    C: FnMut(&str) -> anyhow::Result<bool>,
+    A: FnMut() -> anyhow::Result<()>,
+{
     let deltas = settings.deltas();
-    let decision = decide_apply(!deltas.is_empty(), force, prompt, dry_run, yes);
+    let decision = decide_apply(
+        !deltas.is_empty(),
+        options.force,
+        options.prompt,
+        options.dry_run,
+        options.yes,
+    );
 
     if matches!(decision, ApplyDecision::AlreadyConfigured) {
         info!("{} already configured correctly", repo);
@@ -136,7 +179,7 @@ fn check_and_apply(
         return Ok(());
     }
 
-    apply_settings(sh, repo)
+    apply()
 }
 
 /// Apply preferred settings across every repo the authenticated user owns,
@@ -222,7 +265,10 @@ fn confirm(prompt: &str) -> anyhow::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApplyDecision, RepoListEntry, RepoSettings, decide_apply, eligible_repos};
+    use super::{
+        ApplyDecision, ApplyOptions, RepoListEntry, RepoSettings, decide_apply, eligible_repos,
+    };
+    use std::cell::Cell;
 
     fn preferred_settings() -> RepoSettings {
         RepoSettings {
@@ -232,6 +278,15 @@ mod tests {
             squash_merge_commit_message: "PR_BODY".to_string(),
             allow_rebase_merge: false,
             delete_branch_on_merge: true,
+        }
+    }
+
+    fn apply_options(force: bool, prompt: bool, dry_run: bool, yes: bool) -> ApplyOptions {
+        ApplyOptions {
+            force,
+            prompt,
+            dry_run,
+            yes,
         }
     }
 
@@ -257,6 +312,133 @@ mod tests {
         let mut settings = preferred_settings();
         settings.allow_merge_commit = true;
         assert_eq!(settings.deltas(), vec!["allow_merge_commit: true -> false"]);
+    }
+
+    #[test]
+    fn check_and_apply_settings_does_not_apply_when_already_configured() {
+        let applied = Cell::new(false);
+
+        super::check_and_apply_settings(
+            "owner/repo",
+            &preferred_settings(),
+            apply_options(false, false, false, false),
+            |_| Ok(true),
+            || {
+                applied.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(!applied.get());
+    }
+
+    #[test]
+    fn check_and_apply_settings_does_not_apply_dry_run() {
+        let mut settings = preferred_settings();
+        settings.allow_merge_commit = true;
+        let applied = Cell::new(false);
+
+        super::check_and_apply_settings(
+            "owner/repo",
+            &settings,
+            apply_options(false, false, true, false),
+            |_| Ok(true),
+            || {
+                applied.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(!applied.get());
+    }
+
+    #[test]
+    fn check_and_apply_settings_skips_when_prompt_declined() {
+        let mut settings = preferred_settings();
+        settings.allow_merge_commit = true;
+        let applied = Cell::new(false);
+
+        super::check_and_apply_settings(
+            "owner/repo",
+            &settings,
+            apply_options(false, true, false, false),
+            |_| Ok(false),
+            || {
+                applied.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(!applied.get());
+    }
+
+    #[test]
+    fn check_and_apply_settings_applies_when_confirmed() {
+        let mut settings = preferred_settings();
+        settings.allow_merge_commit = true;
+        let applied = Cell::new(false);
+
+        super::check_and_apply_settings(
+            "owner/repo",
+            &settings,
+            apply_options(false, true, false, false),
+            |_| Ok(true),
+            || {
+                applied.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(applied.get());
+    }
+
+    #[test]
+    fn check_and_apply_settings_force_applies_without_deltas() {
+        let applied = Cell::new(false);
+
+        super::check_and_apply_settings(
+            "owner/repo",
+            &preferred_settings(),
+            apply_options(true, false, false, false),
+            |_| Ok(true),
+            || {
+                applied.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(applied.get());
+    }
+
+    #[test]
+    fn check_and_apply_settings_yes_applies_without_prompting() {
+        let mut settings = preferred_settings();
+        settings.allow_merge_commit = true;
+        let prompted = Cell::new(false);
+        let applied = Cell::new(false);
+
+        super::check_and_apply_settings(
+            "owner/repo",
+            &settings,
+            apply_options(false, true, false, true),
+            |_| {
+                prompted.set(true);
+                Ok(false)
+            },
+            || {
+                applied.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(!prompted.get());
+        assert!(applied.get());
     }
 
     #[test]
