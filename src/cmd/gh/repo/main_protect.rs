@@ -287,11 +287,7 @@ fn get_latest_merged_pr_sha(sh: &Shell, repo: &str) -> anyhow::Result<Option<Str
     )
     .read()?;
     let sha = output.trim();
-    if sha.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(sha.to_string()))
-    }
+    Ok((!sha.is_empty()).then(|| sha.to_string()))
 }
 
 /// Parse a workflow run ID out of a GitHub Actions details URL.
