@@ -3,6 +3,7 @@
 //! resizing so we get high-quality output across all image formats.
 
 use std::path::Path;
+use tempfile::TempPath;
 use tracing::{debug, info};
 use xshell::{Shell, cmd};
 
@@ -30,8 +31,10 @@ pub fn run(file: &Path) -> anyhow::Result<()> {
     }
 
     let sh = Shell::new()?;
-    // Write to a temp file so we don't clobber the original until we
-    // know we have a good result.
+    // The temp file has to live beside the original so the final persist is
+    // an atomic rename on the same filesystem. It also has to be random and
+    // exclusively created: predictable names are user-data loss bugs in shared
+    // directories.
     let temp_file = temp_output_path(file)?;
 
     let file_str = file
@@ -56,7 +59,7 @@ pub fn run(file: &Path) -> anyhow::Result<()> {
         );
 
         if new_size < MAX_SIZE {
-            std::fs::rename(&temp_file, file)?;
+            temp_file.persist(file)?;
             info!(
                 "Done: {:.2} MB -> {:.2} MB (at {}% scale)",
                 original_size as f64 / 1024.0 / 1024.0,
@@ -67,7 +70,6 @@ pub fn run(file: &Path) -> anyhow::Result<()> {
         }
 
         if scale <= 10 {
-            std::fs::remove_file(&temp_file)?;
             anyhow::bail!("Could not reduce file size below 2MB even at 10% scale");
         }
 
@@ -75,16 +77,22 @@ pub fn run(file: &Path) -> anyhow::Result<()> {
     }
 }
 
-fn temp_output_path(file: &Path) -> anyhow::Result<std::path::PathBuf> {
+fn temp_output_path(file: &Path) -> anyhow::Result<TempPath> {
     let extension = file
         .extension()
         .and_then(|extension| extension.to_str())
         .ok_or_else(|| anyhow::anyhow!("Image file must have an extension"))?;
-    file.file_stem()
+    let stem = file
+        .file_stem()
         .and_then(|stem| stem.to_str())
         .ok_or_else(|| anyhow::anyhow!("Invalid image file name"))?;
+    let parent = file.parent().unwrap_or_else(|| Path::new("."));
 
-    Ok(file.with_extension(format!("tmp.{extension}")))
+    let temp_file = tempfile::Builder::new()
+        .prefix(&format!("{stem}."))
+        .suffix(&format!(".{extension}"))
+        .tempfile_in(parent)?;
+    Ok(temp_file.into_temp_path())
 }
 
 #[cfg(test)]
@@ -98,10 +106,12 @@ mod tests {
 
     #[test]
     fn temp_output_path_keeps_original_extension() {
-        assert_eq!(
-            temp_output_path(Path::new("/tmp/image.png")).unwrap(),
-            Path::new("/tmp/image.tmp.png")
-        );
+        let dir = tempdir().unwrap();
+        let image = dir.path().join("image.png");
+        let temp_path = temp_output_path(&image).unwrap();
+
+        assert_eq!(temp_path.extension().unwrap(), "png");
+        assert_eq!(temp_path.parent().unwrap(), dir.path());
     }
 
     #[test]
