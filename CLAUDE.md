@@ -4,8 +4,8 @@ Requires ImageMagick (`magick` command) at runtime for image operations.
 
 ## Before finishing work
 
-Run `cargo fmt`, `cargo clippy`, `cargo test`, and `dprint fmt` before considering work complete or creating a PR. All
-must pass.
+Run `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, and `dprint check` before considering work
+complete or creating a PR. All must pass.
 
 Agents must conform to `SPEC.md`. If implementation and `SPEC.md` disagree, treat that as a bug or explicitly update
 `SPEC.md` in the same change.
