@@ -1,1 +1,31 @@
-CLAUDE.md
+# AGENTS.md
+
+Requires ImageMagick (`magick` command) at runtime for image operations.
+
+## Before finishing work
+
+Run `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, and `dprint check` before considering work
+complete or creating a PR. All must pass.
+
+Agents must conform to `SPEC.md`. If implementation and `SPEC.md` disagree, treat that as a bug or explicitly update
+`SPEC.md` in the same change.
+
+## Style
+
+Comment generously — the codebase should be easy to skim for intent and functionality. Focus on _why_ and _what the
+purpose is_, not restating the code.
+
+## Conventional Commits
+
+All commit messages and PR titles must use Conventional Commit format: `<type>: <short summary>`
+
+Allowed types: `feat`, `fix`, `docs`, `perf`, `refactor`, `style`, `test`, `chore`, `ci`, `revert`.
+
+Append `!` after the type for breaking changes (e.g. `feat!: remove legacy endpoint`). Scope is optional.
+
+Rules:
+
+- Type reflects the user-visible effect, not the implementation activity. A bug fix that requires heavy refactoring is
+  `fix`, not `refactor`. A new CLI flag is `feat`, not `chore`.
+- The summary after the colon is lowercase, imperative mood, no trailing period.
+- Keep the first line under 72 characters.
