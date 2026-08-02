@@ -1,5 +1,5 @@
-//! `kd` — a small personal CLI toolbox for GitHub repo management
-//! and YouTube thumbnail operations.
+//! `kd` — a small personal CLI toolbox for GitHub repo management,
+//! Ubicloud worker VM management, and YouTube thumbnail operations.
 
 mod cmd;
 
