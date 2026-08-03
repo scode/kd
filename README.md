@@ -29,6 +29,21 @@ kd gh repo apply-preferred-settings --all --yes
 # which CI checks should block merges.
 kd gh repo main-protect
 kd gh repo main-protect scode/foo
+
+# Create a disposable Ubicloud worker VM and enroll it into the tailnet.
+# Defaults to a timestamped name; a custom name gets the ubiworker- prefix
+# added automatically if it's missing.
+kd ubiworker create
+kd ubiworker create myname
+
+# List existing ubiworker VMs.
+kd ubiworker list
+
+# Destroy a ubiworker VM (prompts for confirmation unless --yes is given).
+# With no name, targets the sole existing ubiworker.
+kd ubiworker destroy
+kd ubiworker destroy myname
+kd ubiworker destroy myname --yes
 ```
 
 ## Command Notes
@@ -51,6 +66,17 @@ single-repo mode, if you omit `owner/repo`, run it from the repo root; it reads 
 ensures a ruleset named `main-protect` exists on the default branch, enforces linear history, blocks force-pushes, and
 then lets you interactively choose required status checks from checks it finds on the default branch and a recent merged
 PR returned by `gh pr list`. Existing required checks that are not rediscovered are preserved unless you select `none`.
+
+`kd ubiworker` shells out to the `ubi` CLI (must be on `PATH`) and calls the Tailscale API directly. It needs:
+
+- `UBI_TOKEN` set (read by `ubi` itself)
+- `TS_API_CLIENT_ID` / `TS_API_CLIENT_SECRET` for a Tailscale OAuth client with the `auth_keys` scope, owning
+  `tag:ubicloud`
+- Ubicloud SSH keys registered under the names `laptop` and `devbox`
+
+Every worker gets the same fixed shape: location `us-east-a2`, size `standard-4`, an 80 GiB disk, and the
+`ubuntu-resolute` image — this isn't configurable via flags. See `SPEC.md` for the intentional behavior around
+ownership, naming, and the minted tailscale key's lifetime.
 
 ## Logging
 
