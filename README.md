@@ -68,6 +68,31 @@ kd ubiworker destroy
 kd ubiworker destroy myname
 kd ubiworker destroy myname otherworker
 kd ubiworker destroy --all
+
+# Connect to a ubiworker over ssh (host-key checking is deliberately
+# bypassed; see SPEC.md). With no name, targets the sole existing
+# ubiworker, like destroy.
+kd ubiworker ssh
+kd ubiworker ssh myname
+
+# Everything after the worker name forwards straight to ssh: a remote
+# command, or ssh's own flags (e.g. a port forward).
+kd ubiworker ssh myname uptime
+kd ubiworker ssh myname -L 8080:localhost:80
+
+# The first argument is only treated as a worker name if it doesn't start
+# with `-`, so an ssh flag kd doesn't itself recognize can be given with no
+# name at all:
+kd ubiworker ssh -L 8080:localhost:80
+
+# But a leading flag that collides with one of kd's own (-v/-q/-h) is
+# claimed by kd first, not forwarded -- use `--` to force it through to ssh
+# instead. Under the same leading-argument rule, `--` followed by a bare
+# word is a worker name, not a remote command run on the sole worker: `kd
+# ubiworker ssh -- uptime` targets a worker literally named `uptime`
+# (normalized to `ubiworker-uptime`), it does not run `uptime` anywhere.
+kd ubiworker ssh -- -v
+kd ubiworker ssh -- -L 8080:localhost:80
 ```
 
 ## Command Notes
@@ -97,6 +122,7 @@ PR returned by `gh pr list`. Existing required checks that are not rediscovered 
 - `TS_API_CLIENT_ID` / `TS_API_CLIENT_SECRET` for a Tailscale OAuth client with the `auth_keys` scope, owning
   `tag:ubicloud`
 - Ubicloud SSH keys registered under the names `laptop` and `devbox`
+- an OpenSSH `ssh` binary on `PATH`, for `kd ubiworker ssh` (kd execs directly into it; see `SPEC.md`)
 
 Every worker gets the same fixed shape: location `us-east-a2`, size `standard-4`, an 80 GiB disk, and the
 `ubuntu-resolute` image — this isn't configurable via flags. See `SPEC.md` for the intentional behavior around

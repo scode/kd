@@ -29,6 +29,7 @@
 pub mod create;
 pub mod destroy;
 pub mod list;
+pub mod ssh;
 pub mod tailscale;
 
 use anyhow::bail;
@@ -85,6 +86,49 @@ pub struct DestroyArgs {
     pub all: bool,
 }
 
+/// `kd ubiworker ssh [ARGS...]` arguments.
+///
+/// Deliberately a single trailing capture, not a `name: Option<String>`
+/// positional followed by a separate `ssh_args: Vec<String>` (an earlier,
+/// buggy shape). Splitting into two positionals let clap's *global* `-v`/`-q`
+/// flags steal a hyphen-leading token that was meant for `ssh` as soon as the
+/// `name` positional had already been satisfied — e.g. `kd ubiworker ssh
+/// myname -v` parsed `-v` as kd's own verbosity flag instead of forwarding it,
+/// because the trailing-vararg positional hadn't "started" yet from clap's
+/// point of view. A single positional has no such handoff point: once
+/// anything after `ssh` starts matching, every remaining token — flag-shaped
+/// or not — belongs to this vec, `-v`/`-q` included. See `ssh::split_target`
+/// for how the first element is then reinterpreted as an optional worker
+/// name.
+///
+/// `OsString`, not `String`: the module docs promise ssh args are forwarded
+/// verbatim, and `String` would reject a non-UTF-8 argument (a legal argv
+/// entry on Unix) that `ssh` itself would happily accept.
+#[derive(Args)]
+pub struct SshArgs {
+    /// Optionally a worker name, then arguments forwarded verbatim to `ssh`
+    /// after the `user@host` destination.
+    ///
+    /// The first element is treated as the worker name unless it starts with
+    /// `-` (see `ssh::split_target`); everything else is forwarded to `ssh`
+    /// as-is — a remote command, or flags like `-L`/`-D`. An ssh flag clap
+    /// doesn't itself recognize (e.g. `-L 8080:localhost:80`) is captured
+    /// here just fine with no name given and no `--` needed. But a flag that
+    /// *does* collide with one of kd's own registered flags — `-v`, `-q`,
+    /// `-h` (and their long forms) — is claimed by kd first, before this
+    /// vec ever sees it, exactly as it would be anywhere else in the
+    /// command line; use `--` to force it through instead (e.g. `kd
+    /// ubiworker ssh -- -v` to run `ssh -v` for its own verbose output). See
+    /// the CLI wiring tests in `crate::cmd::tests` for both cases pinned
+    /// directly against clap's parse output.
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "NAME_OR_SSH_ARG"
+    )]
+    pub args: Vec<std::ffi::OsString>,
+}
+
 #[derive(Subcommand)]
 pub enum Commands {
     /// Create a ubiworker VM and enroll it into the tailnet
@@ -103,6 +147,25 @@ pub enum Commands {
     Destroy(DestroyArgs),
     /// List existing ubiworker VMs
     List,
+    /// Connect to an owned ubiworker over ssh
+    ///
+    /// With no name, targets the sole existing ubiworker, exactly like
+    /// `destroy`. The first argument is the worker name unless it starts
+    /// with `-`, in which case there is no name and every argument is
+    /// forwarded to `ssh` (a remote command, or flags like `-L`); a leading
+    /// flag that also happens to be one of kd's own (`-v`/`-q`/`-h`) is
+    /// claimed by kd instead, so route it through `ssh` with `--` (e.g. `kd
+    /// ubiworker ssh -- -v`). kd execs directly into `ssh`, replacing
+    /// itself, so ssh's exit code/signals/tty behave exactly as they would
+    /// running `ssh` by hand. Host-key checking is deliberately bypassed
+    /// (see `ssh` module docs and SPEC.md): worker names are reused and each
+    /// fresh boot gets a new host key, so ordinary known-hosts pinning would
+    /// hard-fail every reconnection. Bypassing it delegates endpoint
+    /// identity entirely to Tailscale — reachability is already gated by
+    /// tailnet ACLs, not by the auth key a worker enrolled with, so this
+    /// isn't inventing a new trust boundary, just declining to add a second,
+    /// friction-only one on top.
+    Ssh(SshArgs),
 }
 
 impl Commands {
@@ -111,6 +174,7 @@ impl Commands {
             Commands::Create(args) => create::run(args),
             Commands::Destroy(args) => destroy::run(args),
             Commands::List => list::run(),
+            Commands::Ssh(args) => ssh::run(args),
         }
     }
 }
