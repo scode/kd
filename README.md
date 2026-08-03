@@ -2,6 +2,29 @@
 
 Small personal toolbox. The name means nothing; it is just designed to be easy to type and not clash with other tools.
 
+## Install
+
+Works on macOS and Linux:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/scode/kd/main/install.sh | bash
+```
+
+It clones into `~/git/kd` (failing rather than touching a checkout that's already there) and runs `cargo install` on the
+checkout. It needs `git` and a C toolchain already installed — it checks and says so if they're missing. If cargo isn't
+working (missing, or a toolchain-less rustup shim), it asks whether to install rust via homebrew or rustup first. Read
+[`install.sh`](install.sh) before piping it if you (sensibly) don't run shell scripts off the internet blind.
+
+### Uninstall
+
+Deletes the checkout and the installed binary; rust itself is left alone. (With a custom `CARGO_HOME`, the binary is
+under `$CARGO_HOME/bin` instead.)
+
+```sh
+rm -f ~/.cargo/bin/kd
+rm -rf ~/git/kd
+```
+
 ## Commands TLDR
 
 ```sh
