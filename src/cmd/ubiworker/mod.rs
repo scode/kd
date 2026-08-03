@@ -70,16 +70,19 @@ pub struct CreateArgs {
     pub name: Option<String>,
 }
 
-/// `kd ubiworker destroy [NAME] [--yes]` arguments.
+/// `kd ubiworker destroy [NAME...] [--all]` arguments.
 #[derive(Args)]
 pub struct DestroyArgs {
-    /// Worker name to destroy. If omitted, exactly one owned ubiworker must
-    /// exist and it is targeted automatically.
-    pub name: Option<String>,
+    /// Worker name(s) to destroy. If omitted (and `--all` isn't given),
+    /// exactly one owned ubiworker must exist and it is targeted
+    /// automatically.
+    pub names: Vec<String>,
 
-    /// Skip the "Destroy <name>?" confirmation prompt.
-    #[arg(short, long)]
-    pub yes: bool,
+    /// Destroy every owned ubiworker. A no-op (not an error) if none
+    /// exist, so scripted cleanup doesn't have to special-case an empty
+    /// owned-worker listing.
+    #[arg(short, long, conflicts_with = "names")]
+    pub all: bool,
 }
 
 #[derive(Subcommand)]
@@ -90,11 +93,13 @@ pub enum Commands {
     /// one-use tailscale auth key, and creates the VM with a first-boot
     /// script that installs tailscale and joins the tailnet under it.
     Create(CreateArgs),
-    /// Destroy a ubiworker VM
+    /// Destroy one or more ubiworker VMs
     ///
-    /// Prompts for confirmation unless --yes is given. If no name is
-    /// given, targets the sole existing ubiworker (an error if there are
-    /// zero or more than one).
+    /// Takes any number of names, or --all to destroy every owned
+    /// ubiworker. With neither, targets the sole existing ubiworker (an
+    /// error if there are zero or more than one). There is no confirmation
+    /// prompt (see SPEC.md); resolution is fail-closed, so a name that
+    /// doesn't match destroys nothing rather than partially executing.
     Destroy(DestroyArgs),
     /// List existing ubiworker VMs
     List,

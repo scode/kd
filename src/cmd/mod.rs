@@ -75,13 +75,42 @@ mod tests {
     }
 
     #[test]
-    fn ubiworker_destroy_with_name_and_long_yes_parses() {
-        assert!(parses(&["kd", "ubiworker", "destroy", "myname", "--yes"]));
+    fn ubiworker_destroy_with_two_names_parses() {
+        assert!(parses(&["kd", "ubiworker", "destroy", "a", "b"]));
     }
 
     #[test]
-    fn ubiworker_destroy_short_yes_flag_parses() {
-        assert!(parses(&["kd", "ubiworker", "destroy", "-y", "myname"]));
+    fn ubiworker_destroy_long_all_flag_parses() {
+        assert!(parses(&["kd", "ubiworker", "destroy", "--all"]));
+    }
+
+    #[test]
+    fn ubiworker_destroy_short_all_flag_parses() {
+        assert!(parses(&["kd", "ubiworker", "destroy", "-a"]));
+    }
+
+    /// `--all` and an explicit name are mutually exclusive (`conflicts_with`
+    /// in `DestroyArgs`): resolving both at once is nonsensical, and this
+    /// guards against that wiring regressing silently.
+    #[test]
+    fn ubiworker_destroy_all_with_name_is_rejected() {
+        assert!(!parses(&["kd", "ubiworker", "destroy", "--all", "myname"]));
+    }
+
+    /// Regression test for the removed `--yes`/`-y` flag: the interactive
+    /// confirmation prompt it used to skip is gone entirely (see
+    /// `SPEC.md`), so the flag itself must no longer parse.
+    #[test]
+    fn ubiworker_destroy_yes_flag_is_rejected() {
+        assert!(!parses(&["kd", "ubiworker", "destroy", "myname", "--yes"]));
+    }
+
+    /// The short form of the removed flag is a separate parse path — `-a`
+    /// still exists (as --all), so reintroducing only `-y` must be caught
+    /// on its own.
+    #[test]
+    fn ubiworker_destroy_short_yes_flag_is_rejected() {
+        assert!(!parses(&["kd", "ubiworker", "destroy", "-y", "myname"]));
     }
 
     #[test]

@@ -39,11 +39,12 @@ kd ubiworker create myname
 # List existing ubiworker VMs.
 kd ubiworker list
 
-# Destroy a ubiworker VM (prompts for confirmation unless --yes is given).
+# Destroy ubiworker VM(s) (no confirmation prompt; see SPEC.md).
 # With no name, targets the sole existing ubiworker.
 kd ubiworker destroy
 kd ubiworker destroy myname
-kd ubiworker destroy myname --yes
+kd ubiworker destroy myname otherworker
+kd ubiworker destroy --all
 ```
 
 ## Command Notes
