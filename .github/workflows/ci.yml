@@ -56,3 +56,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check formatting with dprint
         uses: dprint/check@v2.3
+
+  # install.sh is fetched from GitHub and piped straight into bash by users,
+  # so a broken revision fails for everyone with no other CI signal; static
+  # checks are the only automated guard it gets (no test harness by design).
+  shellcheck:
+    runs-on: ubicloud
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash -n install.sh
+      - run: shellcheck install.sh
