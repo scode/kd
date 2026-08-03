@@ -270,14 +270,32 @@ fn create_vm(sh: &Shell, name: &str, ssh_keys: &str, init_script: &str) -> anyho
     .context("ubi vm create failed")
 }
 
+/// Render the final human-readable summary for a newly created worker
+/// named `name`.
+///
+/// Split out from [`print_summary`] specifically so the "how do you connect
+/// to what you just created" line is unit-testable as a string: it's the
+/// one line most likely to silently regress back to a stale form (a bare
+/// `ssh user@name` invocation, from before `kd ubiworker ssh` existed) if
+/// someone edits this text without noticing what it's supposed to say. That
+/// kind of regression wouldn't fail any behavior test — `create` itself
+/// still works — it would just quietly point every future reader at the
+/// wrong command.
+fn render_summary(name: &str) -> String {
+    [
+        format!("Created ubiworker '{name}'"),
+        format!("  ssh keys installed: {}", SSH_KEY_NAMES.join(", ")),
+        format!("  tailscale tag: {TAILSCALE_TAG}"),
+        format!("  connect: kd ubiworker ssh {name}"),
+        format!("  destroy: kd ubiworker destroy {name}"),
+    ]
+    .join("\n")
+}
+
 /// Print the final human-readable summary to stdout (not tracing), so it
 /// survives `-q` and stays easy to read at the end of a create run.
 fn print_summary(name: &str) {
-    println!("Created ubiworker '{name}'");
-    println!("  ssh keys installed: {}", SSH_KEY_NAMES.join(", "));
-    println!("  tailscale tag: {TAILSCALE_TAG}");
-    println!("  connect: ssh {UNIX_USER}@{name}");
-    println!("  destroy: kd ubiworker destroy {name}");
+    println!("{}", render_summary(name));
 }
 
 #[cfg(test)]
@@ -424,5 +442,24 @@ mod tests {
         assert!(!redacted.contains(auth_key));
         assert!(redacted.contains("--auth-key='<redacted>'"));
         assert!(redacted.contains("--hostname='ubiworker-foo'"));
+    }
+
+    /// Pins the summary's connect instruction to the current `kd ubiworker
+    /// ssh <name>` form and guards against it silently reverting to the
+    /// pre-`ssh`-subcommand form (a bare `ssh scode@<name>`). Either
+    /// regression would compile and run fine — `create` doesn't fail — it
+    /// would just quietly strand users on stale advice at the exact moment
+    /// they're looking for the next command to run.
+    #[test]
+    fn render_summary_recommends_kd_ssh_not_raw_ssh() {
+        let summary = render_summary("ubiworker-foo");
+        assert!(
+            summary.contains("kd ubiworker ssh ubiworker-foo"),
+            "unexpected summary: {summary}"
+        );
+        assert!(
+            !summary.contains("ssh scode@ubiworker-foo"),
+            "summary should not recommend the obsolete raw ssh form: {summary}"
+        );
     }
 }
