@@ -9,8 +9,9 @@
 
 use super::tailscale;
 use super::{
-    BOOT_IMAGE, CreateArgs, LOCATION, SIZE, STORAGE_SIZE_GIB, TAILSCALE_TAG, default_worker_name,
-    is_valid_auth_key, local_unix_user, normalize_worker_name, require_env,
+    BOOT_IMAGE, CreateArgs, LOCATION, SIZE, STORAGE_SIZE_GIB, TAILSCALE_TAG, TS_API_CLIENT_ID,
+    TS_API_CLIENT_SECRET, UBI_TOKEN, default_worker_name, is_valid_auth_key, local_unix_user,
+    normalize_worker_name, require_envs,
 };
 use anyhow::{Context, bail};
 use jiff::Zoned;
@@ -30,13 +31,15 @@ const PUBLIC_KEY_MARKER: &str = "public key:";
 const POLICY_EDITOR_URL: &str = "https://login.tailscale.com/admin/acls/file";
 
 pub fn run(args: CreateArgs) -> anyhow::Result<()> {
-    // Fail fast, naming the specific missing variable, before doing any
-    // work. UBI_TOKEN itself is read by the `ubi` binary, not by kd — we
-    // only check it's set so a missing token surfaces here instead of as an
-    // opaque `ubi` error later.
-    require_env("UBI_TOKEN")?;
-    let client_id = require_env("TS_API_CLIENT_ID")?;
-    let client_secret = require_env("TS_API_CLIENT_SECRET")?;
+    // Fail fast, before doing any work, with every missing variable and
+    // how to obtain it in one error (see the env preflight section in
+    // `mod.rs`). UBI_TOKEN itself is read by the `ubi` binary, not by kd —
+    // we only check it's set so a missing token surfaces here instead of
+    // as an opaque `ubi` error later.
+    let creds = require_envs(&[UBI_TOKEN, TS_API_CLIENT_ID, TS_API_CLIENT_SECRET])?;
+    let [_, client_id, client_secret]: [String; 3] = creds
+        .try_into()
+        .expect("require_envs returns one value per requested variable");
 
     let sh = Shell::new()?;
     let name = match args.name {

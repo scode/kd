@@ -456,18 +456,104 @@ pub(crate) fn owned_workers(sh: &Shell) -> anyhow::Result<Vec<VmRow>> {
 }
 
 // ── Env preflight ────────────────────────────────────────────────────────
+// Every subcommand checks its credentials up front, before any `ubi` call
+// or Tailscale request. Two rules shape the error: report *all* missing
+// variables at once (so a fresh machine is fixed in one round-trip, not
+// one variable per failed run), and tell the reader where to go get each
+// value, since the person hitting this is usually a human with a browser
+// rather than a script.
 
-/// Read a required env var, failing fast with the specific variable name.
+/// A credential kd needs from the environment, paired with where a human
+/// goes to obtain it.
 ///
-/// Called directly from each command's `run()`, not from any helper below
-/// it — helpers take credentials as parameters instead, which is both what
-/// keeps them testable without env mutation and what keeps the secret's
-/// flow through the program legible from function signatures alone.
-pub(crate) fn require_env(name: &str) -> anyhow::Result<String> {
-    match std::env::var(name) {
-        Ok(value) if !value.is_empty() => Ok(value),
-        _ => bail!("{name} is not set"),
+/// The `how_to_get` text is console-navigation prose. Vendor consoles move
+/// things around without notice, so treat a stale path here as a bug to
+/// fix, not as a reason to drop the hint — even a slightly-off pointer
+/// beats a bare "is not set".
+pub(crate) struct EnvVar {
+    pub(crate) name: &'static str,
+    pub(crate) how_to_get: &'static str,
+}
+
+/// Ubicloud API token. Read by the `ubi` binary itself, never by kd; kd only
+/// checks it's present so the failure surfaces here rather than as an
+/// opaque `ubi` error mid-command.
+pub(crate) const UBI_TOKEN: EnvVar = EnvVar {
+    name: "UBI_TOKEN",
+    how_to_get: "open https://console.ubicloud.com, pick your project, open its Tokens page, \
+                 Create Token, and export the value it shows",
+};
+
+/// Tailscale OAuth client id, used (with the secret) to mint per-worker
+/// auth keys. Needs the `auth_keys` write scope and must own
+/// [`TAILSCALE_TAG`].
+///
+/// The hint spells out `tag:ubicloud` literally because a `const &str`
+/// can't be interpolated into another const; a test pins it to
+/// [`TAILSCALE_TAG`] so the two can't silently diverge.
+pub(crate) const TS_API_CLIENT_ID: EnvVar = EnvVar {
+    name: "TS_API_CLIENT_ID",
+    how_to_get: "open https://console.tailscale.com/admin/settings/trust-credentials, create an \
+                 OAuth credential with the auth_keys write scope and tag tag:ubicloud; the \
+                 client id is shown on the credential afterwards",
+};
+
+/// Tailscale OAuth client secret, paired with [`TS_API_CLIENT_ID`]. Shown
+/// exactly once at creation, so a lost secret means generating a new client.
+pub(crate) const TS_API_CLIENT_SECRET: EnvVar = EnvVar {
+    name: "TS_API_CLIENT_SECRET",
+    how_to_get: "shown exactly once when the OAuth credential is generated at \
+                 https://console.tailscale.com/admin/settings/trust-credentials (starts with \
+                 tskey-client-); if you no longer have it, create a new credential to get a \
+                 fresh id+secret",
+};
+
+/// Read a set of required env vars, failing with one combined error that
+/// names every missing variable and how to obtain each.
+///
+/// Returns values in the same order as `vars`. Called directly from each
+/// command's `run()`, not from any helper below it — helpers take
+/// credentials as parameters instead, which is both what keeps them
+/// testable without env mutation and what keeps the secret's flow through
+/// the program legible from function signatures alone.
+pub(crate) fn require_envs(vars: &[EnvVar]) -> anyhow::Result<Vec<String>> {
+    require_envs_with(vars, |name| std::env::var(name).ok())
+}
+
+/// [`require_envs`] with the environment lookup injected, so the
+/// report-everything behavior is testable without touching process env.
+/// An empty value counts as unset: an `export FOO=` left behind by a
+/// half-edited shell profile should get the same help as no `export` at all.
+fn require_envs_with(
+    vars: &[EnvVar],
+    lookup: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<Vec<String>> {
+    let mut values = Vec::with_capacity(vars.len());
+    let mut missing = Vec::new();
+    for var in vars {
+        match lookup(var.name) {
+            Some(value) if !value.is_empty() => values.push(value),
+            _ => missing.push(var),
+        }
     }
+    if missing.is_empty() {
+        return Ok(values);
+    }
+    use std::fmt::Write as _;
+    let mut msg = String::from("missing required environment variable");
+    if missing.len() > 1 {
+        msg.push('s');
+    }
+    msg.push(':');
+    for var in &missing {
+        // Writing into a String is infallible, so the Result is safe to drop.
+        let _ = write!(
+            msg,
+            "\n  {}\n    how to get it: {}",
+            var.name, var.how_to_get
+        );
+    }
+    bail!(msg)
 }
 
 #[cfg(test)]
@@ -476,6 +562,65 @@ mod tests {
     use jiff::civil::date;
     use jiff::tz::TimeZone;
     use std::path::PathBuf;
+
+    // ── require_envs ─────────────────────────────────────────────────────
+
+    const A: EnvVar = EnvVar {
+        name: "A",
+        how_to_get: "get A here",
+    };
+    const B: EnvVar = EnvVar {
+        name: "B",
+        how_to_get: "get B here",
+    };
+
+    /// The whole point of the batch preflight: a machine missing several
+    /// credentials gets every one named, with its how-to hint, in a single
+    /// failure rather than one per run. Also pins that an empty value is
+    /// reported as missing, not silently passed through as "".
+    #[test]
+    fn require_envs_reports_every_missing_var_with_instructions() {
+        let err = require_envs_with(&[A, B], |name| match name {
+            "A" => None,
+            "B" => Some(String::new()),
+            _ => unreachable!(),
+        })
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("variables:"), "{msg}");
+        assert!(msg.contains("A\n") && msg.contains("get A here"), "{msg}");
+        assert!(msg.contains("B\n") && msg.contains("get B here"), "{msg}");
+    }
+
+    /// With everything set, values come back in request order so callers
+    /// can destructure positionally.
+    #[test]
+    fn require_envs_returns_values_in_request_order() {
+        let values = require_envs_with(&[B, A], |name| Some(format!("{name}-val"))).unwrap();
+        assert_eq!(values, vec!["B-val".to_string(), "A-val".to_string()]);
+    }
+
+    /// A single missing var must not be lumped into a pluralized message:
+    /// singular wording keeps the common case reading naturally.
+    #[test]
+    fn require_envs_uses_singular_for_one_missing_var() {
+        let err =
+            require_envs_with(&[A, B], |name| (name == "A").then(|| "x".to_string())).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("variable:") && !msg.contains("variables:"),
+            "{msg}"
+        );
+        assert!(msg.contains("B\n") && msg.contains("get B here"), "{msg}");
+        assert!(!msg.contains("get A here"), "{msg}");
+    }
+
+    /// The Tailscale hint names the tag literally (see the const's docs);
+    /// this keeps it from drifting if `TAILSCALE_TAG` is ever changed.
+    #[test]
+    fn tailscale_client_id_hint_names_the_real_tag() {
+        assert!(TS_API_CLIENT_ID.how_to_get.contains(TAILSCALE_TAG));
+    }
 
     // ── validate_unix_user ───────────────────────────────────────────────
     // The username flows unescaped into `--unix-user=` and `user@host`, so

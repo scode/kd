@@ -4,14 +4,14 @@
 //! ([`super::owned_workers`]) so `destroy` (when no name is given) can reuse
 //! it; this module is just the thin printing layer on top.
 
-use super::{owned_workers, require_env};
+use super::{UBI_TOKEN, owned_workers, require_envs};
 use tracing::info;
 use xshell::Shell;
 
 pub fn run() -> anyhow::Result<()> {
     // Same fail-fast rationale as `create`: `ubi` reads UBI_TOKEN itself,
     // kd just surfaces a missing token as a clear error up front.
-    require_env("UBI_TOKEN")?;
+    require_envs(&[UBI_TOKEN])?;
     let sh = Shell::new()?;
     let workers = owned_workers(&sh)?;
 

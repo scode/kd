@@ -22,6 +22,10 @@ non-ImageMagick helpers still behave correctly. It does not prove that thumbnail
   to be one fixed, disposable shape; something else should be built by hand with `ubi` directly.
 - A default worker name is `ubiworker-YYYYMMDD-HHMMSS` in the local timezone, with no collision-avoidance suffix.
   Ubicloud rejects a duplicate name server-side, so kd doesn't need to detect the collision itself.
+- Every subcommand preflights the credential env vars it needs (`UBI_TOKEN` for all; `TS_API_CLIENT_ID` and
+  `TS_API_CLIENT_SECRET` additionally for `create`) before any `ubi` call or Tailscale request. If any is missing, the
+  error names _every_ missing variable at once, each with where a human obtains the value, so a fresh machine is fixed
+  in one round-trip. An empty value counts as unset.
 - `create` returns as soon as `ubi vm create` returns. It does not poll for the VM to actually join the tailnet.
 - Every minted tailscale auth key is one-use, ephemeral, preauthorized, tagged `tag:ubicloud`, and expires after one
   hour. The VM's own first-boot script retries joining the tailnet several times over several minutes; because the key

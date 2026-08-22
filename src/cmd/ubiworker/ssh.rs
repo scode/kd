@@ -33,7 +33,9 @@
 //! it by hand outside kd. Login authorization is the tailnet policy's `ssh`
 //! section, not keys; see SPEC.md for the rule the tailnet needs.
 
-use super::{SshArgs, VmRow, local_unix_user, normalize_worker_name, owned_workers, require_env};
+use super::{
+    SshArgs, UBI_TOKEN, VmRow, local_unix_user, normalize_worker_name, owned_workers, require_envs,
+};
 use anyhow::{Context, bail};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::process::CommandExt;
@@ -45,7 +47,7 @@ pub fn run(args: SshArgs) -> anyhow::Result<()> {
     // UBI_TOKEN itself (needed here for the `ubi vm list` resolution
     // round-trip below), kd just surfaces a missing token as a clear error
     // up front instead of letting it fail deep inside `ubi`.
-    require_env("UBI_TOKEN")?;
+    require_envs(&[UBI_TOKEN])?;
     let sh = Shell::new()?;
 
     let (name_token, ssh_args) = split_target(&args.args);

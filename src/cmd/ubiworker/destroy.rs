@@ -21,7 +21,7 @@
 //! rollback. The error names the worker that failed; re-running is the
 //! recovery for whatever's left.
 
-use super::{DestroyArgs, VmRow, normalize_worker_name, owned_workers, require_env};
+use super::{DestroyArgs, UBI_TOKEN, VmRow, normalize_worker_name, owned_workers, require_envs};
 use anyhow::{Context, bail};
 use std::collections::HashSet;
 use tracing::info;
@@ -30,7 +30,7 @@ use xshell::{Shell, cmd};
 pub fn run(args: DestroyArgs) -> anyhow::Result<()> {
     // Same fail-fast rationale as `create`: `ubi` reads UBI_TOKEN itself,
     // kd just surfaces a missing token as a clear error up front.
-    require_env("UBI_TOKEN")?;
+    require_envs(&[UBI_TOKEN])?;
     let sh = Shell::new()?;
 
     // Normalize before listing, not after: an explicit name must be
