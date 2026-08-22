@@ -298,8 +298,8 @@ mod tests {
     /// provide.
     #[test]
     fn build_ssh_argv_no_extra_args() {
-        let argv = build_ssh_argv("scode@ubiworker-foo", &[]);
-        assert_eq!(argv, vec!["tailscale", "ssh", "scode@ubiworker-foo"]);
+        let argv = build_ssh_argv("alice@ubiworker-foo", &[]);
+        assert_eq!(argv, vec!["tailscale", "ssh", "alice@ubiworker-foo"]);
     }
 
     /// A forwarded flag (as opposed to a remote command) must survive
@@ -309,13 +309,13 @@ mod tests {
     #[test]
     fn build_ssh_argv_forwards_flag_args() {
         let ssh_args: Vec<OsString> = vec!["-L".into(), "8080:localhost:80".into()];
-        let argv = build_ssh_argv("scode@ubiworker-foo", &ssh_args);
+        let argv = build_ssh_argv("alice@ubiworker-foo", &ssh_args);
         assert_eq!(
             argv,
             vec![
                 "tailscale",
                 "ssh",
-                "scode@ubiworker-foo",
+                "alice@ubiworker-foo",
                 "-L",
                 "8080:localhost:80",
             ]
@@ -330,10 +330,10 @@ mod tests {
     #[test]
     fn build_ssh_argv_forwards_remote_command() {
         let ssh_args: Vec<OsString> = vec!["uptime".into()];
-        let argv = build_ssh_argv("scode@ubiworker-foo", &ssh_args);
+        let argv = build_ssh_argv("alice@ubiworker-foo", &ssh_args);
         assert_eq!(
             argv,
-            vec!["tailscale", "ssh", "scode@ubiworker-foo", "uptime"]
+            vec!["tailscale", "ssh", "alice@ubiworker-foo", "uptime"]
         );
     }
 

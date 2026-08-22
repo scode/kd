@@ -28,13 +28,17 @@ non-ImageMagick helpers still behave correctly. It does not prove that thumbnail
   is only consumed by a _successful_ `tailscale up`, retrying with the same key across failed attempts is safe.
 - Workers enroll with Tailscale SSH enabled (`tailscale up --ssh`). This is what makes `tailscale ssh <name>` — and
   therefore `kd ubiworker ssh` — work: a node that merely joins the tailnet is not a Tailscale SSH server and has no
-  Tailscale-managed host key for clients to verify against. The Ubicloud-provisioned OpenSSH server (with the `laptop`
-  and `devbox` keys) keeps running, but Tailscale SSH takes over port 22 on the worker's _tailnet_ address, and the
-  MagicDNS name resolves to that address: plain `ssh <user>@<name>` is therefore still Tailscale SSH (tailnet policy,
-  Tailscale host key), not an independent fallback. The system sshd and the installed keys are reachable only via a
-  non-tailnet address such as the VM's public IP. Workers created before this behavior existed do not advertise a
-  Tailscale SSH host key and are unreachable through `kd ubiworker ssh` until `tailscale set --ssh` is run on them (via
-  their old access path) or they are recreated (see README).
+  Tailscale-managed host key for clients to verify against. The Ubicloud-provisioned OpenSSH server (with every SSH key
+  registered in the Ubicloud account installed on it) keeps running, but Tailscale SSH takes over port 22 on the
+  worker's _tailnet_ address, and the MagicDNS name resolves to that address: plain `ssh <user>@<name>` is therefore
+  still Tailscale SSH (tailnet policy, Tailscale host key), not an independent fallback. The system sshd and the
+  installed keys are reachable only via a non-tailnet address such as the VM's public IP. Workers created before this
+  behavior existed do not advertise a Tailscale SSH host key and are unreachable through `kd ubiworker ssh` until
+  `tailscale set --ssh` is run on them (via their old access path) or they are recreated (see README).
+- `create` installs _every_ SSH key currently registered in the Ubicloud account (`ubi sk list`) — there is no hardcoded
+  key name or count. If none are registered, `create` fails before minting a Tailscale key or creating a VM: a worker
+  with no authorized_keys entries would be unreachable over plain ssh, and that's a preflight failure worth having
+  rather than a silently-bricked worker.
 - _Who_ may log in over Tailscale SSH, and as which Unix user, is decided by the tailnet policy's `ssh` section, which
   kd neither reads nor edits: workers are owned by `tag:ubicloud`, so Tailscale's default "SSH to your own devices" rule
   does not cover them and a rule granting the operator access to `tag:ubicloud` as the provisioned user must exist, as

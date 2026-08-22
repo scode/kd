@@ -122,7 +122,7 @@ PR returned by `gh pr list`. Existing required checks that are not rediscovered 
 - `UBI_TOKEN` set (read by `ubi` itself)
 - `TS_API_CLIENT_ID` / `TS_API_CLIENT_SECRET` for a Tailscale OAuth client with the `auth_keys` scope, owning
   `tag:ubicloud`
-- Ubicloud SSH keys registered under the names `laptop` and `devbox`
+- at least one SSH key registered in Ubicloud (`ubi sk create`); every registered key is installed on each worker
 - a `tailscale` binary on `PATH` (with the machine joined to the same tailnet) plus an OpenSSH `ssh` binary, for
   `kd ubiworker ssh` — kd execs directly into `tailscale ssh`, which in turn wraps `ssh` (see `SPEC.md`). On macOS this
   means the standalone Tailscale distribution: the App Store and TestFlight builds refuse the `tailscale ssh`
