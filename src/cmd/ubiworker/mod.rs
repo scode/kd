@@ -51,8 +51,6 @@ pub(crate) const SIZE: &str = "standard-4";
 pub(crate) const STORAGE_SIZE_GIB: u32 = 80;
 /// Boot image slug.
 pub(crate) const BOOT_IMAGE: &str = "ubuntu-resolute";
-/// Names of the ubicloud-registered SSH keys installed on every worker.
-pub(crate) const SSH_KEY_NAMES: [&str; 2] = ["laptop", "devbox"];
 /// Tailscale ACL tag applied to every minted auth key, and — because the
 /// key is what a device authenticates with — to every worker that joins
 /// using it.
@@ -220,7 +218,7 @@ pub struct SshArgs {
 pub enum Commands {
     /// Create a ubiworker VM and enroll it into the tailnet
     ///
-    /// Fetches the registered "laptop" and "devbox" SSH keys, mints a
+    /// Fetches every SSH key registered in the Ubicloud account, mints a
     /// one-use tailscale auth key, and creates the VM with a first-boot
     /// script that installs tailscale and joins the tailnet under it.
     Create(CreateArgs),
@@ -495,14 +493,7 @@ mod tests {
     fn validate_unix_user_accepts_ubicloud_compatible_names() {
         let max_len = format!("a{}", "b".repeat(31));
         assert_eq!(max_len.len(), 32);
-        for user in [
-            "scode",
-            "alice",
-            "a-b_c",
-            "user123",
-            "_svc",
-            max_len.as_str(),
-        ] {
+        for user in ["alice", "a-b_c", "user123", "_svc", max_len.as_str()] {
             assert!(validate_unix_user(user).is_ok(), "{user} should be valid");
         }
     }

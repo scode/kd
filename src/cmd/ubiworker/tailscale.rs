@@ -453,10 +453,10 @@ mod tests {
     #[test]
     fn parse_status_login_resolves_self_user() {
         let json = r#"{
-            "Self": {"UserID": 1569462067201318},
+            "Self": {"UserID": 1001},
             "User": {
-                "1535632220428206": {"LoginName": "tagged-devices"},
-                "1569462067201318": {"LoginName": "alice@github"}
+                "1002": {"LoginName": "tagged-devices"},
+                "1001": {"LoginName": "alice@github"}
             }
         }"#;
         assert_eq!(parse_status_login(json).unwrap(), "alice@github");

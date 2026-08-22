@@ -1,16 +1,16 @@
 //! `kd ubiworker create`: provision a new Ubicloud VM and enroll it into
 //! the tailnet in one shot.
 //!
-//! The flow: fetch the two registered SSH public keys, mint a single-use
-//! tailscale auth key, embed it in a first-boot shell script that installs
-//! and joins tailscale, and hand everything to `ubi vm create`. No polling
-//! for the VM to actually join the tailnet — this returns as soon as
-//! `ubi vm create` does.
+//! The flow: fetch every SSH public key registered in the Ubicloud account,
+//! mint a single-use tailscale auth key, embed it in a first-boot shell
+//! script that installs and joins tailscale, and hand everything to `ubi vm
+//! create`. No polling for the VM to actually join the tailnet — this
+//! returns as soon as `ubi vm create` does.
 
 use super::tailscale;
 use super::{
-    BOOT_IMAGE, CreateArgs, LOCATION, SIZE, SSH_KEY_NAMES, STORAGE_SIZE_GIB, TAILSCALE_TAG,
-    default_worker_name, is_valid_auth_key, local_unix_user, normalize_worker_name, require_env,
+    BOOT_IMAGE, CreateArgs, LOCATION, SIZE, STORAGE_SIZE_GIB, TAILSCALE_TAG, default_worker_name,
+    is_valid_auth_key, local_unix_user, normalize_worker_name, require_env,
 };
 use anyhow::{Context, bail};
 use jiff::Zoned;
@@ -49,8 +49,8 @@ pub fn run(args: CreateArgs) -> anyhow::Result<()> {
     // bad local username fails before a VM exists (see `local_unix_user`).
     let unix_user = local_unix_user(&sh)?;
 
-    info!("Fetching SSH keys ({})...", SSH_KEY_NAMES.join(", "));
-    let ssh_keys = fetch_ssh_keys(&sh)?;
+    info!("Fetching SSH keys from Ubicloud...");
+    let (ssh_keys, ssh_key_names) = fetch_ssh_keys(&sh)?;
 
     info!("Minting tailscale auth key...");
     // One shared, timeout-configured agent for both Tailscale calls (see
@@ -72,28 +72,119 @@ pub fn run(args: CreateArgs) -> anyhow::Result<()> {
     // suggestion, so a machine where it can't be resolved still gets its
     // worker (and a placeholder in the rule).
     let tailscale_login = tailscale::local_login(&sh);
-    print_summary(&name, &unix_user, tailscale_login.as_deref());
+    print_summary(
+        &name,
+        &unix_user,
+        &ssh_key_names,
+        tailscale_login.as_deref(),
+    );
     Ok(())
 }
 
-/// Run `ubi sk <name> show` for every registered key in [`SSH_KEY_NAMES`]
-/// and join the results with `\n` into the single positional argument `ubi
-/// vm create` expects. `ubi` accepts raw key content in that positional
-/// argument, not a file path. Each element being
-/// joined may itself already be a multi-line authorized_keys payload (see
-/// [`parse_public_keys`]); this join is what stitches multiple registered
-/// keys' payloads together, not what separates lines within one.
-fn fetch_ssh_keys(sh: &Shell) -> anyhow::Result<String> {
-    let mut keys = Vec::with_capacity(SSH_KEY_NAMES.len());
-    for key_name in SSH_KEY_NAMES {
-        let output = cmd!(sh, "ubi sk {key_name} show")
-            .read()
-            .with_context(|| format!("failed to fetch ssh key '{key_name}' from ubicloud"))?;
-        let key = parse_public_keys(&output)
-            .with_context(|| format!("could not parse public key '{key_name}' from ubi output"))?;
-        keys.push(key);
+/// One row of `ubi sk list -N` output: a registered SSH key's Ubicloud id
+/// and its display name.
+///
+/// Mirrors [`super::VmRow`]/[`parse_vm_list`](super::parse_vm_list): same
+/// server-side `format_rows(%i[id name], ...)` rendering, just a different
+/// pair of columns. Kept local to `create.rs` rather than promoted to
+/// `mod.rs` alongside `VmRow` because nothing else in the codebase needs to
+/// list Ubicloud SSH keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SshKeyRow {
+    id: String,
+    name: String,
+}
+
+/// Parse `ubi sk list -N` output into rows.
+///
+/// `-N` suppresses the header, so every non-blank line is `<id> <name>`,
+/// whitespace-separated. Ubicloud key names can't contain whitespace (the
+/// server rejects one that does at registration time), so a plain
+/// `split_whitespace` never misparses a legitimate name — there is no name
+/// containing a space to confuse with the id column. Blank lines are
+/// skipped; any other token count is a hard error naming the offending
+/// line, the same fail-closed stance as [`parse_vm_list`](super::parse_vm_list):
+/// `fetch_ssh_keys` refuses to install a worker's keys at all rather than
+/// silently working from a listing it couldn't fully parse.
+fn parse_ssh_key_list(output: &str) -> anyhow::Result<Vec<SshKeyRow>> {
+    let mut rows = Vec::new();
+    for line in output.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match line.split_whitespace().collect::<Vec<_>>().as_slice() {
+            [id, name] => rows.push(SshKeyRow {
+                id: id.to_string(),
+                name: name.to_string(),
+            }),
+            _ => bail!("unexpected 'ubi sk list' row (expected 2 columns: id, name): '{line}'"),
+        }
     }
-    Ok(keys.join("\n"))
+    Ok(rows)
+}
+
+/// List every SSH key registered in the Ubicloud account (`ubi sk list
+/// -N`), fetch each one's authorized_keys payload (`ubi sk <id> show`), and
+/// join the payloads with `\n` into the single positional argument `ubi vm
+/// create` expects. `ubi` accepts raw key content in that positional
+/// argument, not a file path. Each element being joined may itself already
+/// be a multi-line authorized_keys payload (see [`parse_public_keys`]);
+/// this join is what stitches multiple registered keys' payloads together,
+/// not what separates lines within one.
+///
+/// Fetches by id, not name: `ubi sk (sk-id | sk-name) show` accepts either,
+/// but the id is what `ubi sk list` itself hands back as the unambiguous
+/// identifier for a row, so there's no reason to round-trip through a name
+/// that (unlike the id) isn't guaranteed unique.
+///
+/// Returns the joined key content alongside the list of key *names* that
+/// were installed, purely so [`run`] can report them in the create summary
+/// without re-deriving names from raw key content (which doesn't carry
+/// Ubicloud's own key name at all — see [`parse_public_keys`]).
+///
+/// Every worker used to get a fixed set of hard-coded key names (one
+/// person's own keys, which made kd unusable for anyone else); this installs
+/// *every* key currently registered in the account instead, so the set of
+/// keys that can log in follows Ubicloud's key registry rather than a
+/// constant baked into kd.
+///
+/// Zero registered keys is therefore a hard error, checked before a single
+/// key is fetched: a worker provisioned with no authorized_keys entry at
+/// all would be unreachable over plain ssh, and this preflight catches that
+/// before the Tailscale key mint or VM create that follow in [`run`] spend
+/// anything.
+fn fetch_ssh_keys(sh: &Shell) -> anyhow::Result<(String, Vec<String>)> {
+    let list_output = cmd!(sh, "ubi sk list -N")
+        .read()
+        .context("failed to list ubicloud ssh keys")?;
+    let rows = parse_ssh_key_list(&list_output)?;
+    if rows.is_empty() {
+        bail!(
+            "no SSH keys registered in Ubicloud; register at least one first (e.g. `ubi sk \
+             create`) — a worker with none would be unreachable over plain ssh"
+        );
+    }
+
+    let mut keys = Vec::with_capacity(rows.len());
+    let mut names = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let id = &row.id;
+        let output = cmd!(sh, "ubi sk {id} show").read().with_context(|| {
+            format!(
+                "failed to fetch ssh key '{}' (id {id}) from ubicloud",
+                row.name
+            )
+        })?;
+        let key = parse_public_keys(&output).with_context(|| {
+            format!(
+                "could not parse public key '{}' (id {id}) from ubi output",
+                row.name
+            )
+        })?;
+        keys.push(key);
+        names.push(row.name.clone());
+    }
+    Ok((keys.join("\n"), names))
 }
 
 /// Extract the full authorized_keys payload from `ubi sk ... show` output:
@@ -331,11 +422,16 @@ fn create_vm_args(name: &str, unix_user: &str, ssh_keys: &str, init_script: &str
 /// kind of regression wouldn't fail any behavior test — `create` itself
 /// still works — it would just quietly point every future reader at the
 /// wrong command.
-fn render_summary(name: &str, unix_user: &str, tailscale_login: Option<&str>) -> String {
+fn render_summary(
+    name: &str,
+    unix_user: &str,
+    ssh_key_names: &[String],
+    tailscale_login: Option<&str>,
+) -> String {
     [
         format!("Created ubiworker '{name}'"),
         format!("  unix user: {unix_user}"),
-        format!("  ssh keys installed: {}", SSH_KEY_NAMES.join(", ")),
+        format!("  ssh keys installed: {}", ssh_key_names.join(", ")),
         format!("  tailscale tag: {TAILSCALE_TAG}"),
         format!("  connect: kd ubiworker ssh {name}"),
         format!("  destroy: kd ubiworker destroy {name}"),
@@ -388,20 +484,95 @@ fn render_ssh_policy_rule(unix_user: &str, tailscale_login: Option<&str>) -> Str
 
 /// Print the final human-readable summary to stdout (not tracing), so it
 /// survives `-q` and stays easy to read at the end of a create run.
-fn print_summary(name: &str, unix_user: &str, tailscale_login: Option<&str>) {
-    println!("{}", render_summary(name, unix_user, tailscale_login));
+fn print_summary(
+    name: &str,
+    unix_user: &str,
+    ssh_key_names: &[String],
+    tailscale_login: Option<&str>,
+) {
+    println!(
+        "{}",
+        render_summary(name, unix_user, ssh_key_names, tailscale_login)
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // ── parse_ssh_key_list ──────────────────────────────────────────────
+    // `fetch_ssh_keys` uses this parse to decide *which* keys to fetch and
+    // install, so a misparse here would silently change who can log in to
+    // every future worker (installing too few keys, or erroring outright) —
+    // these tests pin the same fail-closed contract as `parse_vm_list`.
+
+    #[test]
+    fn parse_ssh_key_list_parses_well_formed_rows() {
+        let output = "sk1 work-key\nsk2 phone\n";
+        assert_eq!(
+            parse_ssh_key_list(output).unwrap(),
+            vec![
+                SshKeyRow {
+                    id: "sk1".to_string(),
+                    name: "work-key".to_string(),
+                },
+                SshKeyRow {
+                    id: "sk2".to_string(),
+                    name: "phone".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_ssh_key_list_skips_blank_lines() {
+        let output = "\nsk1 work-key\n\n";
+        let rows = parse_ssh_key_list(output).unwrap();
+        assert_eq!(
+            rows,
+            vec![SshKeyRow {
+                id: "sk1".to_string(),
+                name: "work-key".to_string()
+            }]
+        );
+    }
+
+    /// A row that isn't exactly `<id> <name>` must be a hard error, not
+    /// silently dropped or truncated: `fetch_ssh_keys` treats the parsed
+    /// row count as "how many keys exist," and installing fewer keys than
+    /// are actually registered (because a malformed row was ignored) would
+    /// be a silent access regression nobody asked for.
+    #[test]
+    fn parse_ssh_key_list_rejects_malformed_row() {
+        let err = parse_ssh_key_list("only-one-token\n").unwrap_err();
+        assert!(
+            err.to_string().contains("only-one-token"),
+            "unexpected error: {err}"
+        );
+        let err = parse_ssh_key_list("sk1 name extra\n").unwrap_err();
+        assert!(
+            err.to_string().contains("sk1 name extra"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Empty `ubi sk list -N` output (no keys registered at all) must parse
+    /// to an empty vec rather than erroring — it's [`fetch_ssh_keys`], not
+    /// the parser, that turns "zero keys" into a hard error, so the parser
+    /// itself must stay a faithful, judgment-free translation of the rows
+    /// it's given.
+    #[test]
+    fn parse_ssh_key_list_empty_output_yields_empty_vec() {
+        assert_eq!(parse_ssh_key_list("").unwrap(), Vec::new());
+        assert_eq!(parse_ssh_key_list("\n\n").unwrap(), Vec::new());
+    }
+
     #[test]
     fn parse_public_keys_extracts_single_key_after_marker() {
-        let output = "name: laptop\npublic key:\nssh-ed25519 AAAAC3abc laptop\n";
+        let output = "name: mykey\npublic key:\nssh-ed25519 AAAAC3abc mykey\n";
         assert_eq!(
             parse_public_keys(output).unwrap(),
-            "ssh-ed25519 AAAAC3abc laptop"
+            "ssh-ed25519 AAAAC3abc mykey"
         );
     }
 
@@ -429,7 +600,7 @@ mod tests {
 
     #[test]
     fn parse_public_keys_errors_when_marker_missing() {
-        let err = parse_public_keys("name: laptop\nssh-ed25519 AAAAC3abc laptop\n").unwrap_err();
+        let err = parse_public_keys("name: mykey\nssh-ed25519 AAAAC3abc mykey\n").unwrap_err();
         assert!(
             err.to_string().contains("public key:"),
             "unexpected error: {err}"
@@ -467,7 +638,7 @@ mod tests {
     /// check would have rejected it.
     #[test]
     fn validate_authorized_keys_line_accepts_option_prefixed_line() {
-        assert!(validate_authorized_keys_line("restrict,pty ssh-ed25519 AAAA laptop").is_ok());
+        assert!(validate_authorized_keys_line("restrict,pty ssh-ed25519 AAAA mykey").is_ok());
     }
 
     #[test]
@@ -567,20 +738,35 @@ mod tests {
 
     /// Pins the summary's connect instruction to the current `kd ubiworker
     /// ssh <name>` form and guards against it silently reverting to the
-    /// pre-`ssh`-subcommand form (a bare `ssh scode@<name>`). Either
+    /// pre-`ssh`-subcommand form (a bare `ssh alice@<name>`). Either
     /// regression would compile and run fine — `create` doesn't fail — it
     /// would just quietly strand users on stale advice at the exact moment
     /// they're looking for the next command to run.
     #[test]
     fn render_summary_recommends_kd_ssh_not_raw_ssh() {
-        let summary = render_summary("ubiworker-foo", "scode", None);
+        let summary = render_summary("ubiworker-foo", "alice", &[], None);
         assert!(
             summary.contains("kd ubiworker ssh ubiworker-foo"),
             "unexpected summary: {summary}"
         );
         assert!(
-            !summary.contains("ssh scode@ubiworker-foo"),
+            !summary.contains("ssh alice@ubiworker-foo"),
             "summary should not recommend the obsolete raw ssh form: {summary}"
+        );
+    }
+
+    /// The summary's key listing must reflect whichever keys `fetch_ssh_keys`
+    /// actually installed, not a hardcoded set: this is the regression test
+    /// for the "install every registered key" change, since the old
+    /// implementation printed a constant here regardless of what was
+    /// installed.
+    #[test]
+    fn render_summary_lists_the_installed_ssh_key_names() {
+        let names = vec!["work-key".to_string(), "phone".to_string()];
+        let summary = render_summary("ubiworker-foo", "alice", &names, None);
+        assert!(
+            summary.contains("ssh keys installed: work-key, phone"),
+            "unexpected summary: {summary}"
         );
     }
 
@@ -592,7 +778,7 @@ mod tests {
     /// the fix.
     #[test]
     fn render_summary_includes_policy_rule_for_the_provisioned_user() {
-        let summary = render_summary("ubiworker-foo", "alice", Some("alice@github"));
+        let summary = render_summary("ubiworker-foo", "alice", &[], Some("alice@github"));
         // Independently written expectation — not derived from
         // `render_ssh_policy_rule` — so a wrong action, widened src, or
         // broken syntax in the renderer can't leak into the oracle.
@@ -624,14 +810,24 @@ mod tests {
     }
 
     /// Pins that the operator-derived username is what actually reaches
-    /// `ubi` as `--unix-user=`, as an exact token. Restoring the old
-    /// hard-coded account, or dropping the flag, must fail here even though
-    /// every summary/ssh test would still pass.
+    /// `ubi` as `--unix-user=`, as an exact token, and that it's the *only*
+    /// `--unix-user=` token present. Restoring the old hard-coded account —
+    /// whether alongside or instead of the operator-derived one — or
+    /// dropping the flag, must fail here even though every summary/ssh test
+    /// would still pass.
     #[test]
     fn create_vm_args_pass_the_unix_user_and_fixed_shape() {
         let args = create_vm_args("ubiworker-foo", "alice", "ssh-ed25519 AAAA", "#!/bin/sh\n");
-        assert!(args.contains(&"--unix-user=alice".to_string()), "{args:?}");
-        assert!(!args.iter().any(|a| a.contains("scode")), "{args:?}");
+        let unix_user_args: Vec<&str> = args
+            .iter()
+            .filter(|a| a.starts_with("--unix-user="))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            unix_user_args,
+            vec!["--unix-user=alice"],
+            "expected exactly one --unix-user= token, matching the passed-in user: {args:?}"
+        );
         assert_eq!(args[0], "vm");
         assert_eq!(args[1], "us-east-a2/ubiworker-foo");
         assert_eq!(args[2], "create");
