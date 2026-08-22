@@ -69,8 +69,9 @@ kd ubiworker destroy myname
 kd ubiworker destroy myname otherworker
 kd ubiworker destroy --all
 
-# Connect to a ubiworker over ssh (host-key checking is deliberately
-# bypassed; see SPEC.md). With no name, targets the sole existing
+# Connect to a ubiworker over Tailscale SSH (kd execs into `tailscale ssh`,
+# which verifies the host key via the tailnet, so your ~/.ssh/known_hosts is
+# never touched; see SPEC.md). With no name, targets the sole existing
 # ubiworker, like destroy.
 kd ubiworker ssh
 kd ubiworker ssh myname
@@ -122,7 +123,29 @@ PR returned by `gh pr list`. Existing required checks that are not rediscovered 
 - `TS_API_CLIENT_ID` / `TS_API_CLIENT_SECRET` for a Tailscale OAuth client with the `auth_keys` scope, owning
   `tag:ubicloud`
 - Ubicloud SSH keys registered under the names `laptop` and `devbox`
-- an OpenSSH `ssh` binary on `PATH`, for `kd ubiworker ssh` (kd execs directly into it; see `SPEC.md`)
+- a `tailscale` binary on `PATH` (with the machine joined to the same tailnet) plus an OpenSSH `ssh` binary, for
+  `kd ubiworker ssh` — kd execs directly into `tailscale ssh`, which in turn wraps `ssh` (see `SPEC.md`). On macOS this
+  means the standalone Tailscale distribution: the App Store and TestFlight builds refuse the `tailscale ssh`
+  subcommand.
+- the same local username on every machine you run `create` and `ssh` from: `create` provisions the account `id -un`
+  reports (it must satisfy Ubicloud's `[a-z_][a-z0-9_-]{0,31}` rule and must not be `root`, so don't run kd under
+  `sudo`), `ssh` logs in as whatever `id -un` reports where _it_ runs, and kd stores nothing about which user a worker
+  was created with.
+- a tailnet policy `ssh` rule allowing you to log in to `tag:ubicloud` as that username. Workers are tag-owned, so
+  Tailscale's default "SSH to your own devices" rule does not cover them. `create` prints the exact rule object to use,
+  with your own Tailscale login as `src` and your username under `users`; append it to the existing `ssh` array of the
+  policy file (create the array if there is none):
+
+  ```json
+  { "action": "accept", "src": ["<your-tailscale-login>"], "dst": ["tag:ubicloud"], "users": ["<output of id -un>"] }
+  ```
+
+  Widen `src` (e.g. to `autogroup:member`) only if you really mean to let every tailnet member log in as you. The
+  ordinary ACLs/grants must also allow you to reach `tag:ubicloud` on port 22.
+
+Upgrading from a kd that predates Tailscale SSH: workers it created joined the tailnet without `--ssh` and have no
+Tailscale SSH host key, so `kd ubiworker ssh` fails against them. Run `sudo tailscale set --ssh` on each one (over
+whatever access you used before), or destroy and recreate them.
 
 Every worker gets the same fixed shape: location `us-east-a2`, size `standard-4`, an 80 GiB disk, and the
 `ubuntu-resolute` image — this isn't configurable via flags. See `SPEC.md` for the intentional behavior around

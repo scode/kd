@@ -1,6 +1,7 @@
 //! Ubicloud worker VM lifecycle: disposable VMs that self-enroll into a
-//! Tailscale tailnet on boot, so they're reachable over `ssh` without any
-//! public-IP or firewall bookkeeping.
+//! Tailscale tailnet on boot with Tailscale SSH enabled, so they're
+//! reachable over `tailscale ssh` without any public-IP, firewall, or
+//! host-key bookkeeping.
 //!
 //! # Ownership convention
 //!
@@ -32,7 +33,7 @@ pub mod list;
 pub mod ssh;
 pub mod tailscale;
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 use clap::{Args, Subcommand};
 use tracing::debug;
 use xshell::{Shell, cmd};
@@ -50,8 +51,6 @@ pub(crate) const SIZE: &str = "standard-4";
 pub(crate) const STORAGE_SIZE_GIB: u32 = 80;
 /// Boot image slug.
 pub(crate) const BOOT_IMAGE: &str = "ubuntu-resolute";
-/// Unix login user provisioned on the VM.
-pub(crate) const UNIX_USER: &str = "scode";
 /// Names of the ubicloud-registered SSH keys installed on every worker.
 pub(crate) const SSH_KEY_NAMES: [&str; 2] = ["laptop", "devbox"];
 /// Tailscale ACL tag applied to every minted auth key, and — because the
@@ -61,6 +60,94 @@ pub(crate) const TAILSCALE_TAG: &str = "tag:ubicloud";
 /// Prefix marking a VM as a kd-managed ubiworker (see module docs on the
 /// ownership convention).
 pub(crate) const NAME_PREFIX: &str = "ubiworker-";
+
+// ── Unix login user ──────────────────────────────────────────────────────
+// The one piece of worker shape that is *not* a constant: it follows the
+// operator running kd.
+
+/// The Unix login user provisioned on a worker, and the user `ssh` logs in
+/// as: whoever is running kd, by local username.
+///
+/// There's deliberately no constant or flag here. Deriving the account from
+/// the invoking user means the VM's login matches the operator's own name
+/// without any configuration, and it's what lets `tailscale ssh`'s own
+/// default (local username) and kd's explicit `user@host` agree. The
+/// implied contract is that `ssh` is run by the same person, under the same
+/// local username, as `create` was — kd stores nothing about which user a
+/// worker was provisioned with, so a worker created as `alice` and later
+/// `kd ubiworker ssh`'d from a box where you're `bob` will simply be
+/// refused by the tailnet SSH policy / the VM. That's accepted for a
+/// single-operator fleet.
+///
+/// Resolved via `id -un` rather than `$USER`/`$LOGNAME`: those env vars are
+/// hints that `sudo`, containers, and cron routinely leave wrong or unset,
+/// whereas `id -un` derives the name from the process's effective uid via
+/// the system user database (NSS / directory services included). The
+/// result is validated — exactly as reported, no whitespace normalization
+/// (`Cmd::read` already strips the trailing newline) — against Ubicloud's
+/// own username rule before it's interpolated anywhere (see
+/// [`validate_unix_user`]), so a name Ubicloud would reject fails here,
+/// before any key is minted or VM billed.
+///
+/// The `id` child gets kd's credentials stripped from its environment for
+/// the same reason the `tailscale ssh` exec does: a wrapper or substituted
+/// `id` earlier on `PATH` has no business receiving `UBI_TOKEN` or the
+/// Tailscale OAuth pair.
+pub(crate) fn local_unix_user(sh: &Shell) -> anyhow::Result<String> {
+    let user = cmd!(sh, "id -un")
+        .quiet()
+        .env_remove("UBI_TOKEN")
+        .env_remove("TS_API_CLIENT_ID")
+        .env_remove("TS_API_CLIENT_SECRET")
+        .read()
+        .context("failed to determine the local username via `id -un`")?;
+    validate_unix_user(&user)?;
+    Ok(user)
+}
+
+/// Reject anything Ubicloud would not accept as a VM unix user, plus
+/// `root`.
+///
+/// The charset mirrors Ubicloud's `ALLOWED_OS_USER_NAME_PATTERN`
+/// (`lib/validation.rb`): `[a-z_][a-z0-9_-]{0,31}` — lowercase only, a
+/// letter or underscore first, at most 32 characters. Mirroring it exactly
+/// (rather than some looser "safe charset") is what makes the preflight
+/// meaningful: `create` runs this before fetching keys, minting a one-use
+/// Tailscale auth key, or starting a billable VM, and a rule looser than
+/// Ubicloud's would let `Alice` or `john.doe` through only to fail at
+/// `ubi vm create` after all of that. The same rule also guarantees the
+/// value is safe to interpolate into `ubi`'s `--unix-user=` argv and the
+/// `user@host` ssh destination (no whitespace, `@`, or leading `-`).
+///
+/// `root` is refused on top of the charset: `id -un` under `sudo` reports
+/// `root`, and letting that through would turn an accidental `sudo kd
+/// ubiworker create` into a worker whose only account — and whose printed
+/// SSH policy grant — is direct remote root. The error says to rerun
+/// without sudo rather than silently trusting `$SUDO_USER`, which is just
+/// another env hint.
+///
+/// Pure, so it's unit-testable without the `id` round-trip.
+fn validate_unix_user(user: &str) -> anyhow::Result<()> {
+    const MAX_LEN: usize = 32;
+    let mut chars = user.chars();
+    let first_ok = matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c == '_');
+    let rest_ok =
+        chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+    if !(first_ok && rest_ok && user.len() <= MAX_LEN) {
+        bail!(
+            "local username '{user}' is not a valid ubicloud unix username \
+             (expected [a-z_][a-z0-9_-]{{0,31}}: lowercase, letter or underscore first, \
+             at most {MAX_LEN} characters)"
+        );
+    }
+    if user == "root" {
+        bail!(
+            "refusing to use 'root' as the worker unix user (are you running kd under sudo? \
+             rerun it as your normal user)"
+        );
+    }
+    Ok(())
+}
 
 /// `kd ubiworker create [NAME]` arguments.
 #[derive(Args)]
@@ -147,24 +234,23 @@ pub enum Commands {
     Destroy(DestroyArgs),
     /// List existing ubiworker VMs
     List,
-    /// Connect to an owned ubiworker over ssh
+    /// Connect to an owned ubiworker over Tailscale SSH
     ///
     /// With no name, targets the sole existing ubiworker, exactly like
     /// `destroy`. The first argument is the worker name unless it starts
     /// with `-`, in which case there is no name and every argument is
-    /// forwarded to `ssh` (a remote command, or flags like `-L`); a leading
+    /// forwarded to ssh (a remote command, or flags like `-L`); a leading
     /// flag that also happens to be one of kd's own (`-v`/`-q`/`-h`) is
-    /// claimed by kd instead, so route it through `ssh` with `--` (e.g. `kd
-    /// ubiworker ssh -- -v`). kd execs directly into `ssh`, replacing
-    /// itself, so ssh's exit code/signals/tty behave exactly as they would
-    /// running `ssh` by hand. Host-key checking is deliberately bypassed
-    /// (see `ssh` module docs and SPEC.md): worker names are reused and each
-    /// fresh boot gets a new host key, so ordinary known-hosts pinning would
-    /// hard-fail every reconnection. Bypassing it delegates endpoint
-    /// identity entirely to Tailscale — reachability is already gated by
-    /// tailnet ACLs, not by the auth key a worker enrolled with, so this
-    /// isn't inventing a new trust boundary, just declining to add a second,
-    /// friction-only one on top.
+    /// claimed by kd instead, so route it through with `--` (e.g. `kd
+    /// ubiworker ssh -- -v`). kd execs directly into `tailscale ssh`,
+    /// replacing itself, so the exit code/signals/tty behave exactly as they
+    /// would running it by hand. Going through `tailscale ssh` rather than
+    /// plain `ssh` is what gives host-key verification without known-hosts
+    /// pinning (see `ssh` module docs and SPEC.md): worker names are reused
+    /// and each fresh boot gets a new OpenSSH host key, so ordinary pinning
+    /// would hard-fail every reconnection, whereas the Tailscale-managed
+    /// host key is advertised through the coordination server and checked
+    /// against that.
     Ssh(SshArgs),
 }
 
@@ -391,6 +477,151 @@ mod tests {
     use super::*;
     use jiff::civil::date;
     use jiff::tz::TimeZone;
+    use std::path::PathBuf;
+
+    // ── validate_unix_user ───────────────────────────────────────────────
+    // The username flows unescaped into `--unix-user=` and `user@host`, so
+    // these pin the charset as the one defence against a surprising
+    // `id -un` result landing in either place, and pin it to Ubicloud's
+    // rule specifically so the preflight can't drift looser than the
+    // server-side check it exists to front-run.
+
+    /// Ordinary Ubicloud-compatible local usernames must keep passing:
+    /// rejecting a valid operator here would block `create` before it does
+    /// anything, so the acceptance side of the rule matters as much as the
+    /// rejection side. Includes both Ubicloud boundaries (underscore first
+    /// char, exactly 32 characters).
+    #[test]
+    fn validate_unix_user_accepts_ubicloud_compatible_names() {
+        let max_len = format!("a{}", "b".repeat(31));
+        assert_eq!(max_len.len(), 32);
+        for user in [
+            "scode",
+            "alice",
+            "a-b_c",
+            "user123",
+            "_svc",
+            max_len.as_str(),
+        ] {
+            assert!(validate_unix_user(user).is_ok(), "{user} should be valid");
+        }
+    }
+
+    /// Names Ubicloud rejects must be rejected *here*, before any key is
+    /// minted or VM billed: uppercase, periods, a leading digit or hyphen,
+    /// and 33+ characters all match Ubicloud's `[a-z_][a-z0-9_-]{0,31}`
+    /// refusal. A looser local rule would let these fail late at `ubi vm
+    /// create`.
+    #[test]
+    fn validate_unix_user_mirrors_ubicloud_rejections() {
+        let too_long = format!("a{}", "b".repeat(32));
+        assert_eq!(too_long.len(), 33);
+        for user in ["Alice", "john.doe", "1john", "-flag", too_long.as_str()] {
+            assert!(
+                validate_unix_user(user).is_err(),
+                "{user:?} should be rejected"
+            );
+        }
+    }
+
+    /// Empty, whitespace-bearing (including leading/trailing — the value
+    /// is validated as reported, never trimmed), `@`-bearing, and
+    /// backslash-bearing names must be refused: each would change the
+    /// meaning of the `user@host` destination or of `ubi`'s argv rather
+    /// than just failing late.
+    #[test]
+    fn validate_unix_user_rejects_unsafe_names() {
+        for user in [
+            "",
+            "a b",
+            " alice",
+            "alice ",
+            "alice@corp",
+            "a\nb",
+            "dom\\user",
+        ] {
+            assert!(
+                validate_unix_user(user).is_err(),
+                "{user:?} should be rejected"
+            );
+        }
+    }
+
+    /// `root` is syntactically a valid Ubicloud username but must be
+    /// refused: it's what `id -un` reports under `sudo`, and accepting it
+    /// would provision (and print a policy grant for) direct remote root.
+    /// The error must point at sudo so the operator knows the fix.
+    #[test]
+    fn validate_unix_user_rejects_root_and_mentions_sudo() {
+        let err = validate_unix_user("root").unwrap_err();
+        assert!(err.to_string().contains("sudo"), "unexpected error: {err}");
+    }
+
+    // ── local_unix_user ──────────────────────────────────────────────────
+    // These run a fake `id` placed on the Shell's *own* PATH: xshell's
+    // `Shell::set_var` scopes the variable to commands spawned through that
+    // Shell, so the test process's environment is never mutated (the
+    // project forbids env mutation in tests — see CLAUDE.md).
+
+    /// Build a Shell whose `id` is a script that records its argv and
+    /// prints `output` (verbatim, so tests control the trailing newline).
+    /// Returns the Shell, the temp dir that must outlive it, and the path
+    /// the fake writes its argv to.
+    fn shell_with_fake_id(output: &str, exit_code: i32) -> (Shell, tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let argv_log = dir.path().join("id-argv");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s' '{}'\nexit {}\n",
+            argv_log.display(),
+            output.replace('\'', "'\\''"),
+            exit_code
+        );
+        let id_path = dir.path().join("id");
+        std::fs::write(&id_path, script).unwrap();
+        std::fs::set_permissions(&id_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sh = Shell::new().unwrap();
+        // Prepend so the fake shadows the real `id` for this Shell only.
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![dir.path().to_path_buf()];
+        paths.extend(std::env::split_paths(&path));
+        sh.set_var("PATH", std::env::join_paths(paths).unwrap());
+        (sh, dir, argv_log)
+    }
+
+    /// The central contract of the username change: the account comes from
+    /// `id -un` (not a constant, not `$USER`), with the newline `id` prints
+    /// stripped and nothing else altered. A regression to any other source
+    /// would leave the pure-validator tests green, so this is the one test
+    /// that actually pins the lookup.
+    #[test]
+    fn local_unix_user_runs_id_un_and_returns_its_output() {
+        let (sh, _dir, argv_log) = shell_with_fake_id("alice\n", 0);
+        assert_eq!(local_unix_user(&sh).unwrap(), "alice");
+        assert_eq!(std::fs::read_to_string(argv_log).unwrap(), "-un\n");
+    }
+
+    /// A username `id` reports that Ubicloud would refuse must surface as
+    /// kd's own validation error — proving the lookup result actually goes
+    /// through `validate_unix_user` rather than being returned raw.
+    #[test]
+    fn local_unix_user_rejects_invalid_reported_name() {
+        let (sh, _dir, _) = shell_with_fake_id("Alice\n", 0);
+        let err = local_unix_user(&sh).unwrap_err();
+        assert!(err.to_string().contains("Alice"), "unexpected error: {err}");
+    }
+
+    /// A failing `id` must propagate as an error naming the lookup, not be
+    /// swallowed into an empty or garbage username.
+    #[test]
+    fn local_unix_user_propagates_id_failure() {
+        let (sh, _dir, _) = shell_with_fake_id("", 3);
+        let err = local_unix_user(&sh).unwrap_err();
+        assert!(
+            err.to_string().contains("id -un"),
+            "unexpected error: {err}"
+        );
+    }
 
     /// `default_worker_name` must format from the supplied instant, not the
     /// system clock — this is what makes the function safe to call from

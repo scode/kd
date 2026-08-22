@@ -26,6 +26,39 @@ non-ImageMagick helpers still behave correctly. It does not prove that thumbnail
 - Every minted tailscale auth key is one-use, ephemeral, preauthorized, tagged `tag:ubicloud`, and expires after one
   hour. The VM's own first-boot script retries joining the tailnet several times over several minutes; because the key
   is only consumed by a _successful_ `tailscale up`, retrying with the same key across failed attempts is safe.
+- Workers enroll with Tailscale SSH enabled (`tailscale up --ssh`). This is what makes `tailscale ssh <name>` — and
+  therefore `kd ubiworker ssh` — work: a node that merely joins the tailnet is not a Tailscale SSH server and has no
+  Tailscale-managed host key for clients to verify against. The Ubicloud-provisioned OpenSSH server (with the `laptop`
+  and `devbox` keys) keeps running, but Tailscale SSH takes over port 22 on the worker's _tailnet_ address, and the
+  MagicDNS name resolves to that address: plain `ssh <user>@<name>` is therefore still Tailscale SSH (tailnet policy,
+  Tailscale host key), not an independent fallback. The system sshd and the installed keys are reachable only via a
+  non-tailnet address such as the VM's public IP. Workers created before this behavior existed do not advertise a
+  Tailscale SSH host key and are unreachable through `kd ubiworker ssh` until `tailscale set --ssh` is run on them (via
+  their old access path) or they are recreated (see README).
+- _Who_ may log in over Tailscale SSH, and as which Unix user, is decided by the tailnet policy's `ssh` section, which
+  kd neither reads nor edits: workers are owned by `tag:ubicloud`, so Tailscale's default "SSH to your own devices" rule
+  does not cover them and a rule granting the operator access to `tag:ubicloud` as the provisioned user must exist, as
+  must an ordinary ACL/grant reaching `tag:ubicloud` on port 22. kd deliberately does not try to install that rule
+  itself: it would require the OAuth client to hold policy-file write scope — authority over every access rule on the
+  tailnet, far beyond the `auth_keys` scope kd otherwise needs — and the policy file is hand-edited HuJSON that a
+  programmatic insert could easily mangle.
+- Instead, `create`'s summary (stdout, printed on every successful create) states the provisioned Unix user and an
+  example `ssh` rule _object_ granting that user on `tag:ubicloud` — an object to append to the policy's existing `ssh`
+  array, never a whole `"ssh": [...]` property that would duplicate or replace the rules already there. The rule's `src`
+  is the operator's own Tailscale login, resolved best-effort from the local `tailscale status --json` (`Self.UserID` →
+  `User[..].LoginName`); when that can't be determined (no `tailscale`, tailscaled down, or a tagged node, whose login
+  is the synthetic `tagged-devices`) the summary prints an unmistakable `<your-tailscale-login>` placeholder. kd never
+  suggests `autogroup:member`: on a shared tailnet that is every member, and copy-pasted security examples tend to
+  become production policy unchanged. The summary also names the port-22 ACL/grant requirement and the policy editor URL
+  / console path, the latter two being best-effort guidance that Tailscale can move at any time.
+- The Unix account provisioned on a worker (`ubi vm create --unix-user`) is the local username of whoever runs `create`,
+  as reported by `id -un` — not a constant and not a flag. `ssh` logs in as the local username too, so the implied
+  contract is that both are run by the same person under the same username; kd records nothing about which user a worker
+  was created with. The username is validated exactly as reported (no whitespace normalization) against Ubicloud's own
+  rule, `[a-z_][a-z0-9_-]{0,31}`, so a name Ubicloud would refuse fails before any key is minted or VM billed rather
+  than at `ubi vm create`; `root` is additionally refused, since that is what `id -un` reports under `sudo` and
+  accepting it would turn an accidental `sudo kd ubiworker create` into a worker whose only account — and printed policy
+  grant — is direct remote root.
 - The minted auth key passes through the `ubi` process's argv on the host running `kd`, and is visible to local process
   inspection (e.g. procfs) for as long as that `ubi` invocation runs. kd strips `UBI_DEBUG` from `ubi`'s environment and
   redacts its own logging/error output, but the argv exposure itself is accepted current behavior. The only way to
@@ -73,36 +106,36 @@ non-ImageMagick helpers still behave correctly. It does not prove that thumbnail
   one of kd's own registered flags (`-v`/`-q`/`-h`) is claimed by kd before `ssh` ever sees it, exactly as it would be
   anywhere else on the command line; `--` is the escape hatch that forces it through to `ssh` instead (e.g.
   `kd ubiworker ssh -- -v`). An ssh flag kd doesn't itself recognize (e.g. `-L 8080:localhost:80`) needs no `--` at all.
-- `ssh` deliberately bypasses host-key checking
-  (`-o UserKnownHostsFile=/dev/null -o
-  GlobalKnownHostsFile=/dev/null -o StrictHostKeyChecking=no`) rather than
-  pinning host keys normally — both the per-user and the system-wide known-hosts files are bypassed, since an entry in
-  either could otherwise still trigger the failure this exists to avoid. Worker names are reused and every fresh VM boot
-  mints a fresh host key, so ordinary known-hosts pinning would hard-fail reconnecting to a worker recreated under a
-  previously-used name. This also avoids permanently polluting `~/.ssh/known_hosts` with entries for VMs that no longer
-  exist. With host keys off, endpoint identity is delegated entirely to Tailscale: only a device the tailnet's ACLs
-  permit to reach a worker's tailscale address can connect to it at all. That's reachability, not the one-use enrollment
-  key itself — the key only gates how a worker _joins_ the tailnet, not who can subsequently reach it once it has. This
-  is judged an acceptable trade (friction-free reconnection to a disposable, frequently-recreated fleet, in exchange for
-  trusting the tailnet's own ACL enforcement instead of host-key pinning), but two specific residual risks are accepted
-  as a result, not eliminated by it:
-  - the short MagicDNS name (`ubiworker-foo`, without a tailnet suffix) is the _only_ host-identity claim `ssh` is
-    given; if it fails to resolve via MagicDNS, an unresolved name can fall through to the system's ordinary DNS search
-    domains and potentially reach a host that isn't the intended worker at all, with no host-key check to catch it.
-  - recreating a worker under a previously-used name races Tailscale's own reaping of the old ephemeral node: if the old
-    node hasn't been reaped yet, the new worker's tailnet identity gets a `-1` (or similar) suffix instead of the plain
-    name, so the plain short name can keep resolving to the _stale_, destroyed node for a window after recreation. Both
-    are accepted for now given the single-operator, disposable-fleet scope. The known remedy, left as a possible
-    follow-up rather than implemented here, is verifying resolution against `tailscale status --json` (which reports
-    live node identities) instead of trusting bare MagicDNS/DNS resolution.
+- `ssh` connects via `tailscale ssh <user>@<name>`, never via plain `ssh`, and passes no host-key options of its own.
+  Ordinary known-hosts pinning is a poor fit for this fleet: worker names are reused and every fresh VM boot mints a
+  fresh OpenSSH host key, so reconnecting to a worker recreated under a previously-used name would hard-fail with a
+  "REMOTE HOST IDENTIFICATION HAS CHANGED" refusal (and `~/.ssh/known_hosts` would fill with entries for VMs that no
+  longer exist). `tailscale ssh` sidesteps that without giving up verification: it wraps the system `ssh`, resolving the
+  name via MagicDNS and checking the worker's host key against the Tailscale-managed key advertised through the
+  coordination server (materialized into a Tailscale-managed known-hosts file passed as `UserKnownHostsFile` under
+  strict checking, with a `ProxyCommand` through tailscaled for transport where needed), which is tied to the node's
+  tailnet identity rather than to whatever OpenSSH key the VM generated this boot. That is why the previous
+  implementation's deliberate `StrictHostKeyChecking=no` bypass is gone rather than merely optional: kd's ssh path is
+  meant to be safe by default, and anyone who wants unverified plain ssh can run it by hand outside kd. The residual
+  risk that remains is the recreation race: recreating a worker under a previously-used name races Tailscale's own
+  reaping of the old ephemeral node, and if the old node hasn't been reaped yet the new worker's tailnet identity gets a
+  `-1` (or similar) suffix instead of the plain name, so the plain short name can keep pointing at the _stale_,
+  destroyed node for a window after recreation. With Tailscale SSH the failure mode is a connection error or a refusal,
+  not a silent connection to the wrong host — but it is still accepted rather than handled; the known remedy, left as a
+  possible follow-up, is resolving against `tailscale status --json` (which reports live node identities) before
+  connecting.
+- The user is passed explicitly as `<user>@<name>` (the local username, per the `create` note above) even though
+  `tailscale ssh` would default to the same value, so the destination is self-describing in `ps` and error output and
+  does not depend on `tailscale ssh`'s defaulting rules.
 - `ssh` does not poll or wait for a worker to finish enrolling into the tailnet before connecting (mirroring `create`'s
-  no-polling stance above): connecting to a not-yet-enrolled worker just surfaces `ssh`'s own ordinary connection error.
-- `ssh` execs directly into the `ssh` binary, replacing the `kd` process rather than spawning and waiting on it. `ssh`'s
-  exit code, signals, and tty handling all pass straight through unmodified, exactly as if `ssh` had been invoked
-  directly. Any arguments after the worker name (or after `--`, if no name is given) are forwarded to `ssh` verbatim,
-  after the connection destination. The child's environment has `UBI_TOKEN`/`TS_API_CLIENT_ID`/`TS_API_CLIENT_SECRET`
-  stripped before the exec: `ssh` never needs them, and an ssh-config helper (`ProxyCommand`, `SendEnv`, etc.) would
-  otherwise inherit them by default.
-- On an exec failure (e.g. `ssh` not found on `PATH`), the error names only the program and the destination
-  (`scode@ubiworker-foo`), never the full forwarded argv: forwarded ssh arguments can carry secrets, and joining them
+  no-polling stance above): connecting to a not-yet-enrolled worker just surfaces the ordinary connection error.
+- `ssh` execs directly into the `tailscale` binary, replacing the `kd` process rather than spawning and waiting on it.
+  The exit code, signals, and tty handling all pass straight through unmodified, exactly as if `tailscale ssh` had been
+  invoked directly. Any arguments after the worker name (or after `--`, if no name is given) are forwarded verbatim
+  after the connection destination — `tailscale ssh` hands them to the underlying `ssh` unchanged, so a remote command
+  or ssh flags like `-L` work as they would with plain `ssh`. The child's environment has
+  `UBI_TOKEN`/`TS_API_CLIENT_ID`/`TS_API_CLIENT_SECRET` stripped before the exec: neither `tailscale` nor `ssh` needs
+  them, and an ssh-config helper (`ProxyCommand`, `SendEnv`, etc.) would otherwise inherit them by default.
+- On an exec failure (e.g. `tailscale` not found on `PATH`), the error names only the program and the destination
+  (`<user>@ubiworker-foo`), never the full forwarded argv: forwarded ssh arguments can carry secrets, and joining them
   into one string for an error message would also lose their original argument boundaries.

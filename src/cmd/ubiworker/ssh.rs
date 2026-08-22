@@ -1,42 +1,39 @@
-//! `kd ubiworker ssh [ARGS...]`: connect to an owned ubiworker over `ssh`,
-//! resolving the target worker the same way `destroy` does.
+//! `kd ubiworker ssh [ARGS...]`: connect to an owned ubiworker over
+//! Tailscale SSH, resolving the target worker the same way `destroy` does.
 //!
 //! kd never speaks the ssh protocol itself. It resolves which worker is
 //! meant, builds an argv, and then [`std::os::unix::process::CommandExt::exec`]s
-//! straight into the real `ssh` binary — the kd process is replaced, not
-//! spawned-and-waited-on, so ssh's exit code, signals, and tty handling all
-//! pass straight through exactly as if the user had typed `ssh ...`
-//! themselves. That's also why there's no polling/retry here for a worker
-//! that hasn't finished enrolling yet (mirroring `create`'s no-polling
-//! stance, see module docs): a not-yet-reachable worker just surfaces
-//! ssh's own connection-refused/timeout error, unmodified.
+//! straight into `tailscale ssh` — the kd process is replaced, not
+//! spawned-and-waited-on, so the exit code, signals, and tty handling all
+//! pass straight through exactly as if the user had typed `tailscale ssh
+//! ...` themselves. That's also why there's no polling/retry here for a
+//! worker that hasn't finished enrolling yet (mirroring `create`'s
+//! no-polling stance, see module docs): a not-yet-reachable worker just
+//! surfaces the connection error, unmodified.
 //!
-//! # Host-key checking is deliberately bypassed
+//! # Why `tailscale ssh` rather than plain `ssh`
 //!
-//! Every invocation passes `-o UserKnownHostsFile=/dev/null -o
-//! GlobalKnownHostsFile=/dev/null -o StrictHostKeyChecking=no` — both the
-//! per-user and the system-wide known-hosts files, not just the user's; an
-//! entry sitting in `/etc/ssh/ssh_known_hosts` would otherwise still be
-//! consulted and could still trigger the same hard-fail this is meant to
-//! avoid. This isn't a shortcut taken for convenience; it's required by how
-//! ubiworkers actually behave. Names are reused (a destroyed `ubiworker-foo`
-//! can be recreated under the same name later) and each fresh VM boot mints
-//! a fresh host key, so ordinary known-hosts pinning would hard-fail every
-//! reconnection to a recreated worker with a "REMOTE HOST IDENTIFICATION HAS
-//! CHANGED" refusal — exactly the case a disposable, frequently-recreated
-//! fleet hits constantly. Bypassing it this way also avoids permanently
-//! polluting `~/.ssh/known_hosts` with entries for VMs that no longer exist
-//! by the time you'd next connect.
-//!
-//! With host keys off, endpoint identity rests entirely on Tailscale: a
-//! device can only reach a worker's tailscale IP/short-hostname address if
-//! tailnet ACLs permit it, so kd is trading host-key pinning for tailnet
-//! reachability as the identity check, not for nothing. That's a deliberate,
-//! reasonable trade for this fleet — but it's worth being precise about what
-//! it does and doesn't guarantee; see SPEC.md for the accepted residual risk
-//! around MagicDNS short-name resolution and worker-recreation races.
+//! `tailscale ssh` is a thin wrapper that runs the system `ssh` binary, so
+//! ssh's usual flags and remote-command syntax still work. What it adds is
+//! the identity story this fleet needs: it collects the peers' host keys
+//! as advertised through the Tailscale coordination server into a
+//! Tailscale-managed known-hosts file, and runs `ssh` with that file as
+//! `UserKnownHostsFile` under `StrictHostKeyChecking yes` (plus, where
+//! needed, a `ProxyCommand` through tailscaled for transport). So the
+//! worker's identity is checked against what the tailnet says it is, and
+//! `~/.ssh/known_hosts` is never consulted or written.
+//! Ordinary known-hosts pinning is a poor fit here — worker names are
+//! reused, and every fresh VM boot mints a fresh OpenSSH host key, so
+//! reconnecting to a recreated `ubiworker-foo` would hard-fail with
+//! "REMOTE HOST IDENTIFICATION HAS CHANGED". An earlier version of this
+//! command worked around that by disabling host-key checking outright;
+//! delegating to `tailscale ssh` removes that bypass entirely while keeping
+//! reconnection friction-free, which is why this command no longer offers a
+//! plain-`ssh` mode at all. Anyone who wants unverified plain ssh can run
+//! it by hand outside kd. Login authorization is the tailnet policy's `ssh`
+//! section, not keys; see SPEC.md for the rule the tailnet needs.
 
-use super::{SshArgs, UNIX_USER, VmRow, normalize_worker_name, owned_workers, require_env};
+use super::{SshArgs, VmRow, local_unix_user, normalize_worker_name, owned_workers, require_env};
 use anyhow::{Context, bail};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::process::CommandExt;
@@ -71,30 +68,42 @@ pub fn run(args: SshArgs) -> anyhow::Result<()> {
         .map(normalize_worker_name)
         .transpose()?;
 
+    // The login account is the local username, mirroring what `create`
+    // provisioned (see `local_unix_user` for the same-operator assumption).
+    let unix_user = local_unix_user(&sh)?;
     let rows = owned_workers(&sh)?;
     let target = resolve_target(&rows, name.as_deref())?;
 
-    info!("connecting to ubiworker '{}'", target.name);
+    info!("connecting to ubiworker '{}' as '{unix_user}'", target.name);
 
-    let ssh_argv = build_ssh_argv(&target.name, ssh_args);
+    // Built once and shared by the argv and the error message below, so the
+    // destination kd reports on failure is by construction the one it
+    // actually tried.
+    let destination = format!("{unix_user}@{}", target.name);
+    let ssh_argv = build_ssh_argv(&destination, ssh_args);
     // exec replaces this process image outright; on success this call
     // never returns. On failure it returns the io::Error that `execvp(2)`
-    // produced (e.g. ssh not found on PATH) — surface it with the program
-    // and destination that was attempted, not the full argv: forwarded ssh
-    // args can carry secrets (e.g. a `SendEnv`-adjacent value or a
-    // credential embedded in a remote command), and joining them with
+    // produced (e.g. tailscale not found on PATH) — surface it with the
+    // program and destination that was attempted, not the full argv:
+    // forwarded ssh args can carry secrets (e.g. a `SendEnv`-adjacent value
+    // or a credential embedded in a remote command), and joining them with
     // spaces would also lose their original argument boundaries.
-    let destination = format!("{UNIX_USER}@{}", target.name);
     let err = std::process::Command::new(&ssh_argv[0])
         .args(&ssh_argv[1..])
-        // ssh never needs kd's own credentials, and an ssh-config helper the
-        // user has configured (`ProxyCommand`, `SendEnv`, etc.) would
-        // otherwise inherit them from this process's environment by default.
+        // Neither tailscale nor the ssh it wraps needs kd's own credentials,
+        // and an ssh-config helper the user has configured (`ProxyCommand`,
+        // `SendEnv`, etc.) would otherwise inherit them from this process's
+        // environment by default.
         .env_remove("UBI_TOKEN")
         .env_remove("TS_API_CLIENT_ID")
         .env_remove("TS_API_CLIENT_SECRET")
+        // Same leak path as `UBI_DEBUG` in `create`: with this knob set,
+        // `tailscale ssh` logs the complete OpenSSH argv it builds —
+        // forwarded args included — which is exactly what the error
+        // message above goes out of its way not to print.
+        .env_remove("TS_DEBUG_SSH_EXEC")
         .exec();
-    Err(err).with_context(|| format!("failed to exec ssh to '{destination}'"))
+    Err(err).with_context(|| format!("failed to exec tailscale ssh to '{destination}'"))
 }
 
 /// Split the raw trailing capture into an optional worker-name token and the
@@ -159,21 +168,26 @@ fn resolve_target<'a>(rows: &'a [VmRow], name: Option<&str>) -> anyhow::Result<&
     }
 }
 
-/// Build the full `ssh` argv (program name included, as element 0) for
-/// connecting to `name`, with `ssh_args` forwarded verbatim after the
-/// destination.
+/// Build the full `tailscale ssh` argv (program name included, as element
+/// 0) for connecting to `destination` (`user@host`), with `ssh_args`
+/// forwarded verbatim after it.
 ///
-/// The three `-o` options implement the deliberate host-key bypass described
-/// in the module docs — both known-hosts files (per-user and system-wide)
-/// are pointed at `/dev/null` and checking is disabled, since a stale entry
-/// in *either* file would otherwise still be able to trigger the
-/// "REMOTE HOST IDENTIFICATION HAS CHANGED" refusal this exists to avoid.
-/// `ssh_args` is appended, not merged or reordered: OpenSSH parses flags
-/// positioned after the destination just fine, and treats the first
-/// non-flag argument as the start of a remote command — so both a forwarded
-/// flag (e.g. `-L 8080:localhost:80`) and a forwarded remote command (e.g.
-/// `uptime`) work correctly appended in this order without kd needing to
-/// distinguish the two cases itself.
+/// The shape is fixed by `tailscale ssh`'s own usage, `tailscale ssh
+/// [user@]<host> [args...]`: the destination must be the first non-flag
+/// argument, and everything after it is handed to the underlying `ssh`
+/// unchanged. That's why `ssh_args` is appended, never merged or
+/// reordered — OpenSSH parses flags positioned after the destination just
+/// fine and treats the first non-flag argument as the start of a remote
+/// command, so both a forwarded flag (`-L 8080:localhost:80`) and a
+/// forwarded remote command (`uptime`) work correctly in this order without
+/// kd distinguishing the two cases. No host-key options are passed: the
+/// host-key check is `tailscale ssh`'s job (see the module docs).
+///
+/// The caller passes a fully formed `user@host` even though the user is the
+/// local username and `tailscale ssh` would default to exactly that: being
+/// explicit keeps the argv self-describing in `ps`/error output and means
+/// the destination doesn't silently change if `tailscale ssh`'s defaulting
+/// rules ever do.
 ///
 /// `OsString` end to end (not `String`): this is the same "forward
 /// verbatim, including non-UTF-8 bytes" contract as `SshArgs::args` — see
@@ -181,18 +195,9 @@ fn resolve_target<'a>(rows: &'a [VmRow], name: Option<&str>) -> anyhow::Result<&
 /// the restriction one layer down.
 ///
 /// Pure and I/O-free (just vec assembly) so it's directly unit-testable
-/// without actually invoking `ssh`.
-fn build_ssh_argv(name: &str, ssh_args: &[OsString]) -> Vec<OsString> {
-    let mut argv: Vec<OsString> = vec![
-        "ssh".into(),
-        "-o".into(),
-        "UserKnownHostsFile=/dev/null".into(),
-        "-o".into(),
-        "GlobalKnownHostsFile=/dev/null".into(),
-        "-o".into(),
-        "StrictHostKeyChecking=no".into(),
-        format!("{UNIX_USER}@{name}").into(),
-    ];
+/// without actually invoking `tailscale`.
+fn build_ssh_argv(destination: &str, ssh_args: &[OsString]) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = vec!["tailscale".into(), "ssh".into(), destination.into()];
     argv.extend(ssh_args.iter().cloned());
     argv
 }
@@ -285,41 +290,31 @@ mod tests {
         );
     }
 
+    /// The argv must be `tailscale ssh <user>@<host>` and nothing more: in
+    /// particular no `StrictHostKeyChecking=no`/`UserKnownHostsFile`-style
+    /// options may creep back in. Those were the previous implementation's
+    /// host-key bypass, and reintroducing them would silently defeat the
+    /// host-key verification that delegating to `tailscale ssh` exists to
+    /// provide.
     #[test]
     fn build_ssh_argv_no_extra_args() {
-        let argv = build_ssh_argv("ubiworker-foo", &[]);
-        assert_eq!(
-            argv,
-            vec![
-                "ssh",
-                "-o",
-                "UserKnownHostsFile=/dev/null",
-                "-o",
-                "GlobalKnownHostsFile=/dev/null",
-                "-o",
-                "StrictHostKeyChecking=no",
-                "scode@ubiworker-foo",
-            ]
-        );
+        let argv = build_ssh_argv("scode@ubiworker-foo", &[]);
+        assert_eq!(argv, vec!["tailscale", "ssh", "scode@ubiworker-foo"]);
     }
 
     /// A forwarded flag (as opposed to a remote command) must survive
-    /// appended verbatim, unreordered — this is the port-forwarding use
-    /// case (`kd ubiworker ssh name -L 8080:localhost:80`).
+    /// appended verbatim after the destination, unreordered — `tailscale
+    /// ssh` requires the destination first, and this is the port-forwarding
+    /// use case (`kd ubiworker ssh name -L 8080:localhost:80`).
     #[test]
     fn build_ssh_argv_forwards_flag_args() {
         let ssh_args: Vec<OsString> = vec!["-L".into(), "8080:localhost:80".into()];
-        let argv = build_ssh_argv("ubiworker-foo", &ssh_args);
+        let argv = build_ssh_argv("scode@ubiworker-foo", &ssh_args);
         assert_eq!(
             argv,
             vec![
+                "tailscale",
                 "ssh",
-                "-o",
-                "UserKnownHostsFile=/dev/null",
-                "-o",
-                "GlobalKnownHostsFile=/dev/null",
-                "-o",
-                "StrictHostKeyChecking=no",
                 "scode@ubiworker-foo",
                 "-L",
                 "8080:localhost:80",
@@ -335,20 +330,10 @@ mod tests {
     #[test]
     fn build_ssh_argv_forwards_remote_command() {
         let ssh_args: Vec<OsString> = vec!["uptime".into()];
-        let argv = build_ssh_argv("ubiworker-foo", &ssh_args);
+        let argv = build_ssh_argv("scode@ubiworker-foo", &ssh_args);
         assert_eq!(
             argv,
-            vec![
-                "ssh",
-                "-o",
-                "UserKnownHostsFile=/dev/null",
-                "-o",
-                "GlobalKnownHostsFile=/dev/null",
-                "-o",
-                "StrictHostKeyChecking=no",
-                "scode@ubiworker-foo",
-                "uptime",
-            ]
+            vec!["tailscale", "ssh", "scode@ubiworker-foo", "uptime"]
         );
     }
 
