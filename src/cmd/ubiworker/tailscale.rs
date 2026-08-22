@@ -20,6 +20,77 @@ use crate::cmd::ubiworker::{TAILSCALE_TAG, is_valid_auth_key};
 use anyhow::{Context, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use tracing::warn;
+use xshell::{Shell, cmd};
+
+// ── Local node identity ──────────────────────────────────────────────────
+// Unlike everything below, this talks to the *local* tailscaled through the
+// `tailscale` CLI, not to the REST API. It exists so `create`'s printed SSH
+// policy rule can name the operator's own login instead of a tailnet-wide
+// selector.
+
+/// The Tailscale login (e.g. `alice@github`) this machine is signed in as,
+/// or `None` if it can't be determined.
+///
+/// Used only to render a policy-rule *suggestion*, so every failure mode —
+/// no `tailscale` on `PATH`, tailscaled not running, unparseable output, a
+/// machine that is itself a tagged node (whose "user" is the synthetic
+/// `tagged-devices` account and would make a nonsensical `src`) — is
+/// downgraded to a warning and `None`, never an error: a missing
+/// suggestion must not block creating a worker. The caller substitutes an
+/// unmistakable placeholder in that case.
+///
+/// Credentials are stripped from the child for the same reason as every
+/// other subprocess kd spawns: `tailscale status` needs none of them.
+pub fn local_login(sh: &Shell) -> Option<String> {
+    let output = match cmd!(sh, "tailscale status --json")
+        .quiet()
+        .ignore_stderr()
+        .env_remove("UBI_TOKEN")
+        .env_remove("TS_API_CLIENT_ID")
+        .env_remove("TS_API_CLIENT_SECRET")
+        .read()
+    {
+        Ok(output) => output,
+        Err(err) => {
+            warn!(
+                "could not determine local tailscale login ({err}); the printed policy rule will use a placeholder"
+            );
+            return None;
+        }
+    };
+    match parse_status_login(&output) {
+        Ok(login) => Some(login),
+        Err(err) => {
+            warn!(
+                "could not determine local tailscale login ({err}); the printed policy rule will use a placeholder"
+            );
+            None
+        }
+    }
+}
+
+/// Pull the signed-in user's login out of `tailscale status --json`: the
+/// node's own `Self.UserID` looked up in the top-level `User` map's
+/// `LoginName`. Rejects the synthetic `tagged-devices` login, which is what
+/// a tagged node reports and is not a usable policy `src`. Pure, so the
+/// JSON shape is pinned by tests without a running tailscaled.
+fn parse_status_login(json: &str) -> anyhow::Result<String> {
+    let status: serde_json::Value =
+        serde_json::from_str(json).context("tailscale status output is not JSON")?;
+    let user_id = status
+        .pointer("/Self/UserID")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow!("no Self.UserID in tailscale status"))?;
+    let login = status
+        .pointer(&format!("/User/{user_id}/LoginName"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("no User[{user_id}].LoginName in tailscale status"))?;
+    if login.is_empty() || login == "tagged-devices" {
+        bail!("local node is a tagged device, not signed in as a user");
+    }
+    Ok(login.to_string())
+}
 
 const TOKEN_URL: &str = "https://api.tailscale.com/api/v2/oauth/token";
 const KEYS_URL: &str = "https://api.tailscale.com/api/v2/tailnet/-/keys";
@@ -370,5 +441,40 @@ mod tests {
                 && !message.contains("server error"),
             "404 should not carry a speculative hint: {message}"
         );
+    }
+
+    // ── parse_status_login ───────────────────────────────────────────────
+
+    /// Pins the `tailscale status --json` shape the login lookup depends on:
+    /// `Self.UserID` is a number, and the `User` map is keyed by that id
+    /// as a *string*. Getting the key type wrong would silently yield
+    /// "not found" for every node, and the policy rule would always fall
+    /// back to the placeholder without anyone noticing.
+    #[test]
+    fn parse_status_login_resolves_self_user() {
+        let json = r#"{
+            "Self": {"UserID": 1569462067201318},
+            "User": {
+                "1535632220428206": {"LoginName": "tagged-devices"},
+                "1569462067201318": {"LoginName": "alice@github"}
+            }
+        }"#;
+        assert_eq!(parse_status_login(json).unwrap(), "alice@github");
+    }
+
+    /// A tagged node reports the synthetic `tagged-devices` login, which
+    /// is not a valid policy `src`; it must be treated as "unknown" so the
+    /// caller prints a placeholder rather than an unusable rule.
+    #[test]
+    fn parse_status_login_rejects_tagged_devices() {
+        let json = r#"{"Self": {"UserID": 1}, "User": {"1": {"LoginName": "tagged-devices"}}}"#;
+        assert!(parse_status_login(json).is_err());
+    }
+
+    #[test]
+    fn parse_status_login_errors_on_missing_fields_or_garbage() {
+        assert!(parse_status_login("not json").is_err());
+        assert!(parse_status_login(r#"{"Self": {}}"#).is_err());
+        assert!(parse_status_login(r#"{"Self": {"UserID": 7}, "User": {}}"#).is_err());
     }
 }

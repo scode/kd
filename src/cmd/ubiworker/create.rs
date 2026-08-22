@@ -10,7 +10,7 @@
 use super::tailscale;
 use super::{
     BOOT_IMAGE, CreateArgs, LOCATION, SIZE, SSH_KEY_NAMES, STORAGE_SIZE_GIB, TAILSCALE_TAG,
-    UNIX_USER, default_worker_name, is_valid_auth_key, normalize_worker_name, require_env,
+    default_worker_name, is_valid_auth_key, local_unix_user, normalize_worker_name, require_env,
 };
 use anyhow::{Context, bail};
 use jiff::Zoned;
@@ -22,6 +22,12 @@ use xshell::{Shell, cmd};
 /// taking the last line of output, because `ubi`'s output includes other
 /// metadata around it that isn't a contract kd controls.
 const PUBLIC_KEY_MARKER: &str = "public key:";
+
+/// Where the tailnet policy file is edited, for the create summary's
+/// "go add the ssh rule" pointer. A console URL is the most precise
+/// instruction kd can give, but it is also the kind of detail Tailscale can
+/// move without notice — hence the "may be stale" wording next to its use.
+const POLICY_EDITOR_URL: &str = "https://login.tailscale.com/admin/acls/file";
 
 pub fn run(args: CreateArgs) -> anyhow::Result<()> {
     // Fail fast, naming the specific missing variable, before doing any
@@ -38,6 +44,10 @@ pub fn run(args: CreateArgs) -> anyhow::Result<()> {
         None => default_worker_name(&Zoned::now()),
     };
     info!("Creating ubiworker '{}'", name);
+
+    // Resolved up front, before any billable or secret-minting step, so a
+    // bad local username fails before a VM exists (see `local_unix_user`).
+    let unix_user = local_unix_user(&sh)?;
 
     info!("Fetching SSH keys ({})...", SSH_KEY_NAMES.join(", "));
     let ssh_keys = fetch_ssh_keys(&sh)?;
@@ -56,9 +66,13 @@ pub fn run(args: CreateArgs) -> anyhow::Result<()> {
     debug!("init script:\n{}", redact_auth_key(&init_script, &auth_key));
 
     info!("Creating VM {}/{}...", LOCATION, name);
-    create_vm(&sh, &name, &ssh_keys, &init_script)?;
+    create_vm(&sh, &name, &unix_user, &ssh_keys, &init_script)?;
 
-    print_summary(&name);
+    // Best-effort and last: the login only feeds the printed policy
+    // suggestion, so a machine where it can't be resolved still gets its
+    // worker (and a placeholder in the rule).
+    let tailscale_login = tailscale::local_login(&sh);
+    print_summary(&name, &unix_user, tailscale_login.as_deref());
     Ok(())
 }
 
@@ -148,7 +162,24 @@ fn validate_authorized_keys_line(line: &str) -> anyhow::Result<()> {
 }
 
 /// Render the first-boot shell script that installs tailscale and joins
-/// the tailnet as `name`, authenticating with `auth_key`.
+/// the tailnet as `name`, authenticating with `auth_key`, with Tailscale
+/// SSH enabled.
+///
+/// `--ssh` on `tailscale up` is what makes `tailscale ssh <name>` (and so
+/// `kd ubiworker ssh`) work at all: a node that merely joins the tailnet is
+/// not a Tailscale SSH server, and its Tailscale-managed host key is only
+/// generated and published to the coordination server once SSH is on.
+/// That published key is the whole point — it's how the client verifies
+/// the worker's identity without known-hosts pinning, which can't work for
+/// a fleet whose names are reused and whose OpenSSH host keys change on
+/// every recreation. The Ubicloud-provisioned OpenSSH server keeps running
+/// alongside, but note what that does and doesn't buy: Tailscale SSH takes
+/// over port 22 on the worker's *tailnet* address, so plain `ssh` to the
+/// MagicDNS name is still Tailscale SSH (tailnet policy, Tailscale host
+/// key) — the system sshd and the Ubicloud-installed keys are reachable
+/// only via a non-tailnet address such as the VM's public IP. Who may log
+/// in over Tailscale SSH is governed by the tailnet policy's `ssh`
+/// section, not by anything here (see SPEC.md).
 ///
 /// Retries the whole install-and-join sequence up to 5 times, 30 seconds
 /// apart, entirely inside the script (kd itself has already returned by the
@@ -204,7 +235,7 @@ enroll() {{
   sh "$installer" &&
   rm -f "$installer" &&
   systemctl enable --now tailscaled &&
-  tailscale up --auth-key='{auth_key}' --hostname='{name}'
+  tailscale up --auth-key='{auth_key}' --hostname='{name}' --ssh
 }}
 for attempt in 1 2 3 4 5; do
   enroll && exit 0
@@ -249,25 +280,44 @@ fn redact_auth_key(script: &str, auth_key: &str) -> String {
 /// trusts, and one that would go away entirely if VM creation moved to
 /// Ubicloud's REST API instead of shelling out to the `ubi` CLI (see
 /// SPEC.md).
-fn create_vm(sh: &Shell, name: &str, ssh_keys: &str, init_script: &str) -> anyhow::Result<()> {
-    let vm_ref = format!("{LOCATION}/{name}");
-    let storage_size = STORAGE_SIZE_GIB.to_string();
-    debug!("ubi vm {} create ...", vm_ref);
-    cmd!(
-        sh,
-        "ubi vm {vm_ref} create
-            --boot-image={BOOT_IMAGE}
-            --size={SIZE}
-            --storage-size={storage_size}
-            --unix-user={UNIX_USER}
-            --init-script={init_script}
-            {ssh_keys}"
-    )
-    .quiet()
-    .secret()
-    .env_remove("UBI_DEBUG")
-    .run()
-    .context("ubi vm create failed")
+fn create_vm(
+    sh: &Shell,
+    name: &str,
+    unix_user: &str,
+    ssh_keys: &str,
+    init_script: &str,
+) -> anyhow::Result<()> {
+    debug!("ubi vm {}/{} create ...", LOCATION, name);
+    let args = create_vm_args(name, unix_user, ssh_keys, init_script);
+    cmd!(sh, "ubi {args...}")
+        .quiet()
+        .secret()
+        .env_remove("UBI_DEBUG")
+        .run()
+        .context("ubi vm create failed")
+}
+
+/// The `ubi` argv (everything after the program name) for provisioning a
+/// worker — the fixed shape constants plus the per-worker values.
+///
+/// Split out of [`create_vm`] purely so the argument assembly is
+/// unit-testable: the one value most likely to regress is `--unix-user`,
+/// which used to be a hard-coded constant and now follows the operator
+/// (see `local_unix_user`). A test pinning the exact `--unix-user=<user>`
+/// token is what keeps the provisioned account in lockstep with the one
+/// `kd ubiworker ssh` later targets.
+fn create_vm_args(name: &str, unix_user: &str, ssh_keys: &str, init_script: &str) -> Vec<String> {
+    vec![
+        "vm".to_string(),
+        format!("{LOCATION}/{name}"),
+        "create".to_string(),
+        format!("--boot-image={BOOT_IMAGE}"),
+        format!("--size={SIZE}"),
+        format!("--storage-size={STORAGE_SIZE_GIB}"),
+        format!("--unix-user={unix_user}"),
+        format!("--init-script={init_script}"),
+        ssh_keys.to_string(),
+    ]
 }
 
 /// Render the final human-readable summary for a newly created worker
@@ -281,21 +331,65 @@ fn create_vm(sh: &Shell, name: &str, ssh_keys: &str, init_script: &str) -> anyho
 /// kind of regression wouldn't fail any behavior test — `create` itself
 /// still works — it would just quietly point every future reader at the
 /// wrong command.
-fn render_summary(name: &str) -> String {
+fn render_summary(name: &str, unix_user: &str, tailscale_login: Option<&str>) -> String {
     [
         format!("Created ubiworker '{name}'"),
+        format!("  unix user: {unix_user}"),
         format!("  ssh keys installed: {}", SSH_KEY_NAMES.join(", ")),
         format!("  tailscale tag: {TAILSCALE_TAG}"),
         format!("  connect: kd ubiworker ssh {name}"),
         format!("  destroy: kd ubiworker destroy {name}"),
+        // Printed every time, not just once: the tailnet policy pieces are
+        // prerequisites kd can neither install nor detect (see SPEC.md),
+        // and without them `tailscale ssh` fails with a host-key or
+        // permission error that says nothing about policy. Repeating the
+        // exact rule here puts the fix next to the command that needs it.
+        // Rendered as a single rule *object* to append to the policy's
+        // existing `ssh` array — never as a whole `"ssh": [...]` property,
+        // which would duplicate or clobber the rules already there.
+        format!(
+            "  requires, in the tailnet policy file:\n    \
+             1. an ssh rule letting you log in to {TAILSCALE_TAG} as '{unix_user}' — append this \
+             object to the existing \"ssh\" array (create the array if there is none):\n       {}\n    \
+             2. an acl/grant that lets you reach {TAILSCALE_TAG} on port 22\n  \
+             edit the policy file at {POLICY_EDITOR_URL}\n  \
+             (admin console -> Access controls -> Edit file; UI path may be stale)",
+            render_ssh_policy_rule(unix_user, tailscale_login)
+        ),
     ]
     .join("\n")
 }
 
+/// Placeholder `src` for the printed policy rule when the operator's own
+/// Tailscale login couldn't be resolved (see [`tailscale::local_login`]).
+/// Deliberately unmistakable and unpasteable — the alternative of
+/// defaulting to `autogroup:member` would quietly grant every tailnet
+/// member a shell as the operator on every worker.
+const LOGIN_PLACEHOLDER: &str = "<your-tailscale-login>";
+
+/// The tailnet policy `ssh` rule object a worker needs before `kd ubiworker
+/// ssh` can log in, rendered as a HuJSON object for `unix_user`.
+///
+/// `src` is the operator's own Tailscale login when known, so the rule
+/// grants exactly the person who just created the worker and nobody else.
+/// kd never suggests `autogroup:member`: on a shared tailnet that selector
+/// is every member (including invited users on shared destinations), and a
+/// copy-pasted security example tends to become production policy
+/// unchanged. Operators who genuinely want tailnet-wide access can widen
+/// it themselves. Kept separate from [`render_summary`] so the snippet is
+/// unit-testable as the one line most likely to drift from what Tailscale
+/// actually accepts.
+fn render_ssh_policy_rule(unix_user: &str, tailscale_login: Option<&str>) -> String {
+    let src = tailscale_login.unwrap_or(LOGIN_PLACEHOLDER);
+    format!(
+        r#"{{ "action": "accept", "src": ["{src}"], "dst": ["{TAILSCALE_TAG}"], "users": ["{unix_user}"] }}"#
+    )
+}
+
 /// Print the final human-readable summary to stdout (not tracing), so it
 /// survives `-q` and stays easy to read at the end of a create run.
-fn print_summary(name: &str) {
-    println!("{}", render_summary(name));
+fn print_summary(name: &str, unix_user: &str, tailscale_login: Option<&str>) {
+    println!("{}", render_summary(name, unix_user, tailscale_login));
 }
 
 #[cfg(test)]
@@ -391,6 +485,33 @@ mod tests {
         assert!(script.contains("hostnamectl set-hostname 'ubiworker-foo' || true"));
     }
 
+    /// `--ssh` must stay on the `tailscale up` line: without it the worker
+    /// joins the tailnet but never becomes a Tailscale SSH server, so
+    /// `tailscale ssh` (and hence `kd ubiworker ssh`) fails with a missing
+    /// host-key error that looks nothing like "SSH isn't enabled". Nothing
+    /// else in kd would catch its loss — `create` succeeds, the VM boots,
+    /// and only the first connection attempt reveals it.
+    #[test]
+    fn render_init_script_enables_tailscale_ssh_on_enrollment() {
+        let script = render_init_script("tskey-auth-xxxxx-yyyyy", "ubiworker-foo").unwrap();
+        let up_line = script
+            .lines()
+            .find(|line| line.trim_start().starts_with("tailscale up "))
+            .expect("script has a `tailscale up` line");
+        let tokens: Vec<&str> = up_line.split_whitespace().collect();
+        assert!(
+            tokens.iter().any(|t| t.starts_with("--auth-key=")),
+            "unexpected line: {up_line}"
+        );
+        assert!(
+            tokens.iter().any(|t| t.starts_with("--hostname=")),
+            "unexpected line: {up_line}"
+        );
+        // Exact-token match, not a substring: `--ssh=false` would also
+        // contain " --ssh" and is precisely the regression this guards.
+        assert!(tokens.contains(&"--ssh"), "unexpected line: {up_line}");
+    }
+
     /// FX17: the enrollment sequence must be wrapped in a bounded retry
     /// loop rather than run once, so a transient first-boot failure doesn't
     /// permanently strand an already-billed VM.
@@ -452,7 +573,7 @@ mod tests {
     /// they're looking for the next command to run.
     #[test]
     fn render_summary_recommends_kd_ssh_not_raw_ssh() {
-        let summary = render_summary("ubiworker-foo");
+        let summary = render_summary("ubiworker-foo", "scode", None);
         assert!(
             summary.contains("kd ubiworker ssh ubiworker-foo"),
             "unexpected summary: {summary}"
@@ -461,5 +582,60 @@ mod tests {
             !summary.contains("ssh scode@ubiworker-foo"),
             "summary should not recommend the obsolete raw ssh form: {summary}"
         );
+    }
+
+    /// The summary must carry the tailnet SSH policy rule, rendered for the
+    /// actual provisioned user and tag: it is the only place kd tells the
+    /// operator about the one prerequisite it can't set up or detect, so a
+    /// summary that dropped it (or rendered it for a stale hard-coded user)
+    /// would leave the first `kd ubiworker ssh` failing with no pointer to
+    /// the fix.
+    #[test]
+    fn render_summary_includes_policy_rule_for_the_provisioned_user() {
+        let summary = render_summary("ubiworker-foo", "alice", Some("alice@github"));
+        // Independently written expectation — not derived from
+        // `render_ssh_policy_rule` — so a wrong action, widened src, or
+        // broken syntax in the renderer can't leak into the oracle.
+        let expected = r#"{ "action": "accept", "src": ["alice@github"], "dst": ["tag:ubicloud"], "users": ["alice"] }"#;
+        assert!(summary.contains(expected), "unexpected summary: {summary}");
+        // It must be a rule object to append, never a whole `"ssh":`
+        // property that would duplicate/clobber the policy's existing one.
+        assert!(
+            !summary.contains(r#""ssh":"#),
+            "summary must not render a top-level ssh property: {summary}"
+        );
+        assert!(
+            summary.contains("port 22"),
+            "summary must mention the separate port-22 acl/grant prerequisite: {summary}"
+        );
+    }
+
+    /// The rule's `src` must never default to a tailnet-wide selector: when
+    /// the operator's login is unknown, the output must be an obvious
+    /// placeholder the reader has to replace, not `autogroup:member`.
+    #[test]
+    fn render_ssh_policy_rule_never_defaults_to_autogroup_member() {
+        let rule = render_ssh_policy_rule("alice", None);
+        assert_eq!(
+            rule,
+            r#"{ "action": "accept", "src": ["<your-tailscale-login>"], "dst": ["tag:ubicloud"], "users": ["alice"] }"#
+        );
+        assert!(!rule.contains("autogroup"), "unexpected rule: {rule}");
+    }
+
+    /// Pins that the operator-derived username is what actually reaches
+    /// `ubi` as `--unix-user=`, as an exact token. Restoring the old
+    /// hard-coded account, or dropping the flag, must fail here even though
+    /// every summary/ssh test would still pass.
+    #[test]
+    fn create_vm_args_pass_the_unix_user_and_fixed_shape() {
+        let args = create_vm_args("ubiworker-foo", "alice", "ssh-ed25519 AAAA", "#!/bin/sh\n");
+        assert!(args.contains(&"--unix-user=alice".to_string()), "{args:?}");
+        assert!(!args.iter().any(|a| a.contains("scode")), "{args:?}");
+        assert_eq!(args[0], "vm");
+        assert_eq!(args[1], "us-east-a2/ubiworker-foo");
+        assert_eq!(args[2], "create");
+        assert!(args.contains(&"--init-script=#!/bin/sh\n".to_string()));
+        assert_eq!(args.last().unwrap(), "ssh-ed25519 AAAA");
     }
 }
