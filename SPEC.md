@@ -19,7 +19,10 @@ non-ImageMagick helpers still behave correctly. It does not prove that thumbnail
 - Ownership of a VM is structural, not tracked in a side database: a VM is a "ubiworker" iff its name starts with
   `ubiworker-` _and_ it lives in location `us-east-a2`. Both conditions are required.
 - Infra shape (location, size, storage, boot image) is a set of hardcoded constants, not CLI flags. A ubiworker is meant
-  to be one fixed, disposable shape; something else should be built by hand with `ubi` directly.
+  to be one fixed, disposable shape; something else should be built by hand with `ubi` directly. Apt packages are the
+  one deliberate exception: `create` combines a hardcoded base set (`BASE_PACKAGES`, currently empty) with repeatable
+  `--pkg` flags, because "what software this worker needs" is inherently a per-create decision in a way the rest of the
+  shape isn't.
 - A default worker name is `ubiworker-YYYYMMDD-HHMMSS` in the local timezone, with no collision-avoidance suffix.
   Ubicloud rejects a duplicate name server-side, so kd doesn't need to detect the collision itself.
 - Every subcommand preflights the credential env vars it needs (`UBI_TOKEN` for all; `TS_API_CLIENT_ID` and
@@ -43,6 +46,26 @@ non-ImageMagick helpers still behave correctly. It does not prove that thumbnail
   key name or count. If none are registered, `create` fails before minting a Tailscale key or creating a VM: a worker
   with no authorized_keys entries would be unreachable over plain ssh, and that's a preflight failure worth having
   rather than a silently-bricked worker.
+- `create --pkg PACKAGE` (repeatable) requests apt packages for the worker, on top of the hardcoded `BASE_PACKAGES` base
+  set (currently empty). Every name in the _combined_ list is validated against Debian package-name syntax, with a
+  trailing `-` additionally rejected (apt reads `name-` as "remove"). Validation happens before any billable or
+  secret-minting step — the same preflight position as the unix-user check above — and again, defensively, inside the
+  init-script renderer; a bad name is an error naming it, never silently dropped.
+- Installation, plus an unconditional `apt-get dist-upgrade`, runs asynchronously on the worker in a transient systemd
+  unit named `kd-bootstrap`, launched only _after_ tailscale enrollment has succeeded and never waited on by `create` or
+  by the init script. After, not before or alongside, because tailscale's installer (`tailscale.com/install.sh`) runs
+  its own `apt-get install` with no dpkg-lock timeout: a bootstrap started earlier — whose apt calls wait up to 600s for
+  the lock and can hold it for minutes during a dist-upgrade — would make the installer fail instantly and could exhaust
+  enrollment's 5×30s retry budget. Packages are installed with `apt-get satisfy` (apt ≥ 2.0), not `apt-get install`:
+  `satisfy` matches names exactly, whereas `install` treats an unmatched name containing `.` as a regex and installs
+  every match (`lib.` would install everything containing `lib`), and honors the trailing-`-` remove suffix.
+- Progress is visible on the worker via `systemctl status kd-bootstrap` and `/var/log/kd-bootstrap.log`; success is
+  marked by `/var/lib/kd/bootstrap-done`. `create` does not wait for or report bootstrap completion — the summary names
+  only the requested packages and the log path. An operator who `ssh`s in before bootstrap finishes may find
+  `apt`/`dpkg` locked by the still-running unit. A `dist-upgrade` that installs a new kernel does not reboot the VM.
+  Re-running the init script by hand on a VM where the unit already exists gets a harmless "Unit kd-bootstrap.service
+  already exists" from `systemd-run`, swallowed by the same best-effort guard that covers a launch failure; clear the
+  stale unit first with `systemctl reset-failed kd-bootstrap`. The init script itself runs once per instance.
 - _Who_ may log in over Tailscale SSH, and as which Unix user, is decided by the tailnet policy's `ssh` section, which
   kd neither reads nor edits: workers are owned by `tag:ubicloud`, so Tailscale's default "SSH to your own devices" rule
   does not cover them and a rule granting the operator access to `tag:ubicloud` as the provisioned user must exist, as
