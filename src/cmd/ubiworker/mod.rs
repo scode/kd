@@ -58,6 +58,11 @@ pub(crate) const TAILSCALE_TAG: &str = "tag:ubicloud";
 /// Prefix marking a VM as a kd-managed ubiworker (see module docs on the
 /// ownership convention).
 pub(crate) const NAME_PREFIX: &str = "ubiworker-";
+/// Apt packages installed on every worker, in addition to whatever the
+/// operator requests via `--pkg` (see `create::bootstrap_packages`).
+/// Deliberately empty for now — there's no package kd itself needs on every
+/// worker unconditionally.
+pub(crate) const BASE_PACKAGES: &[&str] = &[];
 
 // ── Unix login user ──────────────────────────────────────────────────────
 // The one piece of worker shape that is *not* a constant: it follows the
@@ -154,6 +159,21 @@ pub struct CreateArgs {
     /// name gets the `ubiworker-` prefix prepended automatically if it's
     /// missing.
     pub name: Option<String>,
+
+    /// Apt package to install on the worker at first boot (repeatable:
+    /// `--pkg build-essential --pkg git`). Installation — together with an
+    /// `apt-get dist-upgrade` — runs asynchronously in a detached systemd
+    /// unit (`kd-bootstrap`) that is launched only *after* tailscale
+    /// enrollment succeeds, and never waited on by `create` or by
+    /// enrollment itself: `create` returns as soon as `ubi vm create` does.
+    /// Bootstrap runs after, not before or alongside, because tailscale's
+    /// own installer shells out to `apt-get install` with no dpkg-lock
+    /// timeout of its own, so a bootstrap running earlier could hold the
+    /// lock out from under it and burn through enrollment's retry budget.
+    /// Progress lands in `/var/log/kd-bootstrap.log` on the worker, and
+    /// `systemctl status kd-bootstrap` shows whether it's still running.
+    #[arg(long = "pkg", value_name = "PACKAGE")]
+    pub pkgs: Vec<String>,
 }
 
 /// `kd ubiworker destroy [NAME...] [--all]` arguments.
@@ -220,7 +240,12 @@ pub enum Commands {
     ///
     /// Fetches every SSH key registered in the Ubicloud account, mints a
     /// one-use tailscale auth key, and creates the VM with a first-boot
-    /// script that installs tailscale and joins the tailnet under it.
+    /// script that installs tailscale and joins the tailnet under it. Once
+    /// that succeeds, the same script also bootstraps apt packages (the
+    /// hardcoded base set plus any `--pkg` flags) asynchronously, in a
+    /// detached systemd unit launched only after enrollment — never before
+    /// or alongside it, since tailscale's own installer needs the dpkg lock
+    /// too and has no lock timeout of its own.
     Create(CreateArgs),
     /// Destroy one or more ubiworker VMs
     ///

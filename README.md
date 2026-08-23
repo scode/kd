@@ -59,6 +59,10 @@ kd gh repo main-protect scode/foo
 kd ubiworker create
 kd ubiworker create myname
 
+# Request apt packages, installed asynchronously (with an apt-get
+# dist-upgrade) after boot; see SPEC.md for what "asynchronously" means.
+kd ubiworker create --pkg build-essential --pkg git
+
 # List existing ubiworker VMs.
 kd ubiworker list
 
