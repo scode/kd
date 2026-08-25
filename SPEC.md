@@ -14,6 +14,52 @@ available on `PATH`.
 This means a passing `cargo test` run without ImageMagick proves the pure Rust code still compiles and its
 non-ImageMagick helpers still behave correctly. It does not prove that thumbnail resizing works end to end.
 
+## kd gh repo apply-preferred-settings
+
+- The preferred set enforced on every repo:
+  - squash merge enabled; merge commits and rebase merges disabled
+  - squash commit title `PR_TITLE`, squash commit message `PR_BODY`
+  - delete branch on merge enabled
+  - Actions `default_workflow_permissions` set to `read`, `can_approve_pull_request_reviews` set to `false`
+    (`actions/permissions/workflow`)
+  - Actions fork-PR contributor approval policy set to `all_external_contributors`
+    (`actions/permissions/fork-pr-contributor-approval`) -- public repos only, see below
+  - On non-public repos, the mirror-image Actions private-fork-workflow lockdown
+    (`actions/permissions/fork-pr-workflows-private-repos`) instead: `run_workflows_from_fork_pull_requests`,
+    `send_write_tokens_to_workflows`, `send_secrets_and_variables`, and `require_approval_for_fork_pr_workflows` all set
+    to `false` -- see below
+- Every setting is re-checked from scratch on every run; there is no stored state. Writes are issued only when an apply
+  actually proceeds -- a delta exists or `--force` is given, and neither `--dry-run` nor a declined confirmation prompt
+  stopped it. When it does proceed, each endpoint (merge settings, workflow permissions, fork-PR approval or
+  private-fork-workflows) is written only when its own group has drift, except under `--force`, where merge settings and
+  workflow permissions are always re-asserted and the applicable one of fork-PR approval / private-fork-workflows is
+  re-asserted whenever it's applicable (see below) -- regardless of whether that particular endpoint's group has a
+  delta.
+- Writes are sequential and non-atomic: the merge-settings PATCH, then the workflow-permissions PUT, then the applicable
+  fork-PR-approval or private-fork-workflows PUT, each awaited before the next starts. A failure partway through leaves
+  the earlier writes in place; there is no rollback. Rerunning the command re-fetches settings and reconciles whatever's
+  still outstanding, without repeating writes that already landed.
+- Exactly one of the two fork-workflow endpoints is applicable to a given repo, and applicability is the mirror image of
+  the other: public repos get the fork-PR-approval policy; non-public repos (private, or -- on GitHub Enterprise --
+  internal) instead get the private-fork-workflow settings, where `run_workflows_from_fork_pull_requests=false` means
+  fork-PR workflows never run on the repo's runners at all, making the other three fields moot in practice -- they're
+  still asserted `false` so a future re-enable of fork workflows doesn't inherit permissive companions.
+  `require_approval_for_fork_pr_workflows` in particular is only meaningful once fork workflows run again; `kd` never
+  sets it `true`, only ever corrects it back to `false`. Each endpoint is read, asserted, and written only where it's
+  applicable -- the other endpoint 422s there, so it's never even requested, and its absence is never mentioned in
+  `deltas` or logged output, `--force` included. Applicability is keyed on the API's `visibility` field being exactly
+  `"public"` vs. not, not on the separate boolean `private` field GitHub also returns (which can't distinguish `private`
+  from `internal`). Because every run re-checks all settings, the applicable policy lands automatically on the first run
+  after a repo's visibility changes -- nothing needs to notice or react to the transition itself.
+- `first_time_contributors` and `first_time_contributors_new_to_github` are deliberately not acceptable values for the
+  fork-PR approval policy, even though GitHub allows them: both auto-run a fork PR's workflow once that contributor has
+  a single prior merged PR, which defeats the point of gating billable/self-hosted-style runner access behind maintainer
+  approval. `all_external_contributors` is the only value `kd` treats as already-correct.
+- `--all` is bounded at 1,000 repos (`gh repo list --limit 1000`), and every repo costs up to ~6 API requests across
+  `get_settings` and `apply_settings`. GitHub's 5,000-requests/hour rate limit is not handled -- a run that hits it
+  stops with an error, and the fix is simply to rerun the command later: already-correct repos cost only cheap reads on
+  the rerun, so no progress is lost. This is an explicitly accepted limitation, not an oversight.
+
 ## kd ubiworker
 
 - Ownership of a VM is structural, not tracked in a side database: a VM is a "ubiworker" iff its name starts with

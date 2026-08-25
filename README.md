@@ -115,6 +115,15 @@ single-repo mode, if you omit `owner/repo`, run it from the repo root; it reads 
 - merge commits disabled
 - rebase merges disabled
 - delete branch on merge enabled
+- default Actions workflow token permissions set to read-only, with `can_approve_pull_request_reviews` disabled
+- on public repos, fork pull-request workflows from external contributors (outside the repo and its org) require
+  approval before running; `pull_request_target` workflows are not gated by this (`all_external_contributors`)
+- on non-public repos, fork pull-request workflows are disabled entirely
+
+The fork-workflow requirement is visibility-specific: public repos get the approval policy above; non-public repos get
+fork-PR workflows disabled outright instead, since GitHub rejects the approval-policy endpoint on non-public repos. Each
+is applied only where it's applicable, and the correct one lands automatically on the first run after a repo's
+visibility changes.
 
 `kd gh repo main-protect` also uses `gh`, and it uses the same repo-root auto-detection when you omit `owner/repo`. It
 ensures a ruleset named `main-protect` exists on the default branch, enforces linear history, blocks force-pushes, and
