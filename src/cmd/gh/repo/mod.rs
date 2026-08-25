@@ -39,11 +39,14 @@ pub struct MainProtectArgs {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Apply preferred merge settings to a repository
+    /// Apply preferred merge and Actions settings to a repository
     ///
     /// Configures squash-merge-only with PR title/body, disables merge commits
-    /// and rebase merges, and enables auto-delete of head branches. Use --all
-    /// to apply across all non-fork, non-archived repositories.
+    /// and rebase merges, enables auto-delete of head branches, and locks down
+    /// Actions (read-only default token permissions; approval for fork-PR
+    /// workflows from external contributors on public repos, or fork-PR
+    /// workflows disabled entirely on non-public repos). Use --all to
+    /// apply across all non-fork, non-archived repositories.
     ApplyPreferredSettings(ApplyPreferredSettingsArgs),
     /// Create/update a "main-protect" ruleset on the default branch
     ///
