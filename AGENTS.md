@@ -7,8 +7,9 @@ Requires ImageMagick (`magick` command) at runtime for image operations.
 Run `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, and `dprint check` before considering work
 complete or creating a PR. All must pass.
 
-Agents must conform to `SPEC.md`. If implementation and `SPEC.md` disagree, treat that as a bug or explicitly update
-`SPEC.md` in the same change.
+Agents must conform to `SPEC.md` and `SPEC_impl.md`. If implementation and either file disagree, treat that as a bug or
+explicitly update the file in the same change. `SPEC.md` records user-facing behavior only; implementation choices that
+are deliberate and easy to "fix" into something worse go in `SPEC_impl.md`.
 
 ## Style
 
