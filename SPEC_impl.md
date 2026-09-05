@@ -140,9 +140,10 @@ plain `ssh` with the user's own config and `known_hosts`, which is how a non-tai
 through a local tunnel becomes a rehearsal target. A missing `tailscale` binary counts as "not a peer".
 
 Remote commands run under `bash -lc` so tools under `~/.cargo/bin` and Linuxbrew are on `PATH` in a non-interactive
-session. Files are pushed as `cat | install -D -m 0600 /dev/stdin <path>` over the same transport, streamed rather than
-buffered since the Hermes archive can be large; `-D` because the parent directories do not exist on a fresh home. No
-scp. A hash check is only done on the archive pull in `backup`; ssh's transport is the integrity check for pushes.
+session. Files are pushed as `umask 077 && mkdir -p <dir> && cat > <path> && chmod 0600 <path>` fed on stdin over the
+same transport, streamed rather than buffered since the Hermes archive can be large; `-D` because the parent directories
+do not exist on a fresh home. No scp. A hash check is only done on the archive pull in `backup`; ssh's transport is the
+integrity check for pushes.
 
 ### Secrets
 
@@ -216,10 +217,11 @@ On the controller:
    and there is no root, so seeding reduces to `sudo -n true` and the public key. Then, as the user, install Codex (the
    one Rust-owned installer, see above) and place its auth file.
 5. Decide whether a GitHub token is needed: `gh auth status` as the user fails (no `gh` counts as failing). If so, a
-   real run prompts for it and a rehearsal takes the controller's `gh auth token`; otherwise no token is fetched or
-   placed. Real run only: Tailscale device prompt (print the hostname and the admin-console instruction, wait for Enter)
-   unless `tailscale status --json` on the target reports `BackendState` of `Running` (no `tailscale` binary counts as
-   not running).
+   real run prompts for it (hidden entry on a terminal; one plain line from stdin when there is none, so a real run can
+   be scripted) and a rehearsal takes the controller's `gh auth token`; otherwise no token is fetched or placed. Real
+   run only: Tailscale device prompt (print the hostname and the admin-console instruction, wait for Enter) unless
+   `tailscale status --json` on the target reports `BackendState` of `Running` (no `tailscale` binary counts as not
+   running).
 6. Agent: system phase. Then, if `/var/run/reboot-required` exists, `sudo systemctl reboot` over ssh, ignoring that
    command's own exit status since the connection drops, and poll SSH every 10 seconds for up to 10 minutes; give up
    with an error after that. The per-run known-hosts file is reused because the host key survives a reboot.
@@ -228,7 +230,9 @@ On the controller:
 9. Tailscale (real run only): the agent installed it in the user-space phase; kd runs `sudo tailscale up --timeout 10m`
    with output streamed so the login URL reaches the terminal. `tailscale up` blocks until the browser login completes
    or the timeout expires, which is the whole wait; a nonzero exit is an error. The hostname defaults to the OS
-   hostname; no `--ssh`, no tags, not ephemeral.
+   hostname; no `--ssh`, no tags, not ephemeral. Skipped when `tailscale status --json` already reports `Running`: on an
+   enrolled node `tailscale up` refuses unless every non-default flag from the original enrollment is repeated, which
+   would fail every rerun.
 10. Probe script over SSH, output printed as is, then both agents' final messages. Exit 0.
 
 ### Probe

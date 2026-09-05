@@ -283,7 +283,7 @@ Terms used below:
 - Starts the Hermes gateway and dashboard on the devbox again. This is the "never mind" after a `backup` that stopped
   Hermes.
 
-### kd devbox bootstrap --profile NAME [--target USER@HOST] [--plain-ssh]
+### kd devbox bootstrap --profile NAME [--target USER@HOST] [--plain-ssh] [--no-hermes]
 
 - Starting state, which is the premise of the whole command: a minimal Ubuntu LTS install that is already up, has
   outbound internet, and accepts an SSH connection from the controller using the profile's public key, either as `root`
@@ -336,5 +336,10 @@ Terms used below:
 - After a rehearsal the worker is left running for inspection with a reminder that it holds real credentials; `kd` does
   not destroy it.
 - Logging goes to stderr. There are no log files, receipts, or run records.
+- `--no-hermes` leaves Hermes out entirely: no archive is required or placed, nothing Hermes-related is installed, and
+  the probe has no Hermes checks. Everything else is the same. This is the shape of a plain bootstrap for a disposable
+  box that never ran Hermes; a fuller separation of that flow from the named-devbox flow is planned.
+- If there is no terminal, the GitHub token is read as one plain line from stdin instead of the hidden prompt, so a
+  scripted real run can pipe `y` for the fingerprint and then the token.
 - Not in scope: triggering the reinstall through a provider API, Hermes version pinning or same-version restore, archive
   retention, deleting Tailscale devices, migrating anything beyond the Hermes archive and the four agent auth files.

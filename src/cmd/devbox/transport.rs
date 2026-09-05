@@ -9,7 +9,7 @@
 //! argv under `bash -lc`. That split is load-bearing: `bash -lc` is what
 //! puts `~/.cargo/bin` and Linuxbrew on `PATH` in a non-interactive session,
 //! and stdin being free is what lets a file push be
-//! `cat local | install -D -m 0600 /dev/stdin remote` with nothing buffered.
+//! `cat local | ssh box 'cat > remote'` with nothing buffered.
 //!
 //! Because the script is in argv, a `pgrep -f` pattern inside it is visible
 //! in the argv of the shell running it. Scripts must use the `[h]ermes`
@@ -157,8 +157,8 @@ impl Transport {
 
     /// Like [`Transport::run`] but with `input` fed to the remote script's
     /// stdin. This is how the Codex prompt reaches `codex exec`, and how a
-    /// file push works (the script being `install -D -m 0600 /dev/stdin
-    /// <path>`). Output is inherited.
+    /// file push works (the script being a `cat > <path>` under a
+    /// restrictive umask). Output is inherited.
     pub fn run_with_stdin(&self, script: &str, input: &[u8]) -> anyhow::Result<()> {
         let mut child = self
             .command(script)
@@ -260,13 +260,19 @@ impl Transport {
     }
 }
 
-/// The remote side of [`Transport::push_secret`]: `$HOME` expands in the
-/// remote shell, the relative part is quoted literally.
+/// The remote side of [`Transport::push_secret`] and [`Transport::push_file`]:
+/// `$HOME` expands in the remote shell, the relative part is quoted
+/// literally, and the bytes are read from stdin by `cat`.
+///
+/// Not `install -D -m 0600 /dev/stdin`, which was the first version: under
+/// Tailscale SSH the remote stdin is a socket, and reopening a socket by
+/// path (`/dev/stdin` -> `/proc/self/fd/0`) fails with "Permission denied",
+/// while OpenSSH hands the shell a pipe that reopens fine. `cat` reads the
+/// fd it already has and works under both. The umask makes the file 0600
+/// from its first byte; the explicit chmod covers a pre-existing file.
 fn push_secret_script(home_relative: &str) -> String {
-    format!(
-        "install -D -m 0600 /dev/stdin \"$HOME\"/{}",
-        shell_quote(home_relative)
-    )
+    let path = format!("\"$HOME\"/{}", shell_quote(home_relative));
+    format!("umask 077 && mkdir -p \"$(dirname {path})\" && cat > {path} && chmod 0600 {path}")
 }
 
 /// Single-quote `s` for a POSIX shell: the only quoting form that makes
@@ -351,14 +357,16 @@ mod tests {
         assert!(strs(&t.argv("true")).contains(&"ssh://tl-user@localhost:2299"));
     }
 
-    /// A push must create parents (`-D`, a fresh home has none of the CLI
-    /// config directories), set the mode atomically, and let `$HOME` expand
-    /// remotely while the relative part stays literal.
+    /// A push must create parents (a fresh home has none of the CLI config
+    /// directories), read stdin with `cat` rather than reopening it by path
+    /// (see [`push_secret_script`]), end at mode 0600, and let `$HOME`
+    /// expand remotely while the relative part stays literal.
     #[test]
     fn push_secret_script_creates_parents_with_mode() {
-        assert_eq!(
-            push_secret_script(".codex/auth.json"),
-            "install -D -m 0600 /dev/stdin \"$HOME\"/'.codex/auth.json'"
-        );
+        let s = push_secret_script(".codex/auth.json");
+        assert!(s.starts_with("umask 077 && mkdir -p"));
+        assert!(s.contains("cat > \"$HOME\"/'.codex/auth.json'"));
+        assert!(s.ends_with("chmod 0600 \"$HOME\"/'.codex/auth.json'"));
+        assert!(!s.contains("/dev/stdin"));
     }
 }
