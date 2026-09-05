@@ -15,9 +15,12 @@
 //! lives in the agent prompts. SPEC_impl.md's NOTE paragraphs list the
 //! decisions that are deliberate; do not "fix" them.
 
+pub mod agent;
 pub mod backup;
+pub mod bootstrap;
 pub mod hermes;
 pub mod profile;
+pub mod prompts;
 pub mod resume;
 pub mod secrets;
 pub mod transport;
@@ -73,6 +76,22 @@ pub fn confirm(question: &str) -> anyhow::Result<bool> {
     ))
 }
 
+/// An instruction the user carries out by hand, acknowledged with Enter.
+/// Not a yes/no: there is nothing to decline, only something to do first.
+/// EOF is an error rather than an acknowledgement, for the same reason
+/// [`confirm`] treats it as "no".
+pub fn wait_for_enter(instruction: &str) -> anyhow::Result<()> {
+    let mut err = std::io::stderr();
+    writeln!(err, "{instruction}")?;
+    err.flush()?;
+    let mut line = String::new();
+    let n = std::io::stdin().lock().read_line(&mut line)?;
+    if n == 0 {
+        anyhow::bail!("stdin closed while waiting for you to press Enter");
+    }
+    Ok(())
+}
+
 #[derive(Args, Debug, Clone)]
 pub struct BackupArgs {
     #[command(flatten)]
@@ -118,10 +137,7 @@ impl Commands {
         match self {
             Commands::Backup(args) => backup::run(args),
             Commands::Resume(args) => resume::run(args),
-            Commands::Bootstrap(args) => {
-                let _profile = args.profile.load()?;
-                anyhow::bail!("kd devbox bootstrap is not implemented yet")
-            }
+            Commands::Bootstrap(args) => bootstrap::run(args),
         }
     }
 }
