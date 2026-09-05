@@ -226,6 +226,27 @@ impl Transport {
         Ok(())
     }
 
+    /// Push a local file to `$HOME/<home_relative>` on the box as a mode-0600
+    /// file, streaming it from disk. This is how the Hermes archive travels;
+    /// it can be hundreds of megabytes and is never held in memory.
+    pub fn push_file(&self, local: &Path, home_relative: &str) -> anyhow::Result<()> {
+        let file = std::fs::File::open(local)
+            .with_context(|| format!("cannot open {}", local.display()))?;
+        let status = self
+            .command(&push_secret_script(home_relative))
+            .stdin(Stdio::from(file))
+            .status()
+            .with_context(|| format!("failed to start remote command on {}", self.destination))?;
+        if !status.success() {
+            bail!(
+                "pushing {} to {} exited with {status}",
+                local.display(),
+                self.destination
+            );
+        }
+        Ok(())
+    }
+
     /// Push `contents` to `$HOME/<home_relative>` on the box as a mode-0600
     /// file, creating parent directories. Streams; nothing is logged.
     ///
