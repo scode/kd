@@ -83,29 +83,7 @@ pub fn run(args: BootstrapArgs) -> anyhow::Result<()> {
         describe(&user_t)
     );
     // 3. Connect as the user; fall back to root for seeding.
-    let seed_t = if user_t.capture("true")?.success() {
-        info!("connected to {}", plan.destination);
-        user_t.clone()
-    } else {
-        if rehearsal {
-            bail!(
-                "rehearsal requires an existing login with passwordless sudo on {}",
-                plan.destination
-            );
-        }
-        info!(
-            "no login as {} yet; seeding as root on {}",
-            plan.user, plan.destination
-        );
-        if !root_t.capture("true")?.success() {
-            bail!(
-                "cannot connect to {} as {} or root using SSH authentication",
-                plan.destination,
-                plan.user
-            );
-        }
-        root_t
-    };
+    let seed_t = select_seed_transport(&user_t, &root_t, |t| Ok(t.capture("true")?.success()))?;
     let run = Run {
         t: user_t,
         user: plan.user.clone(),
@@ -117,7 +95,7 @@ pub fn run(args: BootstrapArgs) -> anyhow::Result<()> {
     guard(&seed_transport, rehearsal || !hermes)?;
 
     // 4. Seed: the user, the key, sudo, a proven second connection, Codex.
-    seed(&seed_transport, &run.t, &run.user, &public_key, rehearsal)?;
+    seed(&seed_transport, &run.t, &run.user, &public_key)?;
     let codex = sources
         .iter()
         .find(|s| s.cli == "codex")
@@ -508,6 +486,28 @@ fn guard(t: &Transport, refuse_live: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Prefer the intended login and try root only when that login fails.
+/// Rehearsal shares this path: its service-start policy must not prevent
+/// testing a restore on a fresh machine. Probe errors propagate rather than
+/// treating a local transport failure as a rejected remote login.
+fn select_seed_transport(
+    user_t: &Transport,
+    root_t: &Transport,
+    mut connects: impl FnMut(&Transport) -> anyhow::Result<bool>,
+) -> anyhow::Result<Transport> {
+    for t in [user_t, root_t] {
+        if connects(t)? {
+            info!("connected to {} for seeding", t.destination);
+            return Ok(t.clone());
+        }
+    }
+    bail!(
+        "cannot connect to {} or {} using SSH authentication",
+        user_t.destination,
+        root_t.destination
+    )
+}
+
 /// Create the user if missing, authorize the key, grant passwordless sudo,
 /// then prove a connection as that user with working sudo. Idempotent. The
 /// public key arrives on stdin so it never needs quoting.
@@ -516,15 +516,9 @@ fn seed(
     user_t: &Transport,
     user: &str,
     public_key: &str,
-    rehearsal: bool,
 ) -> anyhow::Result<()> {
     info!("seeding user {user} on {}", seed_t.destination);
-    let script = if rehearsal {
-        // The target user exists and has sudo; only the key may be missing.
-        REHEARSAL_SEED_SCRIPT.to_owned()
-    } else {
-        SEED_SCRIPT.replace("__USER__", user)
-    };
+    let script = SEED_SCRIPT.replace("__USER__", user);
     seed_t.run_with_stdin(&script, public_key.trim().as_bytes())?;
     let proof = user_t.capture("sudo -n true && id -un")?;
     if !proof.success() {
@@ -562,18 +556,6 @@ fi
 printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$u" | $S tee "/etc/sudoers.d/90-kd-$u" >/dev/null
 $S chmod 0440 "/etc/sudoers.d/90-kd-$u"
 $S visudo -cf "/etc/sudoers.d/90-kd-$u" >/dev/null
-"#;
-
-/// Rehearsal seed: the login exists; make sure the shared key is authorized
-/// too and that sudo is passwordless.
-const REHEARSAL_SEED_SCRIPT: &str = r#"
-set -eu
-key=$(cat)
-sudo -n true
-install -d -m 0700 "$HOME/.ssh"
-touch "$HOME/.ssh/authorized_keys"
-chmod 0600 "$HOME/.ssh/authorized_keys"
-grep -qF "$key" "$HOME/.ssh/authorized_keys" || printf '%s\n' "$key" >> "$HOME/.ssh/authorized_keys"
 "#;
 
 /// The one installer Rust owns (see SPEC_impl.md): fetch the Codex release
@@ -838,6 +820,51 @@ mod tests {
         assert_eq!(target_host("scode@worker"), "worker");
         assert_eq!(target_host("worker"), "worker");
         assert_eq!(target_host("ssh://tl-user@localhost:2299"), "localhost");
+    }
+
+    /// A working intended-user login must not require root access. Fresh
+    /// targets instead probe root second; two rejected logins must fail
+    /// before any provisioning, for rehearsals and ordinary runs alike.
+    #[test]
+    fn seed_login_prefers_user_and_falls_back_only_on_rejection() {
+        let user = Transport::ssh("developer@worker");
+        let root = Transport::ssh("root@worker");
+        for (user_works, root_works, expected) in [
+            (true, false, Some(&user)),
+            (false, true, Some(&root)),
+            (false, false, None),
+        ] {
+            let mut probes = Vec::new();
+            let result = select_seed_transport(&user, &root, |t| {
+                probes.push(t.destination.clone());
+                Ok(if t == &user { user_works } else { root_works })
+            });
+            assert_eq!(result.ok().as_ref(), expected);
+            let expected_probes = if user_works {
+                vec![user.destination.clone()]
+            } else {
+                vec![user.destination.clone(), root.destination.clone()]
+            };
+            assert_eq!(probes, expected_probes);
+        }
+    }
+
+    /// A local failure to launch SSH is not evidence that the account is
+    /// absent. Preserve that error without attempting a privileged login.
+    #[test]
+    fn seed_login_propagates_transport_errors() {
+        let mut probes = 0;
+        let error = select_seed_transport(
+            &Transport::ssh("developer@worker"),
+            &Transport::ssh("root@worker"),
+            |_| {
+                probes += 1;
+                bail!("could not launch ssh")
+            },
+        )
+        .unwrap_err();
+        assert_eq!(probes, 1);
+        assert_eq!(error.to_string(), "could not launch ssh");
     }
 
     /// The seed script's only template slot is the username; the profile

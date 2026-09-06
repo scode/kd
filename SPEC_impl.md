@@ -219,17 +219,17 @@ On the controller:
    `ssh-keyscan -t ed25519 -p <port> <host>`, show the key's fingerprint in both SHA256 and MD5 forms (`ssh-keygen -lf`
    and `ssh-keygen -E md5 -lf`, consoles vary), ask the user to confirm it matches the console. On yes, write the
    keyscan line to the per-run known-hosts file; on no, exit.
-3. Connect as the intended user; on a real run, if that fails, root at the same destination for seeding (a rehearsal has
-   no root and its user must already exist). Guard: `pgrep -f '[h]ermes.*gateway'` over that first connection (any user;
-   `hermes` itself may not be on PATH yet). If it matches, a non-rehearsal restore asks before continuing; scratch
-   bootstrap and rehearsals refuse outright. Running, not enabled, is the test, and directories are never checked,
-   because a rerun after a partial bootstrap must work: on a real run the previous attempt may already have restored
-   Hermes, and on a rehearsal Hermes is installed without being started.
+3. Connect as the intended user; if that fails, try root at the same destination for seeding, including rehearsals.
+   Guard: `pgrep -f '[h]ermes.*gateway'` over that first connection (any user; `hermes` itself may not be on PATH yet).
+   If it matches, a non-rehearsal restore asks before continuing; scratch bootstrap and rehearsals refuse outright.
+   Running, not enabled, is the test, and directories are never checked, because a rerun after a partial bootstrap must
+   work: on a real run the previous attempt may already have restored Hermes, and on a rehearsal Hermes is installed
+   without being started.
 4. Seed, idempotently, since a rerun finds everything already in place: create the user with `/bin/bash` if missing,
    install the public key if missing, passwordless sudo, prove a second connection as that user. From here on every
    connection is as the user; the root connection, if there was one, is not used again. On a ubiworker the user exists
-   and there is no root, so seeding reduces to `sudo -n true` and the public key. Then, as the user, install Codex (the
-   one Rust-owned installer, see above) and place its auth file.
+   and there is no root, so the same seed script uses its existing passwordless sudo without creating an account. Then,
+   as the user, install Codex (the one Rust-owned installer, see above) and place its auth file.
 5. Decide whether a GitHub token is needed: `gh auth status` as the user fails (no `gh` counts as failing). If so, a
    real run prompts for it (hidden entry on a terminal; one plain line from stdin when there is none, so a real run can
    be scripted) and a rehearsal takes the controller's `gh auth token`; otherwise no token is fetched or placed. With
