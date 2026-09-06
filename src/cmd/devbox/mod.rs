@@ -19,6 +19,7 @@ pub mod agent;
 pub mod backup;
 pub mod bootstrap;
 pub mod hermes;
+pub mod probe;
 pub mod profile;
 pub mod prompts;
 pub mod resume;

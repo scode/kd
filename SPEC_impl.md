@@ -83,22 +83,26 @@ problem, which is the point.
 - Media and browser dependencies: ImageMagick, ffmpeg, Xvfb, Playwright's system dependencies, GTK/WebKit runtime
   packages.
 - Docker Engine and the Compose plugin, with the user in the `docker` group.
-- Toolchains: rustup with stable, Homebrew (Linuxbrew), Node and npm, Bun, uv, Python 3.
+- Toolchains: rustup with stable, Node and npm, Bun, uv, Python 3, under the user's home; Homebrew at its standard Linux
+  prefix `/home/linuxbrew/.linuxbrew`, because only that prefix gets prebuilt bottles (the first rehearsal's agent put
+  it under `~` and everything brew touched built from source).
 
 **User-space phase**, as the user, after kd has placed the secrets:
 
 - CLIs: `gh`, `jj`, `cargo-dist`, `git-cliff`, `sccache`, `trunk`, `dioxus-cli`, `dprint`, `herdr`, `vercel`, Claude
   Code (its own installer), OpenCode, Muse.
-- `gh auth login --with-token < ~/.kd-github-token && rm ~/.kd-github-token`, then `gh auth setup-git`. Skip if
-  `gh auth status` already passes.
+- `gh auth login --with-token < ~/.kd-github-token`, then delete the token file with `unlink`, then `gh auth setup-git`.
+  Skip the login if `gh auth status` already passes. `unlink` rather than `rm -f` because Codex's built-in command
+  policy rejects any command containing `rm -f`, even under full-access mode.
 - Clone `scode/voice` and `scode/dotfiles` into `~/git/<name>` (always, whether or not the manifest lists them), then
   run `cargo run -p dotfiles -- install` from `~/git/dotfiles` twice; the second run must report zero failures. `voice`
   goes first because the dotfiles installer links the voice skill only when `~/git/voice` exists.
 - Clone every repo in the profile manifest into `~/git/<name>` over HTTPS, then `jj git init --colocate` in each
   (including `voice` and `dotfiles`). Skip clones that already exist.
-- `ssh localhost`: generate `~/.ssh/id_ed25519_localhost` with no passphrase, append its public key to
-  `~/.ssh/authorized_keys`, `ssh-keyscan localhost >> ~/.ssh/known_hosts`, fix modes, verify with
-  `ssh -o BatchMode=yes -i ~/.ssh/id_ed25519_localhost localhost true`.
+- `ssh localhost`: the contract is that plain `ssh -o BatchMode=yes localhost true` succeeds. Mechanism: generate
+  `~/.ssh/id_ed25519_localhost` with no passphrase, append its public key to `~/.ssh/authorized_keys`, a
+  `Host localhost` stanza in `~/.ssh/config` naming that IdentityFile, `ssh-keyscan` into `~/.ssh/known_hosts`, fix
+  modes. The first rehearsal's agent verified only with `-i` and the plain command failed, hence the stanza.
 - Hermes: official installer; stop the gateway first if one is running (a real-run rerun can find one); then
   `hermes import ~/.kd-hermes-backup.zip --force`, then `rm ~/.kd-hermes-backup.zip` since it contains `.hermes/.env`;
   then `hermes gateway install`. Pass the start flags explicitly, because the headless default is to start and enable,
@@ -155,7 +159,10 @@ stopped or written if one is missing:
   writable and only writes the file as a fallback, so a stale file can sit next to a live Keychain entry. The Keychain
   payload is the same JSON the Linux file holds. There is no setting that forces file storage on macOS.
 - OpenCode: `~/.local/share/opencode/auth.json`.
-- Muse: `~/.config/muse/auth.json`.
+- Muse: `~/.config/muse/auth.json`, but not verbatim on macOS. Muse 1.0 writes schema 1 on Linux (secrets inline) and
+  schema 2 on macOS (`"storage": "keychain"`, secrets in the Keychain item `ai.meta.dev.credentials`, account `meta`, as
+  a small JSON with `api_key` and `access_token`), and a Linux Muse rejects schema 2 outright. kd merges the two back
+  into a schema-1 file for the target; a schema-1 file on the controller passes through unchanged.
 
 Codex's file is placed during seeding because the agent needs it. The other three and the Hermes archive go to the
 target as `0600` files between the two agent runs. The GitHub token goes with them only when `gh auth status` on the

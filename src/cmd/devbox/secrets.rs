@@ -13,7 +13,7 @@
 //! Keychain is therefore tried first and the file is used only when that
 //! lookup fails. The Keychain payload is the same JSON the Linux file holds.
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 use std::path::Path;
 use std::process::Command;
 
@@ -71,14 +71,18 @@ pub fn resolve_all(home: &Path) -> anyhow::Result<Vec<AuthSource>> {
         }
     }
 
-    match read_file(&home.join(".config/muse/auth.json")) {
-        Some(contents) => sources.push(AuthSource {
+    match muse_credentials(home) {
+        Ok(contents) => sources.push(AuthSource {
             cli: "muse",
             remote_relative: ".config/muse/auth.json",
             contents,
         }),
-        None => {
-            missing.push("muse: ~/.config/muse/auth.json (run `muse auth set --api-key-stdin`)")
+        Err(e) => {
+            // The reason is worth carrying: a Keychain miss and a missing
+            // file need different fixes.
+            missing.push(Box::leak(
+                format!("muse: {e:#} (run `muse login` on the controller)").into_boxed_str(),
+            ));
         }
     }
 
@@ -101,6 +105,66 @@ fn read_file(path: &Path) -> Option<Vec<u8>> {
     }
 }
 
+/// Keychain service Muse Code uses on macOS for the OAuth secrets that its
+/// schema-2 `auth.json` only points at. Observed on the controller.
+const MUSE_KEYCHAIN_SERVICE: &str = "ai.meta.dev.credentials";
+const MUSE_KEYCHAIN_ACCOUNT: &str = "meta";
+
+/// Muse's auth file in the form a Linux Muse reads.
+///
+/// Muse 1.0 has two on-disk shapes with the same version string. On Linux
+/// it writes schema 1: one JSON with the provider's `api_key` and
+/// `access_token` inline. On macOS it writes schema 2: the same metadata
+/// with `"storage": "keychain"` instead of the secrets, which live in the
+/// Keychain as a small JSON of their own. A Linux Muse rejects schema 2
+/// outright ("unsupported auth schema version 2"), so copying the macOS
+/// file verbatim can never work. Merging the two back into schema 1 is
+/// deterministic and is what this does; a schema-1 file passes through.
+fn muse_credentials(home: &Path) -> anyhow::Result<Vec<u8>> {
+    let path = home.join(".config/muse/auth.json");
+    let file = read_file(&path).ok_or_else(|| anyhow::anyhow!("{} is missing", path.display()))?;
+    let file_json: serde_json::Value =
+        serde_json::from_slice(&file).context("auth.json is not JSON")?;
+    if file_json.get("schema_version") != Some(&serde_json::Value::from(2)) {
+        return Ok(file);
+    }
+    let secrets = keychain_password_for(MUSE_KEYCHAIN_SERVICE, Some(MUSE_KEYCHAIN_ACCOUNT))
+        .context("schema-2 auth.json points at the Keychain but the item is not readable")?;
+    let secrets_json: serde_json::Value =
+        serde_json::from_slice(&secrets).context("Muse Keychain payload is not JSON")?;
+    muse_schema1(&file_json, &secrets_json).map(|v| v.to_string().into_bytes())
+}
+
+/// Pure merge of a schema-2 file and its Keychain payload into schema 1.
+fn muse_schema1(
+    file: &serde_json::Value,
+    secrets: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    use serde_json::{Map, Value};
+    let providers = file
+        .get("providers")
+        .and_then(Value::as_object)
+        .context("auth.json has no providers")?;
+    let mut out = Map::new();
+    for (name, provider) in providers {
+        let mut p = provider.as_object().cloned().unwrap_or_default();
+        p.remove("storage");
+        for key in ["api_key", "access_token"] {
+            if let Some(v) = secrets.get(key) {
+                p.insert(key.to_owned(), v.clone());
+            }
+        }
+        if !p.contains_key("api_key") && !p.contains_key("access_token") {
+            bail!("no secret found for Muse provider '{name}'");
+        }
+        out.insert(name.clone(), Value::Object(p));
+    }
+    let mut root = Map::new();
+    root.insert("schema_version".into(), Value::from(1));
+    root.insert("providers".into(), Value::Object(out));
+    Ok(Value::Object(root))
+}
+
 /// Keychain first, file second; see the module docs for why the order is
 /// not negotiable.
 fn claude_credentials(home: &Path) -> Option<Vec<u8>> {
@@ -113,10 +177,18 @@ fn claude_credentials(home: &Path) -> Option<Vec<u8>> {
 /// locked. All three mean "not available here", which is all the caller
 /// distinguishes.
 fn keychain_password(service: &str) -> Option<Vec<u8>> {
-    let output = Command::new("security")
-        .args(["find-generic-password", "-s", service, "-w"])
-        .output()
-        .ok()?;
+    keychain_password_for(service, None)
+}
+
+/// Like [`keychain_password`], optionally narrowed to an account name for
+/// services that hold several items.
+fn keychain_password_for(service: &str, account: Option<&str>) -> Option<Vec<u8>> {
+    let mut cmd = Command::new("security");
+    cmd.args(["find-generic-password", "-s", service]);
+    if let Some(account) = account {
+        cmd.args(["-a", account]);
+    }
+    let output = cmd.arg("-w").output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -134,4 +206,39 @@ fn keychain_password(service: &str) -> Option<Vec<u8>> {
 pub fn describe(sources: &[AuthSource]) -> String {
     let names: Vec<&str> = sources.iter().map(|s| s.cli).collect();
     format!("controller credentials found for: {}", names.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The macOS-to-Linux merge: metadata from the file, secrets from the
+    /// Keychain payload, `storage` dropped, schema bumped back to 1. The
+    /// shapes here mirror what was observed on the controller and the
+    /// devbox on 2026-09-05.
+    #[test]
+    fn muse_schema2_plus_keychain_becomes_schema1() {
+        let file = json!({
+            "schema_version": 2,
+            "providers": {"meta": {
+                "mechanism": "oauth", "storage": "keychain", "obtained_via": "device_code",
+                "api_base_url": "https://x", "user_email": "e", "user_full_name": "n"
+            }}
+        });
+        let secrets = json!({"secret_schema_version": 1, "api_key": "K", "access_token": "T"});
+        let out = muse_schema1(&file, &secrets).unwrap();
+        assert_eq!(out["schema_version"], 1);
+        let meta = &out["providers"]["meta"];
+        assert_eq!(meta["api_key"], "K");
+        assert_eq!(meta["access_token"], "T");
+        assert_eq!(meta["mechanism"], "oauth");
+        assert!(meta.get("storage").is_none());
+    }
+
+    #[test]
+    fn muse_merge_refuses_a_payload_without_secrets() {
+        let file = json!({"schema_version": 2, "providers": {"meta": {"storage": "keychain"}}});
+        assert!(muse_schema1(&file, &json!({})).is_err());
+    }
 }

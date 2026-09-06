@@ -18,7 +18,8 @@
 //! any failure is "fix or ignore, then rerun the whole command".
 
 use super::{
-    BootstrapArgs, agent, confirm, home_dir, prompts, secrets, transport::Transport, wait_for_enter,
+    BootstrapArgs, agent, confirm, home_dir, probe, prompts, secrets, transport::Transport,
+    wait_for_enter,
 };
 use anyhow::{Context, bail};
 use std::path::{Path, PathBuf};
@@ -121,10 +122,93 @@ pub fn run(args: BootstrapArgs) -> anyhow::Result<()> {
     )?;
     reboot_if_required(&mut run)?;
 
-    let _ = (github_token, archive, system_report);
-    bail!(
-        "bootstrap: the system phase is done; secrets, user-space phase, and probe are not implemented yet"
-    )
+    // 7. Secrets: the other three auth files, the archive, the token.
+    place_secrets(&run.t, &sources, &archive, github_token.as_deref())?;
+
+    // 8. User-space phase.
+    let user_report = agent::run_phase(
+        &run.t,
+        "user-space",
+        &prompts::user_space_phase(&run.user, &profile.repos, rehearsal),
+    )?;
+
+    // 9. Tailscale, real run only. The agent installed it; kd enrolls,
+    // because the login URL has to reach this terminal.
+    if !rehearsal {
+        tailscale_up(&run.t)?;
+    }
+
+    // 10. Probe, then the agents' own reports. Exit 0 regardless.
+    let expected_repos = expected_repo_count(&profile.repos);
+    let report = probe::run(
+        &run.t,
+        &probe::script(&profile.hostname, expected_repos, rehearsal),
+    )?;
+    println!("\n== probe on {}\n{}", run.t.destination, report.trim_end());
+    println!("\n== system phase report\n{}", system_report.trim_end());
+    println!("\n== user-space phase report\n{}", user_report.trim_end());
+    if rehearsal {
+        println!(
+            "\nrehearsal done. The target holds real credentials; destroy it when you are finished."
+        );
+    } else {
+        println!(
+            "\nbootstrap done. Your own ~/.ssh/known_hosts still has the old key for {}: run `ssh-keygen -R {}` before your next login.",
+            profile.host, profile.host
+        );
+    }
+    Ok(())
+}
+
+/// Everything secret except Codex's own login (placed during seeding) goes
+/// over now, between the two agent runs, so the system phase never saw it.
+/// The token is written only when one was collected, i.e. when `gh` on the
+/// box was not already logged in, so a rerun never leaves a token file.
+fn place_secrets(
+    t: &Transport,
+    sources: &[secrets::AuthSource],
+    archive: &Path,
+    github_token: Option<&str>,
+) -> anyhow::Result<()> {
+    info!(
+        "placing credentials and the Hermes archive on {}",
+        t.destination
+    );
+    for s in sources.iter().filter(|s| s.cli != "codex") {
+        t.push_secret(&s.contents, s.remote_relative)?;
+    }
+    t.push_file(archive, prompts::HERMES_ARCHIVE_FILE)?;
+    if let Some(token) = github_token {
+        t.push_secret(token.as_bytes(), prompts::GITHUB_TOKEN_FILE)?;
+    }
+    Ok(())
+}
+
+/// The manifest deduplicated with the always-cloned repos, by repo name,
+/// which is what `~/git/*` will contain.
+fn expected_repo_count(repos: &[String]) -> usize {
+    let mut names: Vec<&str> = repos
+        .iter()
+        .map(String::as_str)
+        .chain(prompts::ALWAYS_CLONED)
+        .filter_map(|r| r.rsplit_once('/').map(|(_, n)| n))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names.len()
+}
+
+/// `tailscale up` blocks until the browser login completes or the timeout
+/// expires; that is the whole wait. Output is streamed so the login URL
+/// reaches the terminal. Hostname defaults to the OS hostname; no `--ssh`,
+/// no tags, not ephemeral.
+fn tailscale_up(t: &Transport) -> anyhow::Result<()> {
+    info!(
+        "enrolling {} in the tailnet; open the login URL when it appears",
+        t.destination
+    );
+    t.run("sudo -n tailscale up --timeout 10m")
+        .context("tailscale enrollment failed or timed out")
 }
 
 // ── Up-front pieces ────────────────────────────────────────────────────
