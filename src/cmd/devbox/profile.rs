@@ -1,17 +1,13 @@
-//! Devbox profiles: the one place identity lives.
+//! Shared bootstrap settings and named stateful instances.
 //!
-//! A profile names a disposable remote development box: where it is, who the
-//! one real user on it is, and where its Hermes archives land on the
-//! controller. Everything that could identify the user (addresses,
-//! hostnames, usernames, key paths) is in this file and nowhere in the
-//! binary; package and tool preferences are the reverse (compiled in, never
-//! in the profile). SPEC.md's `kd devbox` section documents the file.
+//! A disposable environment needs only the shared user, key and manifest.
+//! Named profiles identify state that survives a machine: its current host,
+//! hostname and archive directory. Package preferences remain in prompts.
 //!
 //! The file holds no secrets, so its permissions are deliberately not
 //! checked. It lives at `$XDG_CONFIG_HOME/kd/devboxes.toml`, falling back to
-//! `~/.config/kd/devboxes.toml`; every subcommand requires `--profile`
-//! even when only one profile exists, because the commands are not something
-//! to run against the wrong box by accident.
+//! `~/.config/kd/devboxes.toml`. Stateful operations require a profile;
+//! bootstrap names its destination explicitly and needs no source profile.
 
 use anyhow::{Context, bail};
 use serde::Deserialize;
@@ -21,29 +17,31 @@ use std::path::{Path, PathBuf};
 
 /// One devbox, as written in `devboxes.toml`.
 ///
-/// `public_key` and `backup_dir` are stored as written; `~` is expanded by
+/// `backup_dir` is stored as written; `~` is expanded by
 /// [`Profile::resolve`] against a home directory the caller supplies, so the
 /// parsing layer never touches the process environment and stays
 /// unit-testable.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
-    /// Address the controller can ssh to before Tailscale exists on the box
-    /// (the provider's public IP, typically). Never a MagicDNS name: on a real
-    /// run Tailscale is the last thing bootstrap sets up.
+    /// Current source address for backup, suspend and resume. Bootstrap
+    /// never connects here; its destination is always explicit.
     pub host: String,
-    /// The one real user on the box. On a rehearsal (`--target`) this is
-    /// ignored in favour of the target's user.
-    pub user: String,
+    /// Source login override; omitted means the shared bootstrap user.
+    #[serde(default)]
+    pub user: Option<String>,
     /// OS hostname to set; Tailscale uses the same name.
     pub hostname: String,
-    /// Controller-side public key to authorize on the box. `~` allowed.
-    pub public_key: String,
     /// Controller-side directory where Hermes archives land. `~` allowed.
     pub backup_dir: String,
-    /// GitHub `owner/name` entries, each cloned to `~/git/<name>` on the box.
-    /// `scode/dotfiles` and `scode/voice` are cloned whether or not they are
-    /// listed (see SPEC.md); listing them is harmless.
+}
+
+/// Reusable environment identity, independent of any machine or backup.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapSettings {
+    pub user: String,
+    pub public_key: String,
     pub repos: Vec<String>,
 }
 
@@ -51,6 +49,7 @@ pub struct Profile {
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Profiles {
+    pub bootstrap: BootstrapSettings,
     #[serde(default)]
     pub devbox: BTreeMap<String, Profile>,
 }
@@ -62,9 +61,7 @@ pub struct ResolvedProfile {
     pub host: String,
     pub user: String,
     pub hostname: String,
-    pub public_key: PathBuf,
     pub backup_dir: PathBuf,
-    pub repos: Vec<String>,
 }
 
 impl Profile {
@@ -73,34 +70,34 @@ impl Profile {
     ///
     /// Validation is deliberately narrow: `user` and `hostname` must be the
     /// plain lowercase tokens Ubuntu accepts, because both end up in
-    /// `useradd`/`hostnamectl` arguments and an ssh destination; `repos`
-    /// must be `owner/name` so `~/git/<name>` is derivable. `host` is not
+    /// `useradd`/`hostnamectl` arguments and an ssh destination. `host` is not
     /// validated beyond being non-empty because it is only ever passed as a
     /// single argv element to ssh.
-    pub fn resolve(&self, name: &str, home: &Path) -> anyhow::Result<ResolvedProfile> {
+    pub fn resolve(
+        &self,
+        name: &str,
+        home: &Path,
+        default_user: &str,
+    ) -> anyhow::Result<ResolvedProfile> {
         if self.host.trim().is_empty() {
             bail!("profile '{name}': host is empty");
         }
-        validate_token(name, "user", &self.user)?;
+        let user = self.user.as_deref().unwrap_or(default_user);
+        validate_token(name, "user", user)?;
         validate_token(name, "hostname", &self.hostname)?;
-        for repo in &self.repos {
-            repo_name(repo).with_context(|| format!("profile '{name}': bad repos entry"))?;
-        }
         Ok(ResolvedProfile {
             name: name.to_owned(),
             host: self.host.clone(),
-            user: self.user.clone(),
+            user: user.to_owned(),
             hostname: self.hostname.clone(),
-            public_key: expand_tilde(&self.public_key, home),
             backup_dir: expand_tilde(&self.backup_dir, home),
-            repos: self.repos.clone(),
         })
     }
 }
 
 /// `[a-z_][a-z0-9_-]*`, at most 63 characters: the intersection of what
 /// `useradd` and hostnames accept, and a charset safe to interpolate.
-fn validate_token(profile: &str, field: &str, value: &str) -> anyhow::Result<()> {
+pub fn validate_token(profile: &str, field: &str, value: &str) -> anyhow::Result<()> {
     let mut chars = value.chars();
     let first_ok = matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c == '_');
     let rest_ok =
@@ -158,7 +155,17 @@ pub fn config_path(xdg_config_home: Option<&OsStr>, home: &Path) -> PathBuf {
 
 /// Parse a `devboxes.toml` document.
 pub fn parse(text: &str) -> anyhow::Result<Profiles> {
-    toml::from_str(text).context("failed to parse devboxes.toml")
+    let config: Profiles = toml::from_str(text).context(
+        "failed to parse devboxes.toml; shared user, public_key and repos belong in [bootstrap]",
+    )?;
+    validate_token("bootstrap", "user", &config.bootstrap.user)?;
+    if config.bootstrap.public_key.trim().is_empty() {
+        bail!("bootstrap public_key is empty");
+    }
+    for repo in &config.bootstrap.repos {
+        repo_name(repo).context("bad bootstrap repos entry")?;
+    }
+    Ok(config)
 }
 
 /// Load and resolve one named profile from the config file at `path`.
@@ -167,26 +174,37 @@ pub fn parse(text: &str) -> anyhow::Result<Profiles> {
 /// the former tells the user where the file is expected, the latter lists
 /// the profiles that do exist.
 pub fn load(path: &Path, name: &str, home: &Path) -> anyhow::Result<ResolvedProfile> {
+    load_config(path)?.resolve(name, home)
+}
+
+/// Read configuration without selecting a stateful instance. Scratch
+/// bootstrap uses this path and never inspects backup directories.
+pub fn load_config(path: &Path) -> anyhow::Result<Profiles> {
     let text = std::fs::read_to_string(path).with_context(|| {
         format!(
             "no devbox config at {} (see SPEC.md for the format)",
             path.display()
         )
     })?;
-    let profiles = parse(&text).with_context(|| format!("in {}", path.display()))?;
-    let Some(profile) = profiles.devbox.get(name) else {
-        let known: Vec<&str> = profiles.devbox.keys().map(String::as_str).collect();
-        bail!(
-            "no profile '{name}' in {}; known profiles: {}",
-            path.display(),
-            if known.is_empty() {
-                "(none)".to_owned()
-            } else {
-                known.join(", ")
-            }
-        );
-    };
-    profile.resolve(name, home)
+    parse(&text).with_context(|| format!("in {}", path.display()))
+}
+
+impl Profiles {
+    /// Resolve only the requested instance, inheriting the shared user.
+    pub fn resolve(&self, name: &str, home: &Path) -> anyhow::Result<ResolvedProfile> {
+        let Some(profile) = self.devbox.get(name) else {
+            let known: Vec<&str> = self.devbox.keys().map(String::as_str).collect();
+            bail!(
+                "no profile '{name}'; known profiles: {}",
+                if known.is_empty() {
+                    "(none)".to_owned()
+                } else {
+                    known.join(", ")
+                }
+            );
+        };
+        profile.resolve(name, home, &self.bootstrap.user)
+    }
 }
 
 #[cfg(test)]
@@ -196,31 +214,32 @@ mod tests {
     /// The SPEC.md example must parse as written, since it is what the user
     /// copies from. Any drift between the doc and the schema shows up here.
     const SPEC_EXAMPLE: &str = r#"
+[bootstrap]
+user = "scode"
+public_key = "~/.ssh/id_ed25519.pub"
+repos = ["scode/kd", "scode/voice"]
+
 [devbox.NAME]
 host = "203.0.113.5"              # address the controller can ssh to before Tailscale exists
-user = "scode"                    # the one real user on the box
 hostname = "devbox"               # OS hostname; Tailscale uses the same name
-public_key = "~/.ssh/id_ed25519.pub"  # controller key to authorize on the box; ~ is expanded
 backup_dir = "~/devbox-backups"   # where Hermes archives land on the controller; ~ is expanded
-repos = ["scode/kd", "scode/voice"]   # GitHub owner/name, each cloned to ~/git/<name>
 "#;
 
     #[test]
     fn spec_example_parses_and_resolves() {
         let profiles = parse(SPEC_EXAMPLE).unwrap();
-        let resolved = profiles.devbox["NAME"]
-            .resolve("NAME", Path::new("/home/me"))
-            .unwrap();
+        let resolved = profiles.resolve("NAME", Path::new("/home/me")).unwrap();
         assert_eq!(resolved.host, "203.0.113.5");
         assert_eq!(
-            resolved.public_key,
+            expand_tilde(&profiles.bootstrap.public_key, Path::new("/home/me")),
             PathBuf::from("/home/me/.ssh/id_ed25519.pub")
         );
         assert_eq!(
             resolved.backup_dir,
             PathBuf::from("/home/me/devbox-backups")
         );
-        assert_eq!(resolved.repos, vec!["scode/kd", "scode/voice"]);
+        assert_eq!(profiles.bootstrap.repos, vec!["scode/kd", "scode/voice"]);
+        assert_eq!(resolved.user, "scode");
     }
 
     /// Unknown keys are rejected so a typo like `pubkey =` fails loudly
@@ -237,11 +256,11 @@ repos = ["scode/kd", "scode/voice"]   # GitHub owner/name, each cloned to ~/git/
     fn user_and_hostname_charset_is_enforced() {
         let profiles = parse(SPEC_EXAMPLE).unwrap();
         let mut p = profiles.devbox["NAME"].clone();
-        p.user = "Bad User".into();
-        assert!(p.resolve("NAME", Path::new("/h")).is_err());
-        p.user = "ok_user".into();
+        p.user = Some("Bad User".into());
+        assert!(p.resolve("NAME", Path::new("/h"), "scode").is_err());
+        p.user = Some("ok_user".into());
         p.hostname = "-nope".into();
-        assert!(p.resolve("NAME", Path::new("/h")).is_err());
+        assert!(p.resolve("NAME", Path::new("/h"), "scode").is_err());
     }
 
     #[test]

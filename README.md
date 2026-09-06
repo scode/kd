@@ -100,6 +100,57 @@ kd ubiworker ssh -- -v
 kd ubiworker ssh -- -L 8080:localhost:80
 ```
 
+## Development environments and stateful instances
+
+Configure a fresh Ubuntu machine over SSH, optionally restoring a named instance's backup. A disposable environment
+needs no named profile and no backup. Set up shared defaults once in `~/.config/kd/devboxes.toml` (or
+`$XDG_CONFIG_HOME/kd/devboxes.toml`):
+
+```toml
+[bootstrap]
+user = "scode"
+public_key = "~/.ssh/id_ed25519.pub"
+repos = ["scode/kd", "scode/voice"]
+
+# Only needed for a stateful instance:
+[devbox.devbox]
+host = "devbox.example.com"
+hostname = "devbox"
+backup_dir = "~/devbox-backups"
+```
+
+| Intent                                                 | Invocation                                                                    |
+| ------------------------------------------------------ | ----------------------------------------------------------------------------- |
+| Suspend Hermes before a consistent backup or migration | `kd devbox suspend --profile devbox`                                          |
+| Back up Hermes without changing whether it is running  | `kd devbox backup --profile devbox`                                           |
+| Restart Hermes on the original box after suspension    | `kd devbox resume --profile devbox`                                           |
+| Bootstrap a replacement and restore/start Hermes       | `kd devbox bootstrap --target NEW_IP --restore devbox`                        |
+| Rehearse the restore without starting Hermes services  | `kd devbox bootstrap --target scode@test-worker --restore devbox --rehearsal` |
+| Bootstrap a fresh disposable environment               | `kd devbox bootstrap --target worker --hostname worker`                       |
+| Bootstrap using a different Unix user                  | `kd devbox bootstrap --target alice@worker --hostname worker`                 |
+
+`suspend → backup → resume` returns the services to operation and leaves a new archive. For a move, suspend and back up
+the source, create or reinstall the target yourself with your SSH key, then bootstrap it with `--restore devbox`. Keep
+the source suspended; bootstrap does not contact it. Suspension stops current services without disabling their startup
+after reboot. After verifying the replacement, update the profile's `host` if its address changed. `resume` starts the
+original services; it is not a step after a successful restore.
+
+Hermes is currently the only application state backed up. Git repos are cloned from remotes, so push or otherwise save
+local work before disposing of a machine. The backup preflight reports dirty/unpushed repos but does not save them.
+Backup never stops or starts services, even on failure; suspend first for a consistent archive. A live backup may fail
+if Hermes reports it incomplete, including because of live sockets.
+
+Add `--enroll-tailscale` to bootstrap to install and enroll an unenrolled target; existing enrollment is preserved.
+Without it, Tailscale enrollment is left alone. Transport automatically uses Tailscale SSH for a known peer; add
+`--plain-ssh` to force ordinary SSH. SSH aliases and `ssh://USER@HOST:PORT` work too. A bare host uses the shared user;
+bootstrap can connect as root to create that account if needed. A restore rehearsal requires an existing sudo user.
+
+The controller must have credentials for Codex, Claude, OpenCode and Muse. Bootstrap copies them to the target, uses two
+remote Codex runs for setup, and prints a probe report plus each phase's workarounds. Probe failures do not change the
+command's exit status; inspect the report before relying on the box. Destroy disposable targets yourself when done.
+`backup --yes` skips its confirmation, not the preflight report. See [SPEC.md](SPEC.md#kd-devbox) for prompts, restore
+semantics, and migrating the old per-box configuration format.
+
 ## Command Notes
 
 `kd yt thumb resize` rewrites the file you pass it. If the image is already below 2 MB, it does nothing. This shells out

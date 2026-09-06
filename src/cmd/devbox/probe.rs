@@ -14,10 +14,15 @@
 use super::transport::{Transport, shell_quote};
 
 /// Render the probe for this run. `expected_repos` is the manifest
-/// deduplicated with the always-cloned repos; `rehearsal` skips the checks
-/// that only a real run can satisfy (dashboard, Tailscale) and expects the
-/// gateway to be stopped.
-pub fn script(hostname: &str, expected_repos: usize, rehearsal: bool, hermes: bool) -> String {
+/// deduplicated with the always-cloned repos. Rehearsal expects restored
+/// services stopped; Tailscale is checked only when enrollment was requested.
+pub fn script(
+    hostname: &str,
+    expected_repos: usize,
+    rehearsal: bool,
+    hermes: bool,
+    enroll_tailscale: bool,
+) -> String {
     let mut s = String::from(PRELUDE);
     let mut check = |name: &str, cmd: &str| {
         s.push_str(&format!(
@@ -58,7 +63,7 @@ pub fn script(hostname: &str, expected_repos: usize, rehearsal: bool, hermes: bo
             "curl -fsS 127.0.0.1:9119/api/status >/dev/null",
         );
     }
-    if !rehearsal {
+    if enroll_tailscale {
         check("tailscale", "tailscale status >/dev/null 2>&1");
     }
     check(
@@ -98,11 +103,11 @@ mod tests {
     /// expect the gateway stopped; a real run is the other way round.
     #[test]
     fn rehearsal_and_real_probe_different_hermes_and_network_checks() {
-        let r = script("devbox", 25, true, true);
+        let r = script("devbox", 25, true, true, false);
         assert!(r.contains("no gateway process"));
         assert!(!r.contains("'tailscale'"));
         assert!(!r.contains("'dashboard'"));
-        let real = script("devbox", 25, false, true);
+        let real = script("devbox", 25, false, true, true);
         assert!(real.contains("'gateway process'"));
         assert!(real.contains("'tailscale'"));
         assert!(real.contains("'dashboard'"));
@@ -114,20 +119,20 @@ mod tests {
     #[test]
     fn script_never_contains_the_literal_it_greps_for() {
         for rehearsal in [true, false] {
-            let s = script("devbox", 1, rehearsal, true).to_ascii_lowercase();
+            let s = script("devbox", 1, rehearsal, true, false).to_ascii_lowercase();
             assert!(!s.contains("hermes gateway"), "{s}");
         }
     }
 
-    /// `--no-hermes` drops every Hermes check in both modes; the Tailscale
-    /// check still depends on the mode alone.
+    /// Scratch runs have no stateful checks; enrollment is independent of
+    /// restoring an archive, so both network choices must work from scratch.
     #[test]
     fn no_hermes_drops_gateway_and_dashboard_checks() {
-        for rehearsal in [true, false] {
-            let s = script("devbox", 1, rehearsal, false);
+        for enroll in [true, false] {
+            let s = script("devbox", 1, false, false, enroll);
             assert!(!s.contains("gateway"));
             assert!(!s.contains("'dashboard'"));
-            assert_eq!(s.contains("'tailscale'"), !rehearsal);
+            assert_eq!(s.contains("'tailscale'"), enroll);
         }
     }
 
@@ -135,7 +140,7 @@ mod tests {
     /// template rather than a constant.
     #[test]
     fn expected_values_are_rendered() {
-        let s = script("box-1", 7, true, true);
+        let s = script("box-1", 7, true, true, false);
         assert!(s.contains("box-1"));
         assert!(s.contains("= 7 ]"));
     }
