@@ -142,8 +142,10 @@ if Hermes reports it incomplete, including because of live sockets.
 
 Add `--enroll-tailscale` to bootstrap to install and enroll an unenrolled target; existing enrollment is preserved.
 Without it, Tailscale enrollment is left alone. Transport automatically uses Tailscale SSH for a known peer; add
-`--plain-ssh` to force ordinary SSH. SSH aliases and `ssh://USER@HOST:PORT` work too. A bare host uses the shared user;
-bootstrap can connect as root to create that account if needed. A restore rehearsal requires an existing sudo user.
+`--plain-ssh` to force ordinary SSH. SSH aliases and `ssh://USER@HOST:PORT` work too. A bare host uses the shared user.
+Bootstrap first tries that user, then root if the login fails, including during a restore rehearsal. It creates the
+account if missing, authorizes the configured key, and grants passwordless sudo. An existing user login needs
+passwordless sudo to perform setup.
 
 The controller must have credentials for Codex, Claude, OpenCode and Muse. Bootstrap copies them to the target, uses two
 remote Codex runs for setup, and prints a probe report plus each phase's workarounds. Probe failures do not change the
