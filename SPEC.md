@@ -325,9 +325,11 @@ Terms used below:
   a replacement may reuse an address with an old key. SSH aliases and ports are resolved before scanning. Restore
   destinations using a proxy must also be directly reachable by `ssh-keyscan`. The completion reminder names
   `ssh-keygen -R`; the user handles any stale key in their own known-hosts file. Tailscale authenticates its own peers.
-- `--rehearsal` requires `--restore` and conflicts with `--enroll-tailscale`. Its target user must already exist with
-  passwordless sudo. Hermes and its dashboard are restored without enabling or starting them, so they cannot compete
-  with the source. It has no kd prompts; SSH may still require authentication or host-key acceptance.
+- `--rehearsal` requires `--restore` and conflicts with `--enroll-tailscale`. Like every bootstrap, it first tries the
+  intended user and falls back to root if that login fails, provisioning the user, key and passwordless sudo. An
+  existing user login needs passwordless sudo for setup. Hermes and its dashboard are restored without enabling or
+  starting them, so they cannot compete with the source. It has no kd prompts; SSH may still require authentication or
+  host-key acceptance.
 - If `gh` on the target is unauthenticated, a rehearsal copies the controller's `gh auth token`; other runs prompt for a
   new classic token using the prefilled URL (scopes `repo`, `workflow`, `read:org`, `gist`). Authenticated reruns skip
   token collection. The four agent credentials must exist locally before connecting.
