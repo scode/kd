@@ -22,6 +22,7 @@ use super::{
     wait_for_enter,
 };
 use anyhow::{Context, bail};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -48,8 +49,15 @@ pub fn run(args: BootstrapArgs) -> anyhow::Result<()> {
     info!("{}", secrets::describe(&sources));
     let public_key = std::fs::read_to_string(&profile.public_key)
         .with_context(|| format!("cannot read public key {}", profile.public_key.display()))?;
-    let archive = newest_archive(&profile.backup_dir, &profile.hostname)?;
-    info!("archive to restore: {}", archive.display());
+    let hermes = !args.no_hermes;
+    let archive = if hermes {
+        let archive = newest_archive(&profile.backup_dir, &profile.hostname)?;
+        info!("archive to restore: {}", archive.display());
+        Some(archive)
+    } else {
+        info!("--no-hermes: no archive, Hermes will not be installed");
+        None
+    };
 
     // 2. Real run only: fingerprint prompt, then the per-run known-hosts file.
     let (mut run, seed_transport) = match &args.target {
@@ -123,13 +131,18 @@ pub fn run(args: BootstrapArgs) -> anyhow::Result<()> {
     reboot_if_required(&mut run)?;
 
     // 7. Secrets: the other three auth files, the archive, the token.
-    place_secrets(&run.t, &sources, &archive, github_token.as_deref())?;
+    place_secrets(
+        &run.t,
+        &sources,
+        archive.as_deref(),
+        github_token.as_deref(),
+    )?;
 
     // 8. User-space phase.
     let user_report = agent::run_phase(
         &run.t,
         "user-space",
-        &prompts::user_space_phase(&run.user, &profile.repos, rehearsal),
+        &prompts::user_space_phase(&run.user, &profile.repos, rehearsal, hermes),
     )?;
 
     // 9. Tailscale, real run only. The agent installed it; kd enrolls,
@@ -142,7 +155,7 @@ pub fn run(args: BootstrapArgs) -> anyhow::Result<()> {
     let expected_repos = expected_repo_count(&profile.repos);
     let report = probe::run(
         &run.t,
-        &probe::script(&profile.hostname, expected_repos, rehearsal),
+        &probe::script(&profile.hostname, expected_repos, rehearsal, hermes),
     )?;
     println!("\n== probe on {}\n{}", run.t.destination, report.trim_end());
     println!("\n== system phase report\n{}", system_report.trim_end());
@@ -167,17 +180,17 @@ pub fn run(args: BootstrapArgs) -> anyhow::Result<()> {
 fn place_secrets(
     t: &Transport,
     sources: &[secrets::AuthSource],
-    archive: &Path,
+    archive: Option<&Path>,
     github_token: Option<&str>,
 ) -> anyhow::Result<()> {
-    info!(
-        "placing credentials and the Hermes archive on {}",
-        t.destination
-    );
+    info!("placing credentials on {}", t.destination);
     for s in sources.iter().filter(|s| s.cli != "codex") {
         t.push_secret(&s.contents, s.remote_relative)?;
     }
-    t.push_file(archive, prompts::HERMES_ARCHIVE_FILE)?;
+    if let Some(archive) = archive {
+        info!("placing the Hermes archive on {}", t.destination);
+        t.push_file(archive, prompts::HERMES_ARCHIVE_FILE)?;
+    }
     if let Some(token) = github_token {
         t.push_secret(token.as_bytes(), prompts::GITHUB_TOKEN_FILE)?;
     }
@@ -203,12 +216,29 @@ fn expected_repo_count(repos: &[String]) -> usize {
 /// reaches the terminal. Hostname defaults to the OS hostname; no `--ssh`,
 /// no tags, not ephemeral.
 fn tailscale_up(t: &Transport) -> anyhow::Result<()> {
+    // A rerun finds the node already enrolled, and `tailscale up` on an
+    // enrolled node refuses unless every non-default flag from the original
+    // enrollment is repeated, so it must not be run again.
+    if tailnet_running(t)? {
+        info!(
+            "{} is already on the tailnet; skipping tailscale up",
+            t.destination
+        );
+        return Ok(());
+    }
     info!(
         "enrolling {} in the tailnet; open the login URL when it appears",
         t.destination
     );
     t.run("sudo -n tailscale up --timeout 10m")
         .context("tailscale enrollment failed or timed out")
+}
+
+/// Whether the box already has a running tailnet session. A missing
+/// `tailscale` binary counts as not running.
+fn tailnet_running(t: &Transport) -> anyhow::Result<bool> {
+    let out = t.capture("tailscale status --json 2>/dev/null")?;
+    Ok(out.success() && out.stdout.contains("\"BackendState\": \"Running\""))
 }
 
 // ── Up-front pieces ────────────────────────────────────────────────────
@@ -430,7 +460,8 @@ $S chown "$u:$u" "$home/.ssh/authorized_keys"
 if ! $S grep -qF "$key" "$home/.ssh/authorized_keys"; then
   printf '%s\n' "$key" | $S tee -a "$home/.ssh/authorized_keys" >/dev/null
 fi
-printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$u" | $S install -m 0440 /dev/stdin "/etc/sudoers.d/90-kd-$u"
+printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$u" | $S tee "/etc/sudoers.d/90-kd-$u" >/dev/null
+$S chmod 0440 "/etc/sudoers.d/90-kd-$u"
 $S visudo -cf "/etc/sudoers.d/90-kd-$u" >/dev/null
 "#;
 
@@ -503,7 +534,21 @@ fn github_token(t: &Transport, rehearsal: bool) -> anyhow::Result<Option<String>
     }
     eprintln!("GitHub needs a new classic token. Create one here (no expiry):");
     eprintln!("  {GITHUB_TOKEN_URL}");
-    let token = rpassword::prompt_password("paste the token: ").context("reading the token")?;
+    // Hidden entry on a terminal. Without one (a scripted run, a test with
+    // stdin piped) the token is read as one plain line from stdin instead;
+    // it still never touches argv or the log.
+    let token = match rpassword::prompt_password("paste the token: ") {
+        Ok(t) => t,
+        Err(_) => {
+            eprintln!("(no terminal; reading the token as one line from stdin)");
+            let mut line = String::new();
+            std::io::stdin()
+                .lock()
+                .read_line(&mut line)
+                .context("reading the token from stdin")?;
+            line
+        }
+    };
     if token.trim().is_empty() {
         bail!("no token entered");
     }
@@ -522,8 +567,7 @@ fn output_ok(out: &std::process::Output) -> bool {
 /// the new node becomes `<hostname>-1`. Skipped when the box is already on
 /// the tailnet (a rerun).
 fn tailscale_device_prompt(t: &Transport, hostname: &str) -> anyhow::Result<()> {
-    let out = t.capture("tailscale status --json 2>/dev/null")?;
-    if out.success() && out.stdout.contains("\"BackendState\": \"Running\"") {
+    if tailnet_running(t)? {
         info!("{} is already on the tailnet", t.destination);
         return Ok(());
     }

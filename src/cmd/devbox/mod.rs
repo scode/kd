@@ -121,6 +121,9 @@ pub struct BootstrapArgs {
     /// Reach --target with plain ssh even if it is a tailnet peer
     #[arg(long, requires = "target")]
     pub plain_ssh: bool,
+    /// Skip Hermes entirely: no archive needed, nothing imported, no units
+    #[arg(long)]
+    pub no_hermes: bool,
 }
 
 #[derive(Subcommand, Debug)]

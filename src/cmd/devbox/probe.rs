@@ -17,7 +17,7 @@ use super::transport::{Transport, shell_quote};
 /// deduplicated with the always-cloned repos; `rehearsal` skips the checks
 /// that only a real run can satisfy (dashboard, Tailscale) and expects the
 /// gateway to be stopped.
-pub fn script(hostname: &str, expected_repos: usize, rehearsal: bool) -> String {
+pub fn script(hostname: &str, expected_repos: usize, rehearsal: bool, hermes: bool) -> String {
     let mut s = String::from(PRELUDE);
     let mut check = |name: &str, cmd: &str| {
         s.push_str(&format!(
@@ -46,17 +46,19 @@ pub fn script(hostname: &str, expected_repos: usize, rehearsal: bool) -> String 
     // Check names must not spell out what the pgrep pattern matches: the
     // whole script is in the login shell's argv, so a name like "hermes
     // gateway stopped" would match `[h]ermes.*gateway` and fail every time.
-    if rehearsal {
+    if hermes && rehearsal {
         check(
             "no gateway process (rehearsal)",
             "! pgrep -f '[h]ermes.*gateway' >/dev/null",
         );
-    } else {
+    } else if hermes {
         check("gateway process", "pgrep -f '[h]ermes.*gateway' >/dev/null");
         check(
             "dashboard",
             "curl -fsS 127.0.0.1:9119/api/status >/dev/null",
         );
+    }
+    if !rehearsal {
         check("tailscale", "tailscale status >/dev/null 2>&1");
     }
     check(
@@ -96,11 +98,11 @@ mod tests {
     /// expect the gateway stopped; a real run is the other way round.
     #[test]
     fn rehearsal_and_real_probe_different_hermes_and_network_checks() {
-        let r = script("devbox", 25, true);
+        let r = script("devbox", 25, true, true);
         assert!(r.contains("no gateway process"));
         assert!(!r.contains("'tailscale'"));
         assert!(!r.contains("'dashboard'"));
-        let real = script("devbox", 25, false);
+        let real = script("devbox", 25, false, true);
         assert!(real.contains("'gateway process'"));
         assert!(real.contains("'tailscale'"));
         assert!(real.contains("'dashboard'"));
@@ -112,8 +114,20 @@ mod tests {
     #[test]
     fn script_never_contains_the_literal_it_greps_for() {
         for rehearsal in [true, false] {
-            let s = script("devbox", 1, rehearsal).to_ascii_lowercase();
+            let s = script("devbox", 1, rehearsal, true).to_ascii_lowercase();
             assert!(!s.contains("hermes gateway"), "{s}");
+        }
+    }
+
+    /// `--no-hermes` drops every Hermes check in both modes; the Tailscale
+    /// check still depends on the mode alone.
+    #[test]
+    fn no_hermes_drops_gateway_and_dashboard_checks() {
+        for rehearsal in [true, false] {
+            let s = script("devbox", 1, rehearsal, false);
+            assert!(!s.contains("gateway"));
+            assert!(!s.contains("'dashboard'"));
+            assert_eq!(s.contains("'tailscale'"), !rehearsal);
         }
     }
 
@@ -121,7 +135,7 @@ mod tests {
     /// template rather than a constant.
     #[test]
     fn expected_values_are_rendered() {
-        let s = script("box-1", 7, true);
+        let s = script("box-1", 7, true, true);
         assert!(s.contains("box-1"));
         assert!(s.contains("= 7 ]"));
     }
