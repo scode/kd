@@ -23,12 +23,15 @@ unit, and diagnosing whatever breaks along the way. The line is "does this touch
 whether it's safe to write to this machine?". If not, it goes in the prompt.
 
 Two exceptions, both accepted because there is no agent yet or because they are a few lines of shell in a script Rust
-already owns. First, Rust installs Codex during seeding: a generated script run on the target does
-`curl -L https://github.com/openai/codex/releases/latest/download/codex-$(uname -m)-unknown-linux-musl.tar.gz`, which
-GitHub redirects to the newest release without any API call or JSON parsing, extracts the one binary inside, and places
-it at `~/.local/bin/codex`. `curl` and `tar` are assumed present on a minimal Ubuntu. That is the only release layout
-Rust knows about; when it drifts, update it here and in the code together. Second, the probe script hardcodes one real
-request per agent CLI (see "Probe"). A rotted probe line shows up as a failed probe item, never as a failed run.
+already owns. First, Rust installs Codex during seeding: a generated script run on the target fetches
+`https://github.com/openai/codex/releases/latest/download/<name>-$(uname -m)-unknown-linux-musl.tar.gz` for the two
+names `codex` and `codex-code-mode-host`, which GitHub redirects to the newest release without any API call or JSON
+parsing, and places the one binary inside each at `~/.local/bin/<name>`. Both are needed: since Codex 0.153 the command
+runner is the separate `codex-code-mode-host` executable that `codex` looks for beside itself, and the feature is on by
+default and fails closed, so a lone `codex` can run no commands at all. `curl` and `tar` are assumed present on a
+minimal Ubuntu. That is the only release layout Rust knows about; when it drifts, update it here and in the code
+together. Second, the probe script hardcodes one real request per agent CLI (see "Probe"). A rotted probe line shows up
+as a failed probe item, never as a failed run.
 
 The agent may not: modify repository contents (repos are data, not things to fix), touch controller state, read secrets
 it doesn't need, or decide the target is safe. It reports failures and workarounds in its final message; it does not

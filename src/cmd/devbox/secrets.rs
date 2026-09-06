@@ -23,10 +23,8 @@ pub struct AuthSource {
     /// CLI name, for messages only.
     pub cli: &'static str,
     /// Home-relative destination on the target, e.g. `.codex/auth.json`.
-    #[expect(dead_code, reason = "read by bootstrap, which lands next")]
     pub remote_relative: &'static str,
     /// The credential bytes. Never logged.
-    #[expect(dead_code, reason = "read by bootstrap, which lands next")]
     pub contents: Vec<u8>,
 }
 

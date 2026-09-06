@@ -35,7 +35,6 @@ pub enum Backing {
     Ssh { options: Vec<String> },
     /// `tailscale ssh`, which wraps the system ssh with a tailnet-verified
     /// host key. Used for `--target` hosts that are tailnet peers.
-    #[expect(dead_code, reason = "constructed by bootstrap, which lands next")]
     TailscaleSsh,
 }
 
@@ -76,7 +75,6 @@ impl Transport {
     }
 
     /// `tailscale ssh` to a tailnet peer.
-    #[expect(dead_code, reason = "used by bootstrap, which lands next")]
     pub fn tailscale(destination: impl Into<String>) -> Self {
         Transport {
             destination: destination.into(),
@@ -88,7 +86,6 @@ impl Transport {
     /// backing; `tailscale ssh` manages its own host-key options and the
     /// call is a no-op there, which is deliberate rather than an error so a
     /// caller can build the transport uniformly.
-    #[expect(dead_code, reason = "used by bootstrap, which lands next")]
     pub fn with_option(mut self, option: impl Into<String>) -> Self {
         if let Backing::Ssh { options } = &mut self.backing {
             options.push(option.into());
@@ -99,7 +96,6 @@ impl Transport {
     /// Pin host verification to a specific known-hosts file, strict. This is
     /// the real-run bootstrap case where the user's own `known_hosts` still
     /// holds the pre-reinstall key.
-    #[expect(dead_code, reason = "used by bootstrap, which lands next")]
     pub fn with_known_hosts_file(self, path: &Path) -> Self {
         self.with_option(format!("UserKnownHostsFile={}", path.display()))
             .with_option("StrictHostKeyChecking=yes")
@@ -163,7 +159,6 @@ impl Transport {
     /// stdin. This is how the Codex prompt reaches `codex exec`, and how a
     /// file push works (the script being `install -D -m 0600 /dev/stdin
     /// <path>`). Output is inherited.
-    #[expect(dead_code, reason = "used by bootstrap, which lands next")]
     pub fn run_with_stdin(&self, script: &str, input: &[u8]) -> anyhow::Result<()> {
         let mut child = self
             .command(script)
@@ -238,7 +233,6 @@ impl Transport {
     /// by the remote shell: the ssh username is not always the unix user
     /// (a tunnelled sandbox logs in as one name and lands in another's
     /// home), so kd never builds an absolute home path itself.
-    #[expect(dead_code, reason = "used by bootstrap, which lands next")]
     pub fn push_secret(&self, contents: &[u8], home_relative: &str) -> anyhow::Result<()> {
         self.run_with_stdin(&push_secret_script(home_relative), contents)
             .with_context(|| format!("failed to push ~/{home_relative} to {}", self.destination))
@@ -247,7 +241,6 @@ impl Transport {
 
 /// The remote side of [`Transport::push_secret`]: `$HOME` expands in the
 /// remote shell, the relative part is quoted literally.
-#[expect(dead_code, reason = "used by bootstrap, which lands next")]
 fn push_secret_script(home_relative: &str) -> String {
     format!(
         "install -D -m 0600 /dev/stdin \"$HOME\"/{}",
