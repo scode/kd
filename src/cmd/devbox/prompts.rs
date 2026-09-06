@@ -21,8 +21,15 @@ pub const GITHUB_TOKEN_FILE: &str = ".kd-github-token";
 pub const HERMES_ARCHIVE_FILE: &str = ".kd-hermes-backup.zip";
 
 /// The user-space phase: everything that needs a secret, run after kd has
-/// placed the credentials and the Hermes archive.
-pub fn user_space_phase(user: &str, repos: &[String], rehearsal: bool, hermes: bool) -> String {
+/// placed credentials and, only on a restore, the Hermes archive. Service
+/// startup and Tailscale installation are separate per-run decisions.
+pub fn user_space_phase(
+    user: &str,
+    repos: &[String],
+    rehearsal: bool,
+    hermes: bool,
+    enroll_tailscale: bool,
+) -> String {
     let manifest: Vec<String> = repos.iter().map(|r| format!("  - {r}")).collect();
     let archive_note = if hermes {
         format!(", `{HERMES_ARCHIVE_FILE}` (a Hermes backup archive)")
@@ -39,7 +46,7 @@ pub fn user_space_phase(user: &str, repos: &[String], rehearsal: bool, hermes: b
     } else {
         "Enable and start it, and run `loginctl enable-linger` so it survives logout."
     };
-    let tailscale = if rehearsal {
+    let tailscale = if !enroll_tailscale {
         "Do not install or touch Tailscale."
     } else {
         "Install Tailscale with its official install script if the `tailscale` binary is missing. Do NOT run `tailscale up`; the caller does that."
@@ -104,4 +111,29 @@ Rules: do not modify the contents of any git repository. Do not read files under
 
 Your final message must end with a section titled `## Workarounds` listing every step that failed, was skipped, or needed a workaround, with what you did. If there were none, that section is the single line `no workarounds`."#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rehearsal prevents duplicate active instances; scratch must never
+    /// inherit a restore step. Enrollment is an independent opt-in.
+    #[test]
+    fn prompts_keep_restore_startup_and_enrollment_separate() {
+        let scratch = user_space_phase("user", &[], false, false, false);
+        assert!(!scratch.contains(HERMES_ARCHIVE_FILE));
+        assert!(!scratch.contains("hermes import"));
+        assert!(scratch.contains("Do not install or touch Tailscale"));
+        let restore = user_space_phase("user", &[], false, true, false);
+        assert!(restore.contains("hermes import"));
+        assert!(restore.contains("--start-now --start-on-login"));
+        assert!(restore.contains("Do not install or touch Tailscale"));
+        let rehearsal = user_space_phase("user", &[], true, true, false);
+        assert!(rehearsal.contains("--no-start-now --no-start-on-login"));
+        assert!(rehearsal.contains("Write the unit but do not enable or start it"));
+        let enrolled = user_space_phase("user", &[], false, false, true);
+        assert!(enrolled.contains("Install Tailscale with its official"));
+        assert!(!enrolled.contains(HERMES_ARCHIVE_FILE));
+    }
 }

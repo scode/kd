@@ -219,38 +219,50 @@ non-ImageMagick helpers still behave correctly. It does not prove that thumbnail
 
 ## kd devbox
 
-NOTE: This is a solo-developer convenience for treating one remote development box as disposable. The box can be
-anything that runs Ubuntu, can be reinstalled out of band, and comes back reachable over SSH with a public key you
-supplied (a hosted VM with a reinstall button is the typical case, but nothing depends on that). It is deliberately not
-a provisioning framework. The deterministic code is kept small on purpose, and mechanical work on the target is done by
-a Codex agent running on that target; see `SPEC_impl.md` for the division of labor. This section describes only what the
-user sees.
+NOTE: This is a solo-developer convenience for bootstrapping disposable environments and moving a stateful instance. The
+box can be anything that runs Ubuntu, can be reinstalled out of band, and comes back reachable over SSH with a public
+key you supplied (a hosted VM with a reinstall button is the typical case, but nothing depends on that). It is
+deliberately not a provisioning framework. The deterministic code is kept small on purpose, and mechanical work on the
+target is done by a Codex agent running on that target; see `SPEC_impl.md` for the division of labor. This section
+describes only what the user sees.
 
-`kd` never wipes anything. The reinstall happens by hand, however the box's provider does it, between `backup` and
-`bootstrap`.
+`kd` never wipes anything. Create or reinstall machines by hand. Hermes is currently the only migrated application
+state. Repositories are cloned from GitHub, not copied: local files, uncommitted changes, unpushed commits, Docker
+volumes, and other application state are not backed up. Agent credentials come from the controller.
+
+`suspend → backup → resume` returns the services to operation and leaves a new archive.
+`suspend → backup → bootstrap
+--restore NAME` moves the instance to an explicitly selected target, leaving the source
+suspended. Bootstrap never contacts or suspends the source, so the operator must keep it suspended to avoid two active
+copies.
 
 Terms used below:
 
 - The **controller** is the machine `kd devbox` runs on, in practice your laptop. It is the one machine that survives
   the reinstall, so it is where Hermes archives land, where the agent CLI credentials to copy onto the devbox come from,
   and where prompts are answered. It is never the box being rebuilt.
-- The **devbox** is the disposable box the profile describes. The **target** is whatever `bootstrap` is writing to: the
-  devbox itself, or a stand-in supplied with `--target` for a rehearsal.
+- An **instance** is the stateful application described by a named profile. Its current machine is the **source**. The
+  **target** is the explicit SSH destination bootstrap writes to. A target need not replace any existing machine. A
+  **rehearsal** is an explicit `--rehearsal` restore that leaves restored services disabled and stopped.
 
 ### Profiles
 
-- Every `kd devbox` subcommand requires `--profile <name>`, even when only one profile exists.
+- `backup`, `suspend`, and `resume` require `--profile <name>`, even when only one exists. Scratch bootstrap needs only
+  shared settings; `--restore NAME` selects a stateful profile when restoring.
 - Profiles live in `$XDG_CONFIG_HOME/kd/devboxes.toml`, falling back to `~/.config/kd/devboxes.toml`. The file holds
-  identity only and no secrets, so its permissions are not checked. One table per profile:
+  identity only and no secrets, so its permissions are not checked. Shared settings and optional named instances:
 
   ```toml
-  [devbox.NAME]
-  host = "203.0.113.5" # address the controller can ssh to before Tailscale exists
-  user = "scode" # the one real user on the box
-  hostname = "devbox" # OS hostname; Tailscale uses the same name
+  [bootstrap]
+  user = "scode" # default intended user on a target; source login default too
   public_key = "~/.ssh/id_ed25519.pub" # controller key to authorize on the box; ~ is expanded
-  backup_dir = "~/devbox-backups" # where Hermes archives land on the controller; ~ is expanded
   repos = ["scode/kd", "scode/voice"] # GitHub owner/name, each cloned to ~/git/<name>
+
+  [devbox.NAME]
+  host = "203.0.113.5" # current source for backup, suspend and resume
+  hostname = "devbox" # archive identity and default hostname when restoring
+  backup_dir = "~/devbox-backups" # controller archive directory; ~ is expanded
+  # user = "other" # optional source login override
   ```
 
 - Nothing privacy-sensitive (IPs, hostnames, usernames, key material) is compiled into `kd`; package and tool
@@ -258,87 +270,92 @@ Terms used below:
   be "fixed" into profile fields: the target timezone (`America/Los_Angeles`), and the two repos `scode/dotfiles` and
   `scode/voice`, which are always cloned whether or not `repos` lists them because the dotfiles installer is what
   configures the box. This tool has one user.
+- Move `user`, `public_key`, and `repos` from the old per-box format into `[bootstrap]`; remove per-box `public_key` and
+  `repos`. Unknown fields fail rather than silently changing their meaning. No local config is migrated automatically.
 
-### kd devbox backup --profile NAME [--keep-running] [--yes]
+### kd devbox backup --profile NAME [--yes]
 
-- Checks that the four agent auth sources (Codex, Claude, OpenCode, Muse) exist on the controller before touching the
-  devbox. A missing one fails the command before anything is stopped.
+- Checks the profile and creates its backup directory if needed. Agent credentials are not required.
 - Prints a read-only preflight from the devbox — running agent processes, tmux sessions, and which `~/git/*` repos are
   dirty or have unpushed work — then asks "ok to proceed?". `--yes` skips the question but still prints the report. That
   question is the whole attestation; nothing is enumerated or waived item by item.
-- Stops the Hermes gateway and dashboard, takes a full `hermes backup`, pulls the archive into the profile's backup
-  directory, checks that its SHA-256 matches the one computed on the devbox, sets it to mode `0600`, and deletes the
-  copy on the devbox. An incomplete archive is a failure, not a warning.
-- Leaves Hermes stopped on success so no state accumulates between the backup and the wipe. If the backup itself fails,
-  Hermes is restarted before exiting.
-- Prints the archive path, the source `hermes --version`, and a reinstall checklist for the user to carry out by hand
-  (newest Ubuntu LTS image, add the profile's public key, copy the new host-key fingerprint from the box's console).
-- `--keep-running` never stops or restarts Hermes: it takes the backup while Hermes is running, tolerates the
-  skipped-sockets warning that produces, and skips the reinstall checklist. This is how you get an archive to feed a
-  bootstrap rehearsal without disturbing the devbox. Writing and then removing the archive is the only change it makes.
+- Takes a full `hermes backup`, pulls the archive into the profile's backup directory, checks that its SHA-256 matches
+  the one computed on the devbox, sets it to mode `0600`, and deletes the copy on the devbox. An incomplete archive is a
+  failure, not a warning.
+- Never stops or starts services, including on failure. Suspend first for a consistent migration backup. A live backup
+  can fail if Hermes reports an incomplete archive (including skipped live sockets); suspend and retry rather than
+  treating that archive as a complete move. `--keep-running` is removed because state preservation is unconditional.
+- Prints the archive path and source `hermes --version`. It does not imply that the source is suspended or safe to wipe.
 - `kd` never deletes, rotates, or prunes archives on the controller.
+
+### kd devbox suspend --profile NAME
+
+- Stops the Hermes gateway and dashboard without taking a backup. Already-stopped services are acceptable, but a
+  surviving process or failure to verify suspension is an error. This suspends current operation; it does not disable
+  service startup after a reboot. Keep the source stopped and do not reboot it during a move.
 
 ### kd devbox resume --profile NAME
 
-- Starts the Hermes gateway and dashboard on the devbox again. This is the "never mind" after a `backup` that stopped
-  Hermes.
+- Starts the Hermes gateway and dashboard on the source again. This is the inverse of `suspend`, not a restore command
+  or a required step after successful bootstrap.
 
-### kd devbox bootstrap --profile NAME [--target USER@HOST] [--plain-ssh] [--no-hermes]
+### kd devbox bootstrap --target [USER@]HOST [--hostname NAME] [--restore PROFILE] [--rehearsal] [--plain-ssh] [--enroll-tailscale]
 
 - Starting state, which is the premise of the whole command: a minimal Ubuntu LTS install that is already up, has
-  outbound internet, and accepts an SSH connection from the controller using the profile's public key, either as `root`
-  or as the profile user with passwordless `sudo`. That is what a provider's reinstall or a freshly created ubiworker
-  leaves behind, and it is all bootstrap assumes. Bootstrap does not install the OS, does not create or power on the
-  machine, and does not need the profile user, hostname, packages, or anything else to exist yet. Everything from that
-  state to a working devbox is bootstrap's job.
-- Rebuilds that target from the profile: real user with passwordless sudo, full OS upgrade (rebooting if the upgrade
-  asks for it), timezone `America/Los_Angeles`, SSH hardening (key-only, no root, no passwords), default-deny inbound
-  firewall with SSH and the Tailscale interface allowed, unattended security updates without automatic reboot, the
-  development toolchain and CLIs, every repo in the profile manifest cloned as a colocated Jujutsu repo,
+  outbound internet, and accepts an SSH connection from the controller, either as `root` or as the intended user with
+  passwordless `sudo`. That is what a provider's reinstall or a freshly created ubiworker leaves behind, and it is all
+  bootstrap assumes. Bootstrap does not install the OS, does not create or power on the machine, and does not need the
+  intended user, hostname, packages, or anything else to exist yet. Everything from that state to a working devbox is
+  bootstrap's job.
+- Configures that target from shared settings: real user with passwordless sudo, full OS upgrade (rebooting if the
+  upgrade asks for it), timezone `America/Los_Angeles`, SSH hardening (key-only, no root, no passwords), default-deny
+  inbound firewall with SSH and the Tailscale interface allowed, unattended security updates without automatic reboot,
+  the development toolchain and CLIs, every repo in the shared manifest cloned as a colocated Jujutsu repo,
   `scode/dotfiles` installed via its own installer, passwordless key-based `ssh localhost`, the four agent CLIs
-  authenticated from the controller's caches, `gh` authenticated, Hermes restored from the newest archive in the backup
-  directory with its gateway and loopback-only dashboard service, and Tailscale enrolled as an untagged, non-ephemeral
-  node without Tailscale SSH.
-- Two modes, decided by one flag. Without `--target`, this is a **real run** against the profile `host`, which must be
-  an address that works before Tailscale exists (the provider's public IP, typically), because Tailscale is the last
-  thing bootstrap sets up. With `--target`, it is a **rehearsal** against that destination instead. If the target host
-  is a node in your tailnet it is reached over `tailscale ssh` (a ubiworker, typically); otherwise, or always with
-  `--plain-ssh`, it is reached with plain `ssh` and your own ssh config, so any box you can ssh to can be a rehearsal
-  target. On a rehearsal the profile's `user` is ignored: the `--target` user is the user for that run and must already
-  exist with passwordless `sudo`. A rehearsal skips Tailscale enrollment, and installs Hermes and its dashboard without
-  enabling or starting them, so a rehearsal never competes with the real devbox for bot tokens or scheduled jobs. A
-  rehearsal has no prompts at all; its GitHub token is the controller's own `gh auth token`.
-- A real run asks its questions before the agent phases start, in this order, and then runs unattended unless something
-  fails. First, on every real run, confirm the target's SSH host-key fingerprint against the one read from the box's
-  console. Second, on first contact, "a Hermes gateway is running on the target, continue anyway?" if one is. kd then
-  creates the user and installs Codex if needed, so it can ask the last two only when they apply: paste a new classic
-  GitHub token from a prefilled token-creation URL (scopes `repo`, `workflow`, `read:org`, `gist`, no expiry), skipped
-  when `gh` on the target is already authenticated; and an instruction to delete the stale Tailscale device for the same
-  hostname in the admin console now, then press Enter, since leaving it makes the new node `<hostname>-1`, skipped when
-  the target is already on the tailnet. The one thing that needs you after that is Tailscale enrollment at the very end:
-  it prints a login URL you open in a browser, and gives up after ten minutes if you don't.
-- The fingerprint you confirm is written to a temporary per-run known-hosts file on the controller. `kd` never edits
-  your own `~/.ssh/known_hosts`, so after a real run it prints a reminder to run `ssh-keygen -R <host>` yourself.
-- A running Hermes gateway on the target means a live devbox that was not reinstalled. A real run asks before
-  continuing, because a rerun after a previous attempt already restored Hermes is legitimate; a rehearsal refuses
-  outright, because its target should never have one. Directory existence is never a guard: every phase is idempotent,
-  so the recovery for any failure is "fix or ignore, then rerun the whole command". There is no partial resume.
+  authenticated from the controller's caches, and `gh` authenticated. From scratch no archive is required or placed, and
+  no Hermes components are installed or probed. `--hostname` is required from scratch; a restore defaults to the profile
+  hostname, with an explicit override allowed. Archive selection always uses the source profile hostname.
+- The target is required and never inferred from a source profile. A bare host uses `[bootstrap].user`; an explicit user
+  overrides it. `root` cannot be the intended user; bootstrap falls back to root to create a missing account. SSH
+  aliases and `ssh://USER@HOST:PORT` destinations are supported. Existing SSH authentication must work; the shared
+  public key is authorized during seeding, not forced as an SSH identity file.
+- A tailnet peer uses `tailscale ssh`; otherwise, or with `--plain-ssh`, use ordinary SSH. Scratch bootstrap and
+  rehearsals use the user's SSH configuration and host-key handling. A non-rehearsal restore over ordinary SSH asks for
+  console confirmation of the destination's SHA256/MD5 fingerprint and uses a temporary per-run known-hosts file, since
+  a replacement may reuse an address with an old key. SSH aliases and ports are resolved before scanning. Restore
+  destinations using a proxy must also be directly reachable by `ssh-keyscan`. The completion reminder names
+  `ssh-keygen -R`; the user handles any stale key in their own known-hosts file. Tailscale authenticates its own peers.
+- `--rehearsal` requires `--restore` and conflicts with `--enroll-tailscale`. Its target user must already exist with
+  passwordless sudo. Hermes and its dashboard are restored without enabling or starting them, so they cannot compete
+  with the source. It has no kd prompts; SSH may still require authentication or host-key acceptance.
+- If `gh` on the target is unauthenticated, a rehearsal copies the controller's `gh auth token`; other runs prompt for a
+  new classic token using the prefilled URL (scopes `repo`, `workflow`, `read:org`, `gist`). Authenticated reruns skip
+  token collection. The four agent credentials must exist locally before connecting.
+- `--enroll-tailscale` opts into installation, enrollment and its probe check. Existing enrollment is preserved. Before
+  the agent phases, an unenrolled target prompts to free the intended hostname if replacing a stale device. At the end
+  it prints the browser login URL and waits up to ten minutes. Enrollment is untagged, non-ephemeral and without
+  Tailscale SSH. Without the flag, bootstrap neither installs nor changes Tailscale enrollment.
+- A running Hermes gateway on the target means a live devbox that was not reinstalled. A non-rehearsal restore asks
+  before continuing, because a previous attempt may already have restored Hermes; a rehearsal or scratch bootstrap
+  refuses outright. Failure to check for a process is an error. Directory existence is never a guard: every phase is
+  idempotent, so the recovery for any failure is "fix or ignore, then rerun the whole command". There is no partial
+  resume.
 - The GitHub token and the agent auth files are placed on the target as mode `0600` files for the agent to consume; the
   token file is deleted once `gh` has it. They are never passed as arguments or logged.
-- Hermes is restored from the newest archive in the backup directory whose name carries this profile's hostname, so two
-  profiles can share a backup directory. A rerun re-imports that archive and discards whatever Hermes state the previous
-  attempt accumulated.
+- With `--restore`, Hermes is restored from the newest archive in the backup directory whose name carries this profile's
+  hostname, so two profiles can share a backup directory. A rerun re-imports that archive and discards whatever Hermes
+  state the previous attempt accumulated. Outside a rehearsal, its gateway and loopback-only dashboard are enabled and
+  started.
 - Ends with a probe report printed as is: hostname, timezone, `gh auth status`, repo count against the manifest,
-  `ssh localhost`, Hermes gateway state, Docker as the user, and one real request through each agent CLI. On a real run
-  it also checks dashboard reachability and Tailscale status. Probe failures are reported, never fatal: bootstrap exits
-  0 once the probe has run. After the probe, each agent phase's final message is printed whole, which is where the agent
-  lists anything it had to work around, even when the run succeeded.
+  `ssh localhost`, Docker as the user, and one real request through each agent CLI. Restores additionally check Hermes
+  gateway state and, outside rehearsals, dashboard reachability. Tailscale is checked only with `--enroll-tailscale`.
+  Probe failures are reported, never fatal: bootstrap exits 0 once the probe has run. After the probe, each agent
+  phase's final message is printed whole, which is where the agent lists anything it had to work around, even when the
+  run succeeded.
 - After a rehearsal the worker is left running for inspection with a reminder that it holds real credentials; `kd` does
   not destroy it.
 - Logging goes to stderr. There are no log files, receipts, or run records.
-- `--no-hermes` leaves Hermes out entirely: no archive is required or placed, nothing Hermes-related is installed, and
-  the probe has no Hermes checks. Everything else is the same. This is the shape of a plain bootstrap for a disposable
-  box that never ran Hermes; a fuller separation of that flow from the named-devbox flow is planned.
+- The old bootstrap `--profile` and `--no-hermes` flags are removed. Restore is explicitly opt-in with `--restore`.
 - If there is no terminal, the GitHub token is read as one plain line from stdin instead of the hidden prompt, so a
   scripted real run can pipe `y` for the fingerprint and then the token.
 - Not in scope: triggering the reinstall through a provider API, Hermes version pinning or same-version restore, archive

@@ -9,7 +9,7 @@ use clap::Subcommand;
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Disposable remote development box: backup, resume, bootstrap
+    /// Bootstrap development environments and manage stateful instances
     Devbox {
         #[command(subcommand)]
         cmd: devbox::Commands,

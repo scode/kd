@@ -1,25 +1,23 @@
-//! `kd devbox bootstrap`: rebuild a fresh box from a profile.
+//! `kd devbox bootstrap`: configure an explicit SSH destination.
 //!
 //! The sequence is SPEC_impl.md "Bootstrap sequence"; this file is that list
 //! in code, in order. The starting state is the premise of everything here:
-//! a minimal Ubuntu that is up, has internet, and accepts the profile's key
+//! a minimal Ubuntu that is up, has internet, and accepts SSH authentication
 //! as `root` or as the user with passwordless sudo. From there kd owns only
 //! what an agent cannot or must not do: the transport, the host-key decision,
 //! the guard, creating the user, installing Codex, placing secrets, the
 //! prompts, the reboot, and the probe. Two Codex runs on the box do the rest.
 //!
-//! Two modes, decided by `--target`. Without it, a real run against the
-//! profile host, with a fingerprint prompt and a per-run known-hosts file
-//! (the user's own `known_hosts` still holds the pre-reinstall key and is
-//! never edited). With it, a rehearsal: no prompts, the target's user is the
-//! user, Hermes is installed but never started, Tailscale is skipped.
+//! Shared settings describe the environment. Only `--restore` selects
+//! state to import; `--rehearsal` keeps that state's services stopped.
+//! Tailscale enrollment is independent and explicitly requested.
 //!
 //! Every step is idempotent and there is no partial resume: the recovery for
 //! any failure is "fix or ignore, then rerun the whole command".
 
 use super::{
-    BootstrapArgs, agent, confirm, home_dir, probe, prompts, secrets, transport::Transport,
-    wait_for_enter,
+    BootstrapArgs, agent, confirm, home_dir, probe, profile, prompts, secrets,
+    transport::Transport, wait_for_enter,
 };
 use anyhow::{Context, bail};
 use std::io::BufRead;
@@ -30,8 +28,8 @@ use tracing::{info, warn};
 
 /// What a run knows after the up-front phase.
 struct Run {
-    /// Transport to the box as the user. On a real run this is built after
-    /// the fingerprint prompt and carries the per-run known-hosts file.
+    /// Transport as the intended user. Plain-SSH restores carry a temporary
+    /// host-key pin; other runs retain the transport's normal verification.
     t: Transport,
     /// The unix user everything after seeding runs as.
     user: String,
@@ -39,74 +37,84 @@ struct Run {
     _known_hosts: Option<tempfile::NamedTempFile>,
 }
 
+/// Configure the destination in two agent phases. Resolve any restore
+/// archive locally first; the source machine is never contacted by this run.
 pub fn run(args: BootstrapArgs) -> anyhow::Result<()> {
     let home = home_dir()?;
-    let profile = args.profile.load()?;
-    let rehearsal = args.target.is_some();
+    let config = profile::load_config(&profile::config_path(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        &home,
+    ))?;
+    let plan = BootstrapPlan::resolve(&args, &config, &home)?;
+    let rehearsal = args.rehearsal;
 
     // 1. Controller preflight: cheap, no connections, before any prompt.
     let sources = secrets::resolve_all(&home)?;
     info!("{}", secrets::describe(&sources));
-    let public_key = std::fs::read_to_string(&profile.public_key)
-        .with_context(|| format!("cannot read public key {}", profile.public_key.display()))?;
-    let hermes = !args.no_hermes;
-    let archive = if hermes {
-        let archive = newest_archive(&profile.backup_dir, &profile.hostname)?;
+    let public_key_path = profile::expand_tilde(&config.bootstrap.public_key, &home);
+    let public_key = std::fs::read_to_string(&public_key_path)
+        .with_context(|| format!("cannot read public key {}", public_key_path.display()))?;
+    let hermes = plan.archive.is_some();
+    let archive = &plan.archive;
+    if let Some(archive) = archive {
         info!("archive to restore: {}", archive.display());
-        Some(archive)
+    }
+
+    // 2. Select transport independently from restore and enrollment.
+    let mut user_t = target_transport(&plan.destination, args.plain_ssh);
+    let mut root_t = target_transport(&plan.root_destination, args.plain_ssh);
+    // A restore may reuse an address with a stale key. Keep that key pin
+    // isolated from the user's known_hosts; ordinary targets use SSH config.
+    let known_hosts = if hermes
+        && !rehearsal
+        && matches!(user_t.backing, super::transport::Backing::Ssh { .. })
+    {
+        let file = confirm_fingerprint(&plan.destination)?;
+        user_t = user_t.with_known_hosts_file(file.path());
+        root_t = root_t.with_known_hosts_file(file.path());
+        Some(file)
     } else {
-        info!("--no-hermes: no archive, Hermes will not be installed");
         None
     };
-
-    // 2. Real run only: fingerprint prompt, then the per-run known-hosts file.
-    let (mut run, seed_transport) = match &args.target {
-        Some(target) => {
-            let t = target_transport(target, args.plain_ssh);
-            let user = target_user(target);
-            info!("rehearsal against {target} as {user} via {}", describe(&t));
-            let run = Run {
-                t: t.clone(),
-                user,
-                _known_hosts: None,
-            };
-            (run, t)
+    info!(
+        "bootstrap against {} as {} via {}",
+        plan.destination,
+        plan.user,
+        describe(&user_t)
+    );
+    // 3. Connect as the user; fall back to root for seeding.
+    let seed_t = if user_t.capture("true")?.success() {
+        info!("connected to {}", plan.destination);
+        user_t.clone()
+    } else {
+        if rehearsal {
+            bail!(
+                "rehearsal requires an existing login with passwordless sudo on {}",
+                plan.destination
+            );
         }
-        None => {
-            let known_hosts = confirm_fingerprint(&profile.host)?;
-            let user_t = Transport::ssh(format!("{}@{}", profile.user, profile.host))
-                .with_known_hosts_file(known_hosts.path());
-            let root_t = Transport::ssh(format!("root@{}", profile.host))
-                .with_known_hosts_file(known_hosts.path());
-            // 3. Connect as the user; fall back to root for seeding.
-            let seed_t = if user_t.capture("true")?.success() {
-                info!("connected to {} as {}", profile.host, profile.user);
-                user_t.clone()
-            } else {
-                info!(
-                    "no login as {} yet; seeding as root on {}",
-                    profile.user, profile.host
-                );
-                if !root_t.capture("true")?.success() {
-                    bail!(
-                        "cannot connect to {} as {} or root with the profile key",
-                        profile.host,
-                        profile.user
-                    );
-                }
-                root_t
-            };
-            let run = Run {
-                t: user_t,
-                user: profile.user.clone(),
-                _known_hosts: Some(known_hosts),
-            };
-            (run, seed_t)
+        info!(
+            "no login as {} yet; seeding as root on {}",
+            plan.user, plan.destination
+        );
+        if !root_t.capture("true")?.success() {
+            bail!(
+                "cannot connect to {} as {} or root using SSH authentication",
+                plan.destination,
+                plan.user
+            );
         }
+        root_t
     };
+    let run = Run {
+        t: user_t,
+        user: plan.user.clone(),
+        _known_hosts: known_hosts,
+    };
+    let (mut run, seed_transport) = (run, seed_t);
 
     // 3. Guard, over the first connection.
-    guard(&seed_transport, rehearsal)?;
+    guard(&seed_transport, rehearsal || !hermes)?;
 
     // 4. Seed: the user, the key, sudo, a proven second connection, Codex.
     seed(&seed_transport, &run.t, &run.user, &public_key, rehearsal)?;
@@ -118,15 +126,15 @@ pub fn run(args: BootstrapArgs) -> anyhow::Result<()> {
 
     // 5. Token and Tailscale decisions, now that the box is reachable.
     let github_token = github_token(&run.t, rehearsal)?;
-    if !rehearsal {
-        tailscale_device_prompt(&run.t, &profile.hostname)?;
+    if args.enroll_tailscale {
+        tailscale_device_prompt(&run.t, &plan.hostname)?;
     }
 
     // 6. System phase, then the reboot if the upgrade asked for one.
     let system_report = agent::run_phase(
         &run.t,
         "system",
-        &prompts::system_phase(&profile.hostname, &run.user),
+        &prompts::system_phase(&plan.hostname, &run.user),
     )?;
     reboot_if_required(&mut run)?;
 
@@ -142,20 +150,32 @@ pub fn run(args: BootstrapArgs) -> anyhow::Result<()> {
     let user_report = agent::run_phase(
         &run.t,
         "user-space",
-        &prompts::user_space_phase(&run.user, &profile.repos, rehearsal, hermes),
+        &prompts::user_space_phase(
+            &run.user,
+            &config.bootstrap.repos,
+            rehearsal,
+            hermes,
+            args.enroll_tailscale,
+        ),
     )?;
 
-    // 9. Tailscale, real run only. The agent installed it; kd enrolls,
+    // 9. Tailscale, only when requested. The agent installed it; kd enrolls,
     // because the login URL has to reach this terminal.
-    if !rehearsal {
+    if args.enroll_tailscale {
         tailscale_up(&run.t)?;
     }
 
     // 10. Probe, then the agents' own reports. Exit 0 regardless.
-    let expected_repos = expected_repo_count(&profile.repos);
+    let expected_repos = expected_repo_count(&config.bootstrap.repos);
     let report = probe::run(
         &run.t,
-        &probe::script(&profile.hostname, expected_repos, rehearsal, hermes),
+        &probe::script(
+            &plan.hostname,
+            expected_repos,
+            rehearsal,
+            hermes,
+            args.enroll_tailscale,
+        ),
     )?;
     println!("\n== probe on {}\n{}", run.t.destination, report.trim_end());
     println!("\n== system phase report\n{}", system_report.trim_end());
@@ -164,13 +184,80 @@ pub fn run(args: BootstrapArgs) -> anyhow::Result<()> {
         println!(
             "\nrehearsal done. The target holds real credentials; destroy it when you are finished."
         );
-    } else {
+    } else if run._known_hosts.is_some() {
         println!(
-            "\nbootstrap done. Your own ~/.ssh/known_hosts still has the old key for {}: run `ssh-keygen -R {}` before your next login.",
-            profile.host, profile.host
+            "\nbootstrap done. If your own ~/.ssh/known_hosts has a stale key for {}, remove that entry with `ssh-keygen -R {}` (use [host]:port for a non-default port).",
+            target_host(&plan.destination),
+            target_host(&plan.destination)
         );
+    } else {
+        println!("\nbootstrap done. The target holds real credentials.");
     }
     Ok(())
+}
+
+/// Resolve identity and archive selection before credentials or SSH are
+/// touched. A scratch run never resolves a profile or reads a backup dir.
+struct BootstrapPlan {
+    destination: String,
+    root_destination: String,
+    user: String,
+    hostname: String,
+    archive: Option<PathBuf>,
+}
+
+impl BootstrapPlan {
+    /// Keep source archive identity separate from target identity. The
+    /// shared login default applies even when a source uses another user.
+    fn resolve(
+        args: &BootstrapArgs,
+        config: &profile::Profiles,
+        home: &Path,
+    ) -> anyhow::Result<Self> {
+        let restore = args
+            .restore
+            .as_deref()
+            .map(|name| config.resolve(name, home))
+            .transpose()?;
+        let hostname = args
+            .hostname
+            .as_deref()
+            .or_else(|| restore.as_ref().map(|p| p.hostname.as_str()))
+            .context("--hostname is required without --restore")?
+            .to_owned();
+        profile::validate_token("bootstrap", "hostname", &hostname)?;
+        let target = args.target.strip_prefix("ssh://").unwrap_or(&args.target);
+        let (user, host) = target
+            .rsplit_once('@')
+            .unwrap_or((&config.bootstrap.user, target));
+        profile::validate_token("bootstrap", "user", user)?;
+        if user == "root" {
+            bail!("target user must be a non-root account; root is used automatically for seeding");
+        }
+        if host.is_empty()
+            || host.starts_with('-')
+            || host.chars().any(char::is_whitespace)
+            || host.contains('@')
+        {
+            bail!("invalid SSH target");
+        }
+        let prefix = if args.target.starts_with("ssh://") {
+            "ssh://"
+        } else {
+            ""
+        };
+        let archive = restore
+            .as_ref()
+            .map(|p| newest_archive(&p.backup_dir, &p.hostname))
+            .transpose()?;
+        Ok(Self {
+            destination: format!("{prefix}{user}@{host}"),
+            root_destination: format!("{prefix}root@{host}"),
+            user: user.to_owned(),
+            hostname,
+            archive,
+        })
+    }
 }
 
 /// Everything secret except Codex's own login (placed during seeding) goes
@@ -257,7 +344,11 @@ fn newest_archive(backup_dir: &Path, hostname: &str) -> anyhow::Result<PathBuf> 
         if !(name.starts_with(&prefix) && name.ends_with(".zip")) {
             continue;
         }
-        let mtime = entry.metadata()?.modified()?;
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let mtime = metadata.modified()?;
         if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
             best = Some((mtime, entry.path()));
         }
@@ -295,17 +386,7 @@ fn target_host(target: &str) -> &str {
     rest.split_once(':').map_or(rest, |(h, _)| h)
 }
 
-/// The login name in a `--target`, or the controller's own username when
-/// the target names only a host (ssh's default). Used for messages and for
-/// the seed script's idea of "the user".
-fn target_user(target: &str) -> String {
-    let rest = target.strip_prefix("ssh://").unwrap_or(target);
-    match rest.rsplit_once('@') {
-        Some((u, _)) => u.to_owned(),
-        None => std::env::var("USER").unwrap_or_else(|_| "unknown".to_owned()),
-    }
-}
-
+/// Discover tailnet names without requiring a running local client.
 fn is_tailnet_peer(host: &str) -> bool {
     let Ok(output) = Command::new("tailscale")
         .args(["status", "--json"])
@@ -348,11 +429,22 @@ fn peer_names(status_json: &str) -> Vec<String> {
 
 /// Scan the host's Ed25519 key, show its fingerprint in both forms, and ask.
 /// Returns the per-run known-hosts file holding exactly that key. Asked on
-/// every real run; there is nothing to "already satisfy".
-fn confirm_fingerprint(host: &str) -> anyhow::Result<tempfile::NamedTempFile> {
+/// every non-rehearsal plain-SSH restore; normal targets use SSH's own
+/// verification and tailnet peers use Tailscale's identity.
+fn confirm_fingerprint(destination: &str) -> anyhow::Result<tempfile::NamedTempFile> {
+    // ssh -G resolves aliases, URI ports and configured HostName without
+    // connecting. Scan the same endpoint SSH will actually use.
+    let config = Command::new("ssh").args(["-G", destination]).output()?;
+    if !config.status.success() {
+        bail!("cannot resolve SSH configuration for {destination}");
+    }
+    let config = String::from_utf8_lossy(&config.stdout);
+    let value = |key: &str| config.lines().find_map(|line| line.strip_prefix(key));
+    let host = value("hostname ").context("ssh -G returned no hostname")?;
+    let port = value("port ").context("ssh -G returned no port")?;
     info!("scanning host key of {host}");
     let scan = Command::new("ssh-keyscan")
-        .args(["-t", "ed25519", host])
+        .args(["-t", "ed25519", "-p", port, host])
         .output()
         .context("failed to run ssh-keyscan")?;
     let line = String::from_utf8_lossy(&scan.stdout)
@@ -389,14 +481,21 @@ fn confirm_fingerprint(host: &str) -> anyhow::Result<tempfile::NamedTempFile> {
 
 /// A running Hermes gateway means a live devbox that was not reinstalled.
 /// Running, not enabled, and no directory checks: reruns must work.
-fn guard(t: &Transport, rehearsal: bool) -> anyhow::Result<()> {
+fn guard(t: &Transport, refuse_live: bool) -> anyhow::Result<()> {
     let out = t.capture("pgrep -f '[h]ermes.*gateway' >/dev/null")?;
-    if !out.success() {
+    if out.status == 1 {
         return Ok(());
     }
-    if rehearsal {
+    if !out.success() {
         bail!(
-            "a Hermes gateway is running on {}; a rehearsal target must never have one",
+            "cannot check for a live Hermes gateway on {} (exit {})",
+            t.destination,
+            out.status
+        );
+    }
+    if refuse_live {
+        bail!(
+            "a Hermes gateway is running on {}; scratch bootstrap and restore rehearsals refuse a live instance",
             t.destination
         );
     }
@@ -442,7 +541,7 @@ fn seed(
     Ok(())
 }
 
-/// Runs as root or as a sudoer; `__USER__` is the profile user. The key is
+/// Runs as root or as a sudoer; `__USER__` is the intended user. The key is
 /// read from stdin once and appended only if absent.
 const SEED_SCRIPT: &str = r#"
 set -eu
@@ -465,7 +564,7 @@ $S chmod 0440 "/etc/sudoers.d/90-kd-$u"
 $S visudo -cf "/etc/sudoers.d/90-kd-$u" >/dev/null
 "#;
 
-/// Rehearsal seed: the login exists; make sure the profile key is authorized
+/// Rehearsal seed: the login exists; make sure the shared key is authorized
 /// too and that sudo is passwordless.
 const REHEARSAL_SEED_SCRIPT: &str = r#"
 set -eu
@@ -572,8 +671,8 @@ fn tailscale_device_prompt(t: &Transport, hostname: &str) -> anyhow::Result<()> 
         return Ok(());
     }
     wait_for_enter(&format!(
-        "delete the old device named `{hostname}` in the Tailscale admin console now, \
-         otherwise the new node will be named `{hostname}-1`. Press Enter when done."
+        "if replacing an old Tailscale device named `{hostname}`, delete that stale device in the admin console. \
+         For a new machine, ensure `{hostname}` is unused. Press Enter when ready."
     ))
 }
 
@@ -613,6 +712,114 @@ fn reboot_if_required(run: &mut Run) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    /// Exercise the actual clap contract without invoking any commands.
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        args: BootstrapArgs,
+    }
+
+    /// A shared environment needs no stateful profile or backup directory.
+    /// The explicit target user wins over the shared default, including URIs.
+    #[test]
+    fn scratch_bootstrap_is_independent_of_profiles() {
+        let config =
+            profile::parse("[bootstrap]\nuser='scode'\npublic_key='~/key.pub'\nrepos=[]").unwrap();
+        for (target, user, destination) in [
+            ("worker", "scode", "scode@worker"),
+            ("alice@worker", "alice", "alice@worker"),
+            (
+                "ssh://alice@localhost:2299",
+                "alice",
+                "ssh://alice@localhost:2299",
+            ),
+        ] {
+            let cli =
+                Cli::try_parse_from(["bootstrap", "--target", target, "--hostname", "worker"])
+                    .unwrap();
+            let plan = BootstrapPlan::resolve(&cli.args, &config, Path::new("/missing")).unwrap();
+            assert_eq!(plan.user, user);
+            assert_eq!(plan.destination, destination);
+            assert!(plan.archive.is_none());
+        }
+    }
+
+    /// Restoring to another hostname must still select the source profile's
+    /// archive. A missing archive is a local failure, before SSH or auth.
+    #[test]
+    fn restore_uses_source_archive_and_optional_destination_hostname() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = profile::parse("[bootstrap]\nuser='scode'\npublic_key='~/key.pub'\nrepos=[]\n[devbox.source]\nhost='old-host'\nhostname='old-name'\nbackup_dir='~'").unwrap();
+        let cli = Cli::try_parse_from(["bootstrap", "--target", "new-host", "--restore", "source"])
+            .unwrap();
+        assert!(BootstrapPlan::resolve(&cli.args, &config, dir.path()).is_err());
+        let archive = dir.path().join("hermes-old-name-20260906.zip");
+        std::fs::write(&archive, b"archive").unwrap();
+        std::fs::write(
+            dir.path().join("hermes-other-20260907.zip"),
+            b"wrong instance",
+        )
+        .unwrap();
+        let plan = BootstrapPlan::resolve(&cli.args, &config, dir.path()).unwrap();
+        assert_eq!(plan.hostname, "old-name");
+        assert_eq!(plan.archive.as_ref(), Some(&archive));
+        let mut args = cli.args;
+        args.hostname = Some("new-name".into());
+        let plan = BootstrapPlan::resolve(&args, &config, dir.path()).unwrap();
+        assert_eq!(plan.hostname, "new-name");
+        assert_eq!(plan.archive, Some(archive));
+    }
+
+    /// Invalid mode combinations must fail before credentials or a target
+    /// can be touched. Old implicit-restore flags are intentionally removed.
+    #[test]
+    fn cli_requires_explicit_destination_and_safe_modes() {
+        for argv in [
+            vec!["bootstrap", "--hostname", "worker"],
+            vec!["bootstrap", "--target", "worker"],
+            vec![
+                "bootstrap",
+                "--target",
+                "worker",
+                "--hostname",
+                "worker",
+                "--rehearsal",
+            ],
+            vec![
+                "bootstrap",
+                "--target",
+                "worker",
+                "--restore",
+                "source",
+                "--rehearsal",
+                "--enroll-tailscale",
+            ],
+            vec!["bootstrap", "--target", "worker", "--profile", "source"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err());
+        }
+        let config =
+            profile::parse("[bootstrap]\nuser='scode'\npublic_key='key'\nrepos=[]").unwrap();
+        for target in [
+            "root@worker",
+            "bad user@worker",
+            "scode@",
+            "-option",
+            "worker\nother",
+        ] {
+            let args = BootstrapArgs {
+                target: target.into(),
+                restore: None,
+                hostname: Some("worker".into()),
+                plain_ssh: false,
+                rehearsal: false,
+                enroll_tailscale: false,
+            };
+            assert!(BootstrapPlan::resolve(&args, &config, Path::new("/missing")).is_err());
+        }
+    }
 
     /// A peer answers to its HostName, its full MagicDNS name, and the short
     /// first label; the trailing dot Tailscale prints must not leak in.
@@ -627,12 +834,10 @@ mod tests {
     }
 
     #[test]
-    fn target_host_and_user_parse_the_ssh_forms() {
+    fn target_host_parses_the_ssh_forms() {
         assert_eq!(target_host("scode@worker"), "worker");
         assert_eq!(target_host("worker"), "worker");
         assert_eq!(target_host("ssh://tl-user@localhost:2299"), "localhost");
-        assert_eq!(target_user("scode@worker"), "scode");
-        assert_eq!(target_user("ssh://tl-user@localhost:2299"), "tl-user");
     }
 
     /// The seed script's only template slot is the username; the profile

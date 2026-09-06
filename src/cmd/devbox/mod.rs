@@ -1,12 +1,11 @@
-//! `kd devbox`: treat one remote development box as disposable.
+//! `kd devbox`: bootstrap environments and move a stateful instance.
 //!
-//! Three subcommands, specified in SPEC.md (`## kd devbox`) and SPEC_impl.md:
+//! Commands specified in SPEC.md (`## kd devbox`) and SPEC_impl.md:
 //!
-//! - `backup`: read-only preflight on the devbox, then a Hermes backup pulled
-//!   to the controller. Leaves Hermes stopped unless `--keep-running`.
-//! - `resume`: start Hermes again; the "never mind" after a backup.
-//! - `bootstrap`: rebuild a fresh box from a profile, with a Codex agent on
-//!   the box doing the mechanical work in two phases.
+//! - `backup`: pull a Hermes archive without changing service state.
+//! - `suspend` / `resume`: stop / start the stateful instance's services.
+//! - `bootstrap`: configure an explicit SSH target from shared settings,
+//!   optionally restoring a named instance's backup.
 //!
 //! `kd` itself never wipes anything; the reinstall happens by hand between
 //! `backup` and `bootstrap`. The governing constraint is size: Rust owns
@@ -33,9 +32,7 @@ use std::path::PathBuf;
 
 use profile::ResolvedProfile;
 
-/// `--profile NAME`, required on every subcommand even when only one profile
-/// exists: these commands are not something to run against the wrong box
-/// by inference.
+/// Stateful operations always name their source instance explicitly.
 #[derive(Args, Debug, Clone)]
 pub struct ProfileArg {
     /// Profile name from devboxes.toml
@@ -97,9 +94,6 @@ pub fn wait_for_enter(instruction: &str) -> anyhow::Result<()> {
 pub struct BackupArgs {
     #[command(flatten)]
     pub profile: ProfileArg,
-    /// Take the backup while Hermes keeps running; never stop or restart it
-    #[arg(long)]
-    pub keep_running: bool,
     /// Skip the "ok to proceed?" question (the preflight report is still printed)
     #[arg(long)]
     pub yes: bool,
@@ -113,26 +107,35 @@ pub struct ResumeArgs {
 
 #[derive(Args, Debug, Clone)]
 pub struct BootstrapArgs {
-    #[command(flatten)]
-    pub profile: ProfileArg,
-    /// Rehearse against this ssh destination instead of the profile host
+    /// SSH destination; a bare host uses the shared bootstrap user
     #[arg(long, value_name = "USER@HOST")]
-    pub target: Option<String>,
-    /// Reach --target with plain ssh even if it is a tailnet peer
-    #[arg(long, requires = "target")]
-    pub plain_ssh: bool,
-    /// Skip Hermes entirely: no archive needed, nothing imported, no units
+    pub target: String,
+    /// Restore the newest backup of this named instance (currently Hermes)
+    #[arg(long, value_name = "PROFILE")]
+    pub restore: Option<String>,
+    /// OS hostname; required from scratch, otherwise taken from the restore profile
+    #[arg(long, required_unless_present = "restore")]
+    pub hostname: Option<String>,
+    /// Reach the target with plain ssh even if it is a tailnet peer
     #[arg(long)]
-    pub no_hermes: bool,
+    pub plain_ssh: bool,
+    /// Restore for inspection without enabling or starting restored services
+    #[arg(long, requires = "restore", conflicts_with = "enroll_tailscale")]
+    pub rehearsal: bool,
+    /// Install and enroll Tailscale if the target is not already enrolled
+    #[arg(long)]
+    pub enroll_tailscale: bool,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Back up the devbox's Hermes state to the controller
     Backup(BackupArgs),
-    /// Start Hermes on the devbox again after a backup
+    /// Stop Hermes on the named instance before a consistent backup or move
+    Suspend(ResumeArgs),
+    /// Start Hermes on the named instance again after suspend
     Resume(ResumeArgs),
-    /// Rebuild a fresh box from a profile
+    /// Bootstrap an SSH target, optionally restoring a named instance's backup
     Bootstrap(BootstrapArgs),
 }
 
@@ -140,6 +143,7 @@ impl Commands {
     pub fn run(self) -> anyhow::Result<()> {
         match self {
             Commands::Backup(args) => backup::run(args),
+            Commands::Suspend(args) => resume::suspend(args),
             Commands::Resume(args) => resume::run(args),
             Commands::Bootstrap(args) => bootstrap::run(args),
         }
