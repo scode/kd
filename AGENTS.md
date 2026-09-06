@@ -1,5 +1,8 @@
 # AGENTS.md
 
+This project is either public now, or may become public in the future. No content in this project should contain
+personal information such as personal usernames, hostnames, details about the local environments, etc.
+
 Requires ImageMagick (`magick` command) at runtime for image operations.
 
 ## Before finishing work
