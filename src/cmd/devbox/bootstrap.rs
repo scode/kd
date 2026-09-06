@@ -16,7 +16,7 @@
 //! any failure is "fix or ignore, then rerun the whole command".
 
 use super::{
-    BootstrapArgs, agent, confirm, home_dir, probe, profile, prompts, secrets,
+    BootstrapArgs, agent, claude, confirm, home_dir, probe, profile, prompts, secrets,
     transport::Transport, wait_for_enter,
 };
 use anyhow::{Context, bail};
@@ -136,6 +136,10 @@ pub fn run(args: BootstrapArgs) -> anyhow::Result<()> {
             args.enroll_tailscale,
         ),
     )?;
+
+    // A successful headless request does not complete Claude's interactive
+    // first-run gate. Repair only that gate after the installer has finished.
+    claude::complete_onboarding(&run.t)?;
 
     // 9. Tailscale, only when requested. The agent installed it; kd enrolls,
     // because the login URL has to reach this terminal.

@@ -24,7 +24,8 @@ Use the stable Rust toolchain with rustfmt and clippy available. CI refreshes it
 CI installs Ubuntu's `imagemagick` package and links `/usr/bin/convert` to `/usr/local/bin/magick`. On a machine with
 ImageMagick 7, the native `magick` command already satisfies that requirement; do not replace it. Without ImageMagick,
 the image tests may skip themselves, which does not reproduce CI's coverage. `shellcheck` and `dprint` must also be
-installed; CI runs the latter through `dprint/check@v2.3`.
+installed; CI runs the latter through `dprint/check@v2.3`. The Claude onboarding script tests require bash and jq; CI
+installs jq alongside ImageMagick.
 
 The separate PR Base workflow checks the GitHub event's base branch rather than local files, so it has no local check
 command. It currently rejects PRs based on anything other than `main`, including stacked PRs.

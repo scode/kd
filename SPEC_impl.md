@@ -179,6 +179,17 @@ on the target fails, on real runs and rehearsals alike, and the agent consumes i
 `gh auth login --with-token < file && rm file`, so a rerun that skips the login never leaves a token file behind. The
 token touches disk on the target briefly; it never appears in argv or logs anywhere.
 
+After the user-space phase, a deterministic shell step checks `claude auth status` for `loggedIn: true`, then merges
+only `hasCompletedOnboarding: true` into the target's `~/.claude.json`. Claude 2.1.263 gates interactive onboarding on
+that flag independently of OAuth state: a successful `claude -p` request does not prove interactive readiness. This
+belongs beside credential orchestration rather than in the agent prompt because the agent's headless checks missed the
+gate on a real bootstrap. The probe also checks the flag so request success cannot stand in for first-run state. Do not
+copy the controller's global config: it carries preferences and project trust decisions unrelated to this host. An
+already-complete config is left byte-for-byte unchanged. Missing config starts as an empty object; invalid JSON,
+non-object JSON and symlinks fail. An update uses a mode-0600 temporary file in the same directory and renames it over
+the config. This prevents partial writes, not concurrent updates by Claude; interactive sessions must be closed during
+bootstrap. The script's regression tests execute real bash and jq with an isolated home and a stub Claude CLI.
+
 ### Paths and names
 
 On the target, all under the user's home:
