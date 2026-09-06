@@ -150,8 +150,11 @@ passwordless sudo to perform setup.
 The controller must have credentials for Codex, Claude, OpenCode and Muse. Bootstrap copies them to the target, uses two
 remote Codex runs for setup, and prints a probe report plus each phase's workarounds. Probe failures do not change the
 command's exit status; inspect the report before relying on the box. Destroy disposable targets yourself when done.
-`backup --yes` skips its confirmation, not the preflight report. See [SPEC.md](SPEC.md#kd-devbox) for prompts, restore
-semantics, and migrating the old per-box configuration format.
+
+Keep interactive Claude sessions closed during bootstrap. After installing Claude and verifying its copied login, kd
+completes its first-run onboarding state so opening `claude` does not ask you to log in again. Existing settings and
+project trust decisions are preserved. `backup --yes` skips its confirmation, not the preflight report. See
+[SPEC.md](SPEC.md#kd-devbox) for prompts, restore semantics, and migrating the old per-box configuration format.
 
 ## Command Notes
 

@@ -344,16 +344,21 @@ Terms used below:
   resume.
 - The GitHub token and the agent auth files are placed on the target as mode `0600` files for the agent to consume; the
   token file is deleted once `gh` has it. They are never passed as arguments or logged.
+- After installing Claude, bootstrap verifies its login and marks first-run onboarding complete on the target. Copied
+  credentials alone do not prevent interactive startup from asking for login again. Existing settings and project trust
+  decisions are preserved; the controller's global Claude settings are not copied. Malformed or symlinked target
+  configuration is refused rather than overwritten. Keep interactive Claude sessions closed during bootstrap so they
+  cannot race the configuration update. Authentication or configuration errors in this step fail bootstrap.
 - With `--restore`, Hermes is restored from the newest archive in the backup directory whose name carries this profile's
   hostname, so two profiles can share a backup directory. A rerun re-imports that archive and discards whatever Hermes
   state the previous attempt accumulated. Outside a rehearsal, its gateway and loopback-only dashboard are enabled and
   started.
 - Ends with a probe report printed as is: hostname, timezone, `gh auth status`, repo count against the manifest,
-  `ssh localhost`, Docker as the user, and one real request through each agent CLI. Restores additionally check Hermes
-  gateway state and, outside rehearsals, dashboard reachability. Tailscale is checked only with `--enroll-tailscale`.
-  Probe failures are reported, never fatal: bootstrap exits 0 once the probe has run. After the probe, each agent
-  phase's final message is printed whole, which is where the agent lists anything it had to work around, even when the
-  run succeeded.
+  `ssh localhost`, Docker as the user, Claude's onboarding flag, and one real request through each agent CLI. Restores
+  additionally check Hermes gateway state and, outside rehearsals, dashboard reachability. Tailscale is checked only
+  with `--enroll-tailscale`. Probe failures are reported, never fatal: bootstrap exits 0 once the probe has run. After
+  the probe, each agent phase's final message is printed whole, which is where the agent lists anything it had to work
+  around, even when the run succeeded.
 - After a rehearsal the worker is left running for inspection with a reminder that it holds real credentials; `kd` does
   not destroy it.
 - Logging goes to stderr. There are no log files, receipts, or run records.

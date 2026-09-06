@@ -71,6 +71,10 @@ pub fn script(
         "codex exec --skip-git-repo-check 'reply ok' >/dev/null 2>&1",
     );
     check("claude request", "claude -p ok >/dev/null 2>&1");
+    check(
+        "claude onboarding",
+        "jq -e '.hasCompletedOnboarding == true' \"$HOME/.claude.json\" >/dev/null",
+    );
     check("opencode request", "opencode run ok >/dev/null 2>&1");
     check("muse request", "muse exec ok >/dev/null 2>&1");
     s

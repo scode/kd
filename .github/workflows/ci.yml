@@ -23,7 +23,7 @@ jobs:
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-test-
       - run: rustup update stable && rustup default stable
-      - run: sudo apt-get update && sudo apt-get install -y imagemagick
+      - run: sudo apt-get update && sudo apt-get install -y imagemagick jq
       - run: sudo ln -s /usr/bin/convert /usr/local/bin/magick
       - run: cargo test
 
