@@ -1,5 +1,6 @@
 //! Top-level command dispatch. Each submodule owns a domain of functionality.
 
+pub mod devbox;
 pub mod gh;
 pub mod ubiworker;
 pub mod yt;
@@ -8,6 +9,11 @@ use clap::Subcommand;
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Disposable remote development box: backup, resume, bootstrap
+    Devbox {
+        #[command(subcommand)]
+        cmd: devbox::Commands,
+    },
     /// GitHub related commands
     Gh {
         #[command(subcommand)]
@@ -28,6 +34,7 @@ pub enum Commands {
 impl Commands {
     pub fn run(self) -> anyhow::Result<()> {
         match self {
+            Commands::Devbox { cmd } => cmd.run(),
             Commands::Gh { cmd } => cmd.run(),
             Commands::Ubiworker { cmd } => cmd.run(),
             Commands::Yt { cmd } => cmd.run(),
