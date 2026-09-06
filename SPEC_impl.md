@@ -58,12 +58,13 @@ auth file. Both prompts run as the user and use `sudo` for system changes. Agent
 terminal as it happens.
 
 Each prompt states the goal, where the agent may write (its own home, and system paths only through `sudo` for the items
-listed), the package-source preference (apt for slow-moving system tools, Cargo for Rust tools, Homebrew for fast-moving
-CLIs, an upstream installer where that is the supported path, npm only when nothing else is supported), that the agent
-must not modify repository contents, and that its final message must end with a section listing every step that failed
-and how it was worked around, or "no workarounds" if none. After each run kd reads `~/.kd-agent-last-message.md` back
-and keeps it to print whole after the probe; there is no section parsing. Nonzero exit is phase failure: kd prints that
-file if it exists, then the error, and stops.
+listed), the package-source preference (apt for slow-moving system tools; Homebrew for any CLI with a Linux bottle, Rust
+tools included; `cargo install` for Rust tools without a bottle or marked cargo; an upstream installer where that is the
+supported path; npm only when nothing else is supported), that the agent must not modify repository contents, and that
+its final message must end with a section listing every step that failed and how it was worked around, or "no
+workarounds" if none. After each run kd reads `~/.kd-agent-last-message.md` back and keeps it to print whole after the
+probe; there is no section parsing. Nonzero exit is phase failure: kd prints that file if it exists, then the error, and
+stops.
 
 ### Phase contents
 
@@ -89,8 +90,12 @@ problem, which is the point.
 
 **User-space phase**, as the user, after kd has placed the secrets:
 
-- CLIs: `gh`, `jj`, `cargo-dist`, `git-cliff`, `sccache`, `trunk`, `dioxus-cli`, `dprint`, `herdr`, `vercel`, Claude
-  Code (its own installer), OpenCode, Muse.
+- CLIs: `gh`, `jj`, `cargo-dist`, `git-cliff`, `sccache`, `trunk`, `dioxus`, `dprint`, `herdr`, `vercel`, Claude Code
+  (its own installer), OpenCode, Muse. The Rust tools come from Homebrew bottles where a formula exists (`cargo-dist`,
+  `git-cliff`, `sccache`, `trunk`, `dprint`), not `cargo install`: the first ubiworker rehearsals spent about 20 of the
+  user-space phase's 22 minutes compiling them from source. `dioxus` has no Homebrew formula (checked 2026-09-05; an
+  agent guessing `dioxus-cli` fails too) and is `cargo install dioxus-cli`. Cargo stays the fallback for any Rust tool
+  without a bottle, or one deliberately moved back to cargo later.
 - `gh auth login --with-token < ~/.kd-github-token`, then delete the token file with `unlink`, then `gh auth setup-git`.
   Skip the login if `gh auth status` already passes. `unlink` rather than `rm -f` because Codex's built-in command
   policy rejects any command containing `rm -f`, even under full-access mode.

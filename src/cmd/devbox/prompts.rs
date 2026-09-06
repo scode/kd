@@ -58,7 +58,7 @@ This is the USER-SPACE PHASE of a devbox bootstrap. Files kd placed for you, all
 
 Do these, in order:
 
-1. CLIs, using the package-source preference below: gh, jj (Jujutsu), cargo-dist, git-cliff, sccache, trunk, dioxus-cli, dprint, herdr (Homebrew core), vercel, Claude Code (its own installer), OpenCode (its own installer), Muse Code (`muse`, its own installer). Homebrew is at `/home/linuxbrew/.linuxbrew`; `brew` may need its shellenv sourced first. Every CLI must end up on the login shell's PATH; verify each with `command -v` in a fresh `bash -lc`.
+1. CLIs, using the package-source preference below: gh, jj (Jujutsu), cargo-dist, git-cliff, sccache, trunk, dioxus (`dx`), dprint, herdr, vercel, Claude Code (its own installer), OpenCode (its own installer), Muse Code (`muse`, its own installer). Of the Rust ones, cargo-dist, git-cliff, sccache, trunk and dprint have Homebrew formulae with Linux bottles; install those with `brew install`, and fall back to `cargo install` only for one whose formula turns out to be missing. dioxus has no Homebrew formula (do not try `brew install dioxus` or `dioxus-cli`); install it with `cargo install dioxus-cli`. Homebrew is at `/home/linuxbrew/.linuxbrew`; `brew` may need its shellenv sourced first. Every CLI must end up on the login shell's PATH; verify each with `command -v` in a fresh `bash -lc`.
 2. GitHub: if `gh auth status` fails, `gh auth login --with-token < ~/{GITHUB_TOKEN_FILE}`. Then delete `~/{GITHUB_TOKEN_FILE}` if it exists (use `unlink`; your command policy rejects `rm -f`), whether or not you used it. Then `gh auth setup-git`.
 3. Clone `scode/voice` and then `scode/dotfiles` into `~/git/<name>` over HTTPS (skip clones that already exist). Then run `cargo run -p dotfiles -- install` from `~/git/dotfiles` twice; the second run must report zero failures. `voice` goes first because the dotfiles installer links the voice skill only when `~/git/voice` exists.
 4. Clone every repo below into `~/git/<name>` over HTTPS, skipping ones that already exist, then run `jj git init --colocate` in each `~/git/*` that is not already a jj repo (including voice and dotfiles):
@@ -67,7 +67,7 @@ Do these, in order:
 {hermes_steps}
 9. {tailscale}
 
-Package sources, in order of preference: apt for slow-moving system tools; Cargo for Rust tools; Homebrew for fast-moving CLIs; a tool's own upstream installer where that is the supported path; npm only when nothing else is supported.
+Package sources, in order of preference: apt for slow-moving system tools; Homebrew for CLIs that have a Linux bottle, Rust tools included (a bottle installs in seconds, a cargo build of the same tool takes minutes); `cargo install` for Rust tools that have no bottle or are explicitly marked cargo; a tool's own upstream installer where that is the supported path; npm only when nothing else is supported.
 
 If this machine has no systemd (no `systemctl`; a container or a cloud sandbox), still write the unit files but skip enabling or starting anything and skip `loginctl`, and list each skipped item in your final report. Do the same for any step that turns out impossible here: work around it if you can, skip it if you cannot, and report it.
 
@@ -96,7 +96,7 @@ This is the SYSTEM PHASE of a devbox bootstrap. Do these, in order:
 8. Docker Engine and the Compose plugin from Docker's own apt repository; add `{user}` to the docker group.
 9. Toolchains, installed as `{user}` (not root): rustup with the stable toolchain, a current Node.js LTS with npm, Bun, uv, and python3 with venv support, all under that user's home. Homebrew is the exception: install it with its official installer at the standard Linux prefix `/home/linuxbrew/.linuxbrew` (owned by `{user}`), not under the home directory, because only the standard prefix gets prebuilt bottles and everything else builds from source. Make sure `{user}`'s login shell picks up `brew shellenv`.
 
-Package sources, in order of preference: apt for slow-moving system tools; Cargo for Rust tools; Homebrew for fast-moving CLIs; a tool's own upstream installer where that is the supported path; npm only when nothing else is supported.
+Package sources, in order of preference: apt for slow-moving system tools; Homebrew for CLIs that have a Linux bottle, Rust tools included (a bottle installs in seconds, a cargo build of the same tool takes minutes); `cargo install` for Rust tools that have no bottle or are explicitly marked cargo; a tool's own upstream installer where that is the supported path; npm only when nothing else is supported.
 
 If this machine has no systemd (no `systemctl`; a container or a cloud sandbox), skip service enablement, the firewall, and anything reboot-related, and list each skipped item in your final report. Do the same for any step that turns out impossible here: work around it if you can, skip it if you cannot, and report it.
 
