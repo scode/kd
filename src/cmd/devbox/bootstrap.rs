@@ -568,15 +568,11 @@ $S chmod 0440 "/etc/sudoers.d/90-kd-$u"
 $S visudo -cf "/etc/sudoers.d/90-kd-$u" >/dev/null
 "#;
 
-/// The one installer Rust owns (see SPEC_impl.md): fetch the Codex release
-/// tarballs for this architecture straight from GitHub's `latest/download`
-/// redirect, so no API call and no JSON parsing, and place its auth file.
-///
-/// Two binaries, not one: since Codex 0.153 the command runner lives in a
-/// separate `codex-code-mode-host` executable that `codex` looks for next
-/// to itself, and the `code_mode_host` feature is on by default and fails
-/// closed. A `codex` without its host can run no commands at all, which is
-/// exactly how the first rehearsal failed.
+/// Seed the official Codex distribution before an agent exists to do setup.
+/// The upstream installer owns the release layout and companion binaries;
+/// a working standalone installation is also required for QR-code remote
+/// control. Reruns migrate older direct-download installs at the same path.
+/// Credentials are placed only after installation and its version check pass.
 fn install_codex(t: &Transport, auth: &secrets::AuthSource) -> anyhow::Result<()> {
     info!("installing Codex on {}", t.destination);
     t.run(CODEX_INSTALL_SCRIPT)?;
@@ -585,21 +581,12 @@ fn install_codex(t: &Transport, auth: &secrets::AuthSource) -> anyhow::Result<()
 }
 
 const CODEX_INSTALL_SCRIPT: &str = r#"
-set -eu
-mkdir -p "$HOME/.local/bin"
-base="https://github.com/openai/codex/releases/latest/download"
-arch=$(uname -m)
-fetch() {
-  # $1 = release binary name, also the installed name.
-  if [ -x "$HOME/.local/bin/$1" ]; then return 0; fi
-  tmp=$(mktemp -d)
-  curl -fsSL "$base/$1-$arch-unknown-linux-musl.tar.gz" | tar -xz -C "$tmp"
-  bin=$(find "$tmp" -type f | head -n 1)
-  install -m 0755 "$bin" "$HOME/.local/bin/$1"
-  rm -rf "$tmp"
-}
-fetch codex
-fetch codex-code-mode-host
+set -o pipefail
+# An empty or partial download must fail even when sh exits successfully.
+# Pin the visible command's directory: agent::CODEX_BIN bypasses login PATH
+# until the agent phases configure it. Never skip an existing unmanaged binary.
+curl -fsSL https://chatgpt.com/codex/install.sh | \
+  CODEX_NON_INTERACTIVE=1 CODEX_INSTALL_DIR="$HOME/.local/bin" sh || exit 1
 "$HOME/.local/bin/codex" --version
 "#;
 
@@ -705,6 +692,90 @@ fn reboot_if_required(run: &mut Run) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Output;
+
+    /// Run the seeding script with real shells and a fake download. Target paths
+    /// and PATH are injected only into the child, so tests cannot install into
+    /// the developer's home or race through process-global environment changes.
+    fn run_codex_installer(home: &Path, download: &str) -> Output {
+        let bin = home.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let curl = bin.join("curl");
+        fs::write(&curl, format!("#!/bin/sh\n{download}\n")).unwrap();
+        fs::set_permissions(curl, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        Command::new("bash")
+            .args(["-c", CODEX_INSTALL_SCRIPT])
+            .env("HOME", home)
+            .env("PATH", path)
+            .env("CODEX_INSTALL_DIR", home.join("unexpected-install-dir"))
+            .output()
+            .unwrap()
+    }
+
+    /// Seeding must invoke the unattended official installer at the runner's
+    /// fixed path, even on a rerun with an executable already there. Otherwise
+    /// older direct-download installs would never acquire the standalone layout.
+    #[test]
+    fn codex_install_runs_upstream_on_fresh_and_existing_installs() {
+        let dir = tempfile::tempdir().unwrap();
+        let download = r#"
+[ "$*" = '-fsSL https://chatgpt.com/codex/install.sh' ] || exit 2
+cat <<'INSTALLER'
+[ "$CODEX_NON_INTERACTIVE" = 1 ] || exit 3
+[ "$CODEX_INSTALL_DIR" = "$HOME/.local/bin" ] || exit 4
+mkdir -p "$CODEX_INSTALL_DIR" || exit 5
+printf '#!/bin/sh\n[ "$*" = --version ] || exit 6\necho standalone\n' > "$CODEX_INSTALL_DIR/codex" || exit 7
+chmod 700 "$CODEX_INSTALL_DIR/codex" || exit 8
+echo installed >> "$HOME/installations"
+INSTALLER
+"#;
+        for _ in 0..2 {
+            let out = run_codex_installer(dir.path(), download);
+            assert!(out.status.success(), "{out:?}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "standalone\n");
+        }
+        assert_eq!(
+            fs::read_to_string(dir.path().join("installations")).unwrap(),
+            "installed\ninstalled\n"
+        );
+    }
+
+    /// A stale working binary must not disguise a failed download or installer.
+    /// The partial-download case deliberately feeds sh a successful script:
+    /// without pipefail, that would incorrectly permit bootstrap to continue.
+    #[test]
+    fn codex_install_propagates_download_installer_and_version_failures() {
+        for download in [
+            "exit 22",
+            "printf 'exit 0\\n'; exit 22",
+            "printf 'exit 9\\n'",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let binary = dir.path().join(".local/bin/codex");
+            fs::create_dir_all(binary.parent().unwrap()).unwrap();
+            fs::write(&binary, "#!/bin/sh\necho stale\n").unwrap();
+            fs::set_permissions(binary, fs::Permissions::from_mode(0o700)).unwrap();
+            let out = run_codex_installer(dir.path(), download);
+            assert!(!out.status.success(), "{out:?}");
+            assert!(out.stdout.is_empty(), "stale binary was invoked: {out:?}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = run_codex_installer(dir.path(), "printf 'exit 0\\n'");
+        assert!(!out.status.success(), "missing installed binary: {out:?}");
+        let binary = dir.path().join(".local/bin/codex");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, "#!/bin/sh\nexit 10\n").unwrap();
+        fs::set_permissions(binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let out = run_codex_installer(dir.path(), "printf 'exit 0\\n'");
+        assert!(!out.status.success(), "broken installed binary: {out:?}");
+    }
 
     /// Exercise the actual clap contract without invoking any commands.
     #[derive(Parser)]

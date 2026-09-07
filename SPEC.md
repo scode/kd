@@ -356,6 +356,11 @@ Terms used below:
   decisions are preserved; the controller's global Claude settings are not copied. Malformed or symlinked target
   configuration is refused rather than overwritten. Keep interactive Claude sessions closed during bootstrap so they
   cannot race the configuration update. Authentication or configuration errors in this step fail bootstrap.
+- Codex uses the official shell installer, and the login shell must run that installation. This is a deliberate
+  feature-compatibility choice: QR-code remote control requires Codex to be running from the official installation;
+  Homebrew is not an equivalent substitute. Bootstrap reruns the installer even when a Codex binary already exists, so
+  rerunning bootstrap migrates the old direct-download installation too. The probe reports when another Codex
+  installation takes precedence on PATH.
 - Timezone setup uses `America/Los_Angeles` zoneinfo, including daylight-saving transitions, rather than a fixed UTC
   offset. `/etc/localtime` must match that zone's data, and `/etc/timezone`, when present, must name the same zone.
   Releases that no longer use `/etc/timezone` need not create it. A running systemd host must report the same timezone;

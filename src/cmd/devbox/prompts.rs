@@ -20,6 +20,11 @@ pub const ALWAYS_CLONED: [&str; 2] = ["scode/voice", "scode/dotfiles"];
 pub const GITHUB_TOKEN_FILE: &str = ".kd-github-token";
 pub const HERMES_ARCHIVE_FILE: &str = ".kd-hermes-backup.zip";
 
+/// Both phases can change login PATH, and dotfiles installation happens late
+/// in the user phase. Keep the seeded distribution in use across all of them:
+/// finding some executable named codex does not establish this contract.
+const CODEX_INSTALL_POLICY: &str = "Codex is already installed with its official shell installer at `~/.local/bin/codex`. Preserve that installation; do not replace it with Homebrew, npm, or manually downloaded binaries. QR-code remote control requires running the official installation. Keep `~/.local/bin` ahead of Homebrew and npm in the login shell's PATH, including after installing dotfiles. At the end of this phase, verify in a fresh `bash -lc` that `test \"$(command -v codex)\" -ef \"$HOME/.local/bin/codex\"` succeeds; repair PATH if it does not. This overrides the general package-source preference.";
+
 /// The user-space phase: everything that needs a secret, run after kd has
 /// placed credentials and, only on a restore, the Hermes archive. Service
 /// startup and Tailscale installation are separate per-run decisions.
@@ -63,6 +68,8 @@ pub fn user_space_phase(
 
 This is the USER-SPACE PHASE of a devbox bootstrap. Files kd placed for you, all under your home: `{GITHUB_TOKEN_FILE}` (a GitHub token, present only if `gh` was not already logged in){archive_note}, and the agent CLIs' credential files at their native locations (`~/.codex/auth.json`, `~/.claude/.credentials.json`, `~/.local/share/opencode/auth.json`, `~/.config/muse/auth.json`). Never print any of their contents.
 
+{CODEX_INSTALL_POLICY}
+
 Do these, in order:
 
 1. CLIs, using the package-source preference below: gh, jj (Jujutsu), cargo-dist, git-cliff, sccache, trunk, dioxus (`dx`), dprint, herdr, vercel, Claude Code (its own installer), OpenCode (its own installer), Muse Code (`muse`, its own installer). Of the Rust ones, cargo-dist, git-cliff, sccache, trunk and dprint have Homebrew formulae with Linux bottles; install those with `brew install`, and fall back to `cargo install` only for one whose formula turns out to be missing. dioxus has no Homebrew formula (do not try `brew install dioxus` or `dioxus-cli`); install it with `cargo install dioxus-cli`. Homebrew is at `/home/linuxbrew/.linuxbrew`; `brew` may need its shellenv sourced first. Every CLI must end up on the login shell's PATH; verify each with `command -v` in a fresh `bash -lc`.
@@ -93,6 +100,8 @@ pub fn system_phase(hostname: &str, user: &str) -> String {
         r#"You are configuring a freshly installed Ubuntu machine over a non-interactive session as user `{user}`, who has passwordless sudo. Nobody will answer questions: decide yourself and keep going. Every step must be idempotent, because this whole prompt may be run again after a failure.
 
 This is the SYSTEM PHASE of a devbox bootstrap. Do these, in order:
+
+{CODEX_INSTALL_POLICY}
 
 1. `apt-get update` and `apt-get full-upgrade`, non-interactively (DEBIAN_FRONTEND=noninteractive). If the dpkg lock is held by a boot-time upgrade, wait for it rather than failing. Do NOT reboot even if the upgrade asks for one; the caller handles reboots.
 2. Set the hostname to `{hostname}` and the timezone to `America/Los_Angeles`. On a running systemd host use `timedatectl set-timezone America/Los_Angeles`; without systemd, symlink `/etc/localtime` to `/usr/share/zoneinfo/America/Los_Angeles`. Verify `/etc/localtime` matches that zone's data, including its daylight-saving rules. If `/etc/timezone` exists, keep it consistent too: on Ubuntu 24.04 `timedatectl` does not maintain that legacy file, even when it changes the timezone. After setting `/etc/localtime`, run `sudo -n dpkg-reconfigure -f noninteractive tzdata` to synchronize tzdata's configuration and `/etc/timezone`, then verify both. Do not create `/etc/timezone` on releases that no longer use it. Do not set a fixed UTC offset or add a `TZ` environment override; report any existing conflicting override rather than silently changing user settings.

@@ -73,6 +73,12 @@ pub fn script(
     if enroll_tailscale {
         check("tailscale", "tailscale status >/dev/null 2>&1");
     }
+    // A working package-manager copy can still lack standalone-only features.
+    // Compare file identity so symlinks are accepted but PATH shadowing is not.
+    check(
+        "codex installation",
+        "test \"$(command -v codex)\" -ef \"$HOME/.local/bin/codex\"",
+    );
     check(
         "codex request",
         "codex exec --skip-git-repo-check 'reply ok' >/dev/null 2>&1",
