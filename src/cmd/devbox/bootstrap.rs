@@ -16,8 +16,8 @@
 //! any failure is "fix or ignore, then rerun the whole command".
 
 use super::{
-    BootstrapArgs, agent, claude, confirm, home_dir, probe, profile, prompts, secrets,
-    transport::Transport, wait_for_enter,
+    BootstrapArgs, agent, claude, confirm, git_identity::GitIdentity, home_dir, probe, profile,
+    prompts, secrets, transport::Transport, wait_for_enter,
 };
 use anyhow::{Context, bail};
 use std::io::BufRead;
@@ -49,6 +49,7 @@ pub fn run(args: BootstrapArgs) -> anyhow::Result<()> {
     let rehearsal = args.rehearsal;
 
     // 1. Controller preflight: cheap, no connections, before any prompt.
+    let git_identity = GitIdentity::read(&home)?;
     let sources = secrets::resolve_all(&home)?;
     info!("{}", secrets::describe(&sources));
     let public_key_path = profile::expand_tilde(&config.bootstrap.public_key, &home);
@@ -125,6 +126,8 @@ pub fn run(args: BootstrapArgs) -> anyhow::Result<()> {
     )?;
 
     // 8. User-space phase.
+    // Repository initialization needs an author before the agent starts.
+    git_identity.install(&run.t)?;
     let user_report = agent::run_phase(
         &run.t,
         "user-space",
@@ -136,6 +139,9 @@ pub fn run(args: BootstrapArgs) -> anyhow::Result<()> {
             args.enroll_tailscale,
         ),
     )?;
+
+    // Dotfiles may have replaced Git config; restore the copied defaults.
+    git_identity.install(&run.t)?;
 
     // A successful headless request does not complete Claude's interactive
     // first-run gate. Repair only that gate after the installer has finished.

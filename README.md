@@ -156,6 +156,9 @@ completes its first-run onboarding state so opening `claude` does not ask you to
 project trust decisions are preserved. `backup --yes` skips its confirmation, not the preflight report. See
 [SPEC.md](SPEC.md#kd-devbox) for prompts, restore semantics, and migrating the old per-box configuration format.
 
+Bootstrap copies the controller's global Git `user.name` and `user.email` to the target user's global config. Both must
+be configured before running it. Other Git settings and repository-specific identities are not copied.
+
 ## Command Notes
 
 Timezone setup keeps `/etc/localtime` and any existing `/etc/timezone` consistent with `America/Los_Angeles`. The probe
