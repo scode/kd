@@ -12,6 +12,7 @@
 //! probe item, never as a failed run.
 
 use super::transport::{Transport, shell_quote};
+use std::path::Path;
 
 /// Render the probe for this run. `expected_repos` is the manifest
 /// deduplicated with the always-cloned repos. Rehearsal expects restored
@@ -35,10 +36,13 @@ pub fn script(
         "hostname",
         &format!("[ \"$(hostname)\" = {} ]", shell_quote(hostname)),
     );
-    check(
-        "timezone",
-        "[ \"$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone)\" = America/Los_Angeles ]",
-    );
+    for (name, command) in timezone_checks(
+        Path::new("/etc"),
+        Path::new("/usr/share/zoneinfo"),
+        Path::new("/run/systemd/system"),
+    ) {
+        check(name, &command);
+    }
     check("gh auth", "gh auth status >/dev/null 2>&1");
     check(
         "repo count",
@@ -80,6 +84,43 @@ pub fn script(
     s
 }
 
+/// Check each timezone source independently: a correct systemd label must
+/// not hide stale legacy metadata, and legacy metadata must not stand in for
+/// the actual zoneinfo used by libc on hosts without systemd. Comparing zone
+/// files covers daylight-saving rules rather than just today's UTC offset.
+/// Paths are supplied explicitly so tests can reproduce conflicting files
+/// without touching the controller's timezone or process environment.
+fn timezone_checks(
+    etc: &Path,
+    zoneinfo: &Path,
+    systemd_runtime: &Path,
+) -> [(&'static str, String); 4] {
+    let quote = |path: &Path| shell_quote(&path.to_string_lossy());
+    let localtime = quote(&etc.join("localtime"));
+    let legacy = quote(&etc.join("timezone"));
+    let expected = quote(&zoneinfo.join("America/Los_Angeles"));
+    [
+        ("timezone data", format!("cmp -s {localtime} {expected}")),
+        (
+            "timezone metadata",
+            format!(
+                "if [ -e {legacy} ] || [ -L {legacy} ]; then [ \"$(cat {legacy})\" = America/Los_Angeles ]; fi"
+            ),
+        ),
+        (
+            "timezone systemd",
+            format!(
+                "if [ -d {} ]; then zone=$(timedatectl show -p Timezone --value) && [ \"$zone\" = America/Los_Angeles ]; fi",
+                quote(systemd_runtime),
+            ),
+        ),
+        (
+            "timezone environment",
+            "[ -z \"${TZ+x}\" ] || [ \"$TZ\" = America/Los_Angeles ]".to_owned(),
+        ),
+    ]
+}
+
 /// `check NAME CMD` runs CMD under `bash -c` and prints the verdict line.
 /// Every check gets a timeout so a hung CLI cannot stall the report.
 const PRELUDE: &str = r#"
@@ -102,6 +143,133 @@ pub fn run(t: &Transport, script: &str) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    /// Evaluate the real probe commands against a miniature filesystem. The
+    /// fake timedatectl lets failures be tested even on non-systemd macOS;
+    /// bash and cmp remain real so file mismatches are not mocked away.
+    fn timezone_results(
+        localtime: Option<&str>,
+        metadata: Option<&str>,
+        systemd: Option<(i32, &str)>,
+        tz: Option<&str>,
+    ) -> Vec<bool> {
+        let dir = tempfile::tempdir().unwrap();
+        let etc = dir.path().join("etc");
+        let zoneinfo = dir.path().join("zoneinfo");
+        let runtime = dir.path().join("systemd");
+        let bin = dir.path().join("bin");
+        for path in [&etc, &zoneinfo.join("America"), &bin] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(zoneinfo.join("America/Los_Angeles"), "zone data").unwrap();
+        if let Some(data) = localtime {
+            fs::write(etc.join("localtime"), data).unwrap();
+        }
+        if let Some(data) = metadata {
+            fs::write(etc.join("timezone"), data).unwrap();
+        }
+        let (status, zone) = systemd.unwrap_or((99, "must not run"));
+        if systemd.is_some() {
+            fs::create_dir(&runtime).unwrap();
+        }
+        let command = bin.join("timedatectl");
+        fs::write(
+            &command,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' {}\nexit {status}\n",
+                shell_quote(zone)
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(command, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        timezone_checks(&etc, &zoneinfo, &runtime)
+            .into_iter()
+            .map(|(_, script)| {
+                let mut command = Command::new("bash");
+                command
+                    .args(["-c", &script])
+                    .env("PATH", &path)
+                    .env_remove("TZ");
+                if let Some(tz) = tz {
+                    command.env("TZ", tz);
+                }
+                command.output().unwrap().status.success()
+            })
+            .collect()
+    }
+
+    /// Ubuntu 24.04 can report the desired systemd timezone while keeping old
+    /// /etc/timezone contents. Later releases may omit that legacy file;
+    /// neither case may obscure the actual localtime data.
+    #[test]
+    fn timezone_sources_cannot_mask_each_other() {
+        let running = Some((0, "America/Los_Angeles"));
+        assert_eq!(
+            timezone_results(Some("zone data"), Some("Europe/Berlin\n"), running, None),
+            [true, false, true, true]
+        );
+        assert_eq!(
+            timezone_results(
+                Some("wrong data"),
+                Some("America/Los_Angeles\n"),
+                None,
+                None
+            ),
+            [false, true, true, true]
+        );
+        assert_eq!(
+            timezone_results(None, Some("America/Los_Angeles\n"), None, None),
+            [false, true, true, true]
+        );
+        assert_eq!(
+            timezone_results(Some("zone data"), None, None, None),
+            [true; 4]
+        );
+        assert_eq!(
+            timezone_results(
+                Some("zone data"),
+                Some("America/Los_Angeles\n"),
+                running,
+                None
+            ),
+            [true; 4]
+        );
+    }
+
+    /// A broken systemd query must not fall back to a correct text file, and
+    /// an inherited TZ override can defeat correct host files. Empty TZ means
+    /// UTC on libc, so it must not be mistaken for an unset variable.
+    #[test]
+    fn timezone_runtime_failures_and_overrides_are_visible() {
+        for systemd in [Some((1, "")), Some((0, "Europe/Berlin"))] {
+            assert_eq!(
+                timezone_results(
+                    Some("zone data"),
+                    Some("America/Los_Angeles"),
+                    systemd,
+                    None
+                ),
+                [true, true, false, true]
+            );
+        }
+        for tz in ["", "UTC", "Europe/Berlin", "PST8"] {
+            assert_eq!(
+                timezone_results(Some("zone data"), None, None, Some(tz)),
+                [true, true, true, false]
+            );
+        }
+        assert_eq!(
+            timezone_results(Some("zone data"), None, None, Some("America/Los_Angeles")),
+            [true; 4]
+        );
+    }
 
     /// A rehearsal must not probe what only a real run sets up, and must
     /// expect the gateway stopped; a real run is the other way round.

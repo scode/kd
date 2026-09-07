@@ -94,7 +94,7 @@ pub fn system_phase(hostname: &str, user: &str) -> String {
 This is the SYSTEM PHASE of a devbox bootstrap. Do these, in order:
 
 1. `apt-get update` and `apt-get full-upgrade`, non-interactively (DEBIAN_FRONTEND=noninteractive). If the dpkg lock is held by a boot-time upgrade, wait for it rather than failing. Do NOT reboot even if the upgrade asks for one; the caller handles reboots.
-2. Set the hostname to `{hostname}` and the timezone to `America/Los_Angeles`.
+2. Set the hostname to `{hostname}` and the timezone to `America/Los_Angeles`. On a running systemd host use `timedatectl set-timezone America/Los_Angeles`; without systemd, symlink `/etc/localtime` to `/usr/share/zoneinfo/America/Los_Angeles`. Verify `/etc/localtime` matches that zone's data, including its daylight-saving rules. If `/etc/timezone` exists, keep it consistent too: on Ubuntu 24.04 `timedatectl` does not maintain that legacy file, even when it changes the timezone. After setting `/etc/localtime`, run `sudo -n dpkg-reconfigure -f noninteractive tzdata` to synchronize tzdata's configuration and `/etc/timezone`, then verify both. Do not create `/etc/timezone` on releases that no longer use it. Do not set a fixed UTC offset or add a `TZ` environment override; report any existing conflicting override rather than silently changing user settings.
 3. SSH hardening via a file in /etc/ssh/sshd_config.d/: `PasswordAuthentication no`, `KbdInteractiveAuthentication no`, `PermitRootLogin no`. Run `sshd -t` before reloading sshd, and never do anything that could cut the current session.
 4. Firewall with ufw: default deny incoming, allow OpenSSH, `ufw allow in on tailscale0`, enable it non-interactively.
 5. Unattended security upgrades enabled, automatic reboot disabled.

@@ -158,6 +158,10 @@ project trust decisions are preserved. `backup --yes` skips its confirmation, no
 
 ## Command Notes
 
+Timezone setup keeps `/etc/localtime` and any existing `/etc/timezone` consistent with `America/Los_Angeles`. The probe
+checks them independently, along with systemd's timezone and any inherited `TZ` override; application and container
+timezone settings remain separate.
+
 `kd yt thumb resize` rewrites the file you pass it. If the image is already below 2 MB, it does nothing. This shells out
 to ImageMagick, so you need `magick` installed.
 
