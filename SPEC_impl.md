@@ -77,7 +77,12 @@ problem, which is the point.
 
 - `apt update` and `apt dist-upgrade`, waiting on the dpkg lock rather than failing if a boot-time upgrade is still
   running (ubiworkers do this).
-- Hostname from `--hostname`, falling back to the restore profile; timezone `America/Los_Angeles`.
+- Hostname from `--hostname`, falling back to the restore profile; timezone `America/Los_Angeles`. Use `timedatectl`
+  with running systemd, otherwise symlink `/etc/localtime` to the named zoneinfo file. When `/etc/timezone` exists,
+  follow with noninteractive `dpkg-reconfigure tzdata` to synchronize the package configuration and legacy file. Ubuntu
+  24.04 removed systemd's maintenance of that file
+  ([upstream explanation](https://bugs.launchpad.net/ubuntu/+source/systemd/+bug/2103839)); repeating `timedatectl`
+  alone cannot repair it. Do not create the legacy file on releases that no longer use it.
 - SSH: key-only, `PermitRootLogin no`, `PasswordAuthentication no`. Validate with `sshd -t` before restarting.
 - UFW: default deny inbound, allow OpenSSH, `ufw allow in on tailscale0`, enable.
 - Unattended security upgrades with automatic reboot disabled.
@@ -265,12 +270,18 @@ On the controller:
 
 One shell script, rendered per run because it carries expected values, run as the user, printing one line per check in
 the form `<name>: ok` or `<name>: FAIL (exit N)`. Pass is exit status 0 unless stated. Checks: `hostname` equals the
-resolved target hostname; `timedatectl show -p Timezone --value` equals `America/Los_Angeles`; `gh auth status`; the
-count of `~/git/*` directories equals the size of the manifest deduplicated with `scode/voice` and `scode/dotfiles`;
+resolved target hostname; independent timezone checks described below; `gh auth status`; the count of `~/git/*`
+directories equals the size of the manifest deduplicated with `scode/voice` and `scode/dotfiles`;
 `ssh -o BatchMode=yes localhost true`; `docker ps`; and, on restores, a gateway process check (absent on rehearsal,
 present otherwise) plus `curl -fsS 127.0.0.1:9119/api/status` outside rehearsals. `tailscale status` is checked only
 with `--enroll-tailscale`. One real request per agent CLI: `codex exec --skip-git-repo-check "reply ok"`,
 `claude -p ok`, `opencode run ok`, `muse exec ok`. Every check is reported; none is fatal.
+
+Timezone checks compare `/etc/localtime` with the named zoneinfo file using `cmp`, check `/etc/timezone` if present, and
+query `timedatectl` when `/run/systemd/system` exists. None can mask another's failure. Comparing zoneinfo data covers
+daylight-saving rules, rather than only the current offset. An inherited `TZ` must be unset or exactly
+`America/Los_Angeles`; empty is an override too. Tests execute the shell checks against isolated files and a fake
+`timedatectl`, without changing the controller's timezone or process environment.
 
 ### Backup sequence
 

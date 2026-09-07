@@ -349,6 +349,12 @@ Terms used below:
   decisions are preserved; the controller's global Claude settings are not copied. Malformed or symlinked target
   configuration is refused rather than overwritten. Keep interactive Claude sessions closed during bootstrap so they
   cannot race the configuration update. Authentication or configuration errors in this step fail bootstrap.
+- Timezone setup uses `America/Los_Angeles` zoneinfo, including daylight-saving transitions, rather than a fixed UTC
+  offset. `/etc/localtime` must match that zone's data, and `/etc/timezone`, when present, must name the same zone.
+  Releases that no longer use `/etc/timezone` need not create it. A running systemd host must report the same timezone;
+  its query failures cannot be hidden by falling back to a text file. The probe also reports an inherited `TZ` value
+  other than `America/Los_Angeles`, including an explicitly empty value. Bootstrap does not silently rewrite existing
+  user timezone overrides. Application-specific and container timezone settings are outside the host setup contract.
 - With `--restore`, Hermes is restored from the newest archive in the backup directory whose name carries this profile's
   hostname, so two profiles can share a backup directory. A rerun re-imports that archive and discards whatever Hermes
   state the previous attempt accumulated. Outside a rehearsal, its gateway and loopback-only dashboard are enabled and
