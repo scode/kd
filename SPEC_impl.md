@@ -257,7 +257,13 @@ On the controller:
    10 minutes; give up with an error after that. The per-run known-hosts file is reused because the host key survives a
    reboot.
 7. Place secrets.
-8. Agent: user-space phase.
+8. Copy the controller's global Git `user.name` and `user.email` to the target user's global Git config, then run the
+   user-space agent. Read those values during controller preflight with `git config --global --includes --get`, using
+   the controller home as the working directory and clearing inherited `GIT_DIR`, `GIT_WORK_TREE` and `GIT_COMMON_DIR`
+   so the invoking repository cannot select the identity. Set only those keys with `--replace-all`, shell-quoting values
+   rather than placing them in a prompt. Repeat after the agent because dotfiles installation can replace Git config.
+   Verify the effective global values after each transfer; a write or verification failure aborts bootstrap.
+   Repository-local identities and unrelated Git settings are not changed.
 9. Tailscale (only with `--enroll-tailscale`): the agent installed it in the user-space phase; kd runs
    `sudo tailscale up --timeout 10m` with output streamed so the login URL reaches the terminal. `tailscale up` blocks
    until the browser login completes or the timeout expires, which is the whole wait; a nonzero exit is an error. The

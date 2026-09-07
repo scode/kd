@@ -344,6 +344,10 @@ Terms used below:
   resume.
 - The GitHub token and the agent auth files are placed on the target as mode `0600` files for the agent to consume; the
   token file is deleted once `gh` has it. They are never passed as arguments or logged.
+- Bootstrap reads the controller's global Git `user.name` and `user.email`, including global config includes, from
+  outside the invoking repository. Both must be nonempty single-line values; a missing value or read failure aborts
+  before SSH. Only these two fields are copied to the target user's global Git config, replacing existing defaults.
+  Other Git settings and repository-local identities are preserved. No identity is inferred from GitHub login.
 - After installing Claude, bootstrap verifies its login and marks first-run onboarding complete on the target. Copied
   credentials alone do not prevent interactive startup from asking for login again. Existing settings and project trust
   decisions are preserved; the controller's global Claude settings are not copied. Malformed or symlinked target
