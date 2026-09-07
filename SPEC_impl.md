@@ -70,8 +70,8 @@ stops.
 ### Phase contents
 
 These lists are what the two prompts ask for. They are preferences, not identity, so they live in code; when the
-inventory changes, edit the prompt and this section together. Exact package names and install commands are the agent's
-problem, which is the point.
+inventory changes, edit the prompt and this section together. Exact package names and install commands are usually the
+agent's problem; an explicitly chosen upstream installer overrides the general package preference.
 
 **System phase**, as the user with `sudo`:
 
@@ -102,6 +102,10 @@ problem, which is the point.
   user-space phase's 22 minutes compiling them from source. `dioxus` has no Homebrew formula (checked 2026-09-05; an
   agent guessing `dioxus-cli` fails too) and is `cargo install dioxus-cli`. Cargo stays the fallback for any Rust tool
   without a bottle, or one deliberately moved back to cargo later.
+- Tensorlake CLI (`tl`): if missing, run `curl -fsSL https://tensorlake.ai/install | sh` as the user, following
+  [Tensorlake's CLI instructions](https://docs.tensorlake.ai/sandboxes/computer-use). Use the standalone installer, not
+  the Python SDK. Verify `tl --version` in a fresh login shell, fixing PATH if needed. Do not run `tl login`; Tensorlake
+  credentials are outside bootstrap's transfer contract.
 - `gh auth login --with-token < ~/.kd-github-token`, then delete the token file with `unlink`, then `gh auth setup-git`.
   Skip the login if `gh auth status` already passes. `unlink` rather than `rm -f` because Codex's built-in command
   policy rejects any command containing `rm -f`, even under full-access mode.
@@ -278,10 +282,11 @@ One shell script, rendered per run because it carries expected values, run as th
 the form `<name>: ok` or `<name>: FAIL (exit N)`. Pass is exit status 0 unless stated. Checks: `hostname` equals the
 resolved target hostname; independent timezone checks described below; `gh auth status`; the count of `~/git/*`
 directories equals the size of the manifest deduplicated with `scode/voice` and `scode/dotfiles`;
-`ssh -o BatchMode=yes localhost true`; `docker ps`; and, on restores, a gateway process check (absent on rehearsal,
-present otherwise) plus `curl -fsS 127.0.0.1:9119/api/status` outside rehearsals. `tailscale status` is checked only
-with `--enroll-tailscale`. One real request per agent CLI: `codex exec --skip-git-repo-check "reply ok"`,
-`claude -p ok`, `opencode run ok`, `muse exec ok`. Every check is reported; none is fatal.
+`ssh -o BatchMode=yes localhost true`; `docker ps`; `tl --version` (no cloud credentials needed); and, on restores, a
+gateway process check (absent on rehearsal, present otherwise) plus `curl -fsS 127.0.0.1:9119/api/status` outside
+rehearsals. `tailscale status` is checked only with `--enroll-tailscale`. One real request per agent CLI:
+`codex exec --skip-git-repo-check "reply ok"`, `claude -p ok`, `opencode run ok`, `muse exec ok`. Every check is
+reported; none is fatal.
 
 Timezone checks compare `/etc/localtime` with the named zoneinfo file using `cmp`, check `/etc/timezone` if present, and
 query `timedatectl` when `/run/systemd/system` exists. None can mask another's failure. Comparing zoneinfo data covers
