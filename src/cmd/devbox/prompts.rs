@@ -108,7 +108,7 @@ This is the SYSTEM PHASE of a devbox bootstrap. Do these, in order:
 3. SSH hardening via a file in /etc/ssh/sshd_config.d/: `PasswordAuthentication no`, `KbdInteractiveAuthentication no`, `PermitRootLogin no`. Run `sshd -t` before reloading sshd, and never do anything that could cut the current session.
 4. Firewall with ufw: default deny incoming, allow OpenSSH, `ufw allow in on tailscale0`, enable it non-interactively.
 5. Unattended security upgrades enabled, automatic reboot disabled.
-6. Base packages: build-essential, curl, git, jq, ripgrep, tmux, shellcheck, unzip, ca-certificates, emacs-nox.
+6. Base packages: build-essential, curl, git, jq, ripgrep, tmux, tree, shellcheck, unzip, ca-certificates, emacs-nox.
 7. Media and browser dependencies: ImageMagick, ffmpeg, Xvfb, the system libraries Playwright needs on this Ubuntu release, and the GTK and WebKitGTK runtime packages.
 8. Docker Engine and the Compose plugin from Docker's own apt repository; add `{user}` to the docker group.
 9. Toolchains, installed as `{user}` (not root): rustup with the stable toolchain, a current Node.js LTS with npm, Bun, uv, and python3 with venv support, all under that user's home. Homebrew is the exception: install it with its official installer at the standard Linux prefix `/home/linuxbrew/.linuxbrew` (owned by `{user}`), not under the home directory, because only the standard prefix gets prebuilt bottles and everything else builds from source. Make sure `{user}`'s login shell picks up `brew shellenv`.
