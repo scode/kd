@@ -23,8 +23,8 @@ and `jj git init --colocate`, the dotfiles installer, `ssh localhost` setup, Her
 unit, and diagnosing whatever breaks along the way. The line is "does this touch a secret, cross a reboot, or decide
 whether it's safe to write to this machine?". If not, it goes in the prompt.
 
-Two exceptions, both accepted because there is no agent yet or because they are a few lines of shell in a script Rust
-already owns. First, Rust installs Codex during seeding with the
+Small deterministic exceptions cover initial agent installation and contracts that headless agent setup cannot reliably
+verify. Rust installs Codex during seeding with the
 [official shell installer](https://learn.chatgpt.com/docs/codex/cli):
 `curl -fsSL https://chatgpt.com/codex/install.sh | sh`, run as the target user. The installer receives
 `CODEX_NON_INTERACTIVE=1` to suppress prompts and `CODEX_INSTALL_DIR="$HOME/.local/bin"` to preserve the path used by
@@ -32,9 +32,9 @@ the agent runner before login PATH is configured. Bash pipefail and an explicit 
 from being hidden by a successful shell; installation and the explicit-path version check must pass before credentials
 are placed. Run the installer on every bootstrap, including reruns with an existing binary, so the old direct-download
 layout is migrated. Upstream owns architecture selection, release layout and companion binaries. A lone Codex binary
-previously left the command runner missing; maintaining that layout here is no longer necessary. Second, the probe
-script hardcodes one real request per agent CLI (see "Probe"). A rotted probe line shows up as a failed probe item,
-never as a failed run.
+previously left the command runner missing; maintaining that layout here is no longer necessary. The probe script
+hardcodes one real request per agent CLI (see "Probe"). A rotted probe line shows up as a failed probe item, never as a
+failed run.
 
 Codex is an explicit exception to the Homebrew preference below. QR-code remote control is the feature that motivated
 this choice: it requires running the official installation, not the Homebrew distribution. Both phase prompts forbid
@@ -43,9 +43,17 @@ installation. Existing package-manager installs need not be deleted; the command
 the seeded installation. The probe compares file identity with `test -ef` so symlinks work and PATH shadowing is
 reported.
 
+Rust also completes Claude's first-run onboarding after verifying authentication, and transfers only the controller's
+global Git author defaults before and after the user-space phase. Headless Claude requests missed the interactive
+onboarding gate; GitHub authentication did not supply a Git author. These narrow repairs preserve unrelated settings and
+keep identity values out of prompts. They do not move general package or dotfiles installation into Rust.
+
 The agent may not: modify repository contents (repos are data, not things to fix), touch controller state, read secrets
 it doesn't need, or decide the target is safe. It reports failures and workarounds in its final message; it does not
-declare success. The probe script is the only success signal.
+declare success. The probe provides independent checks, but covers only the behavior it exercises. The controller
+operator must inspect failures and workarounds, and test interactive behavior when relevant; a successful headless
+request cannot establish that interactive onboarding works. Bootstrap's zero exit status does not mean every probe
+passed.
 
 ### Agent invocation
 
@@ -325,34 +333,31 @@ informational; colocated jj repos are just git repos for this purpose.
 
 Unit tests cover profile parsing, bootstrap plan selection, CLI constraints, transport command lines, service-control
 scripts and conditional prompt/probe content. Full prompt snapshots are unnecessary; tests focus on mode boundaries.
-Everything else is tested end to end against a ubiworker the user creates and hands over:
+Executable shell tests cover deterministic repairs using isolated files and child-process environments. Manual
+integration testing uses an explicitly authorized target; it need not be a ubiworker. Follow
+[DEVBOX_TESTING.md](DEVBOX_TESTING.md) for commands and evidence expectations. Consistent backup testing suspends the
+source first; a live backup is a separate best-effort case. Scratch bootstrap needs no source or backup.
 
-```text
-kd devbox backup --profile <name> --yes
-kd devbox bootstrap --target scode@<worker> --restore <name> --rehearsal
-kd devbox bootstrap --target scode@<worker> --hostname <worker>
-```
-
-The restore rehearsal uses the controller's GitHub token; scratch runs prompt if the target is not authenticated.
-Rerunning bootstrap against the same worker is the fast loop for iterating on a later phase; a fresh worker is the full
-check. Neither touches the real devbox beyond reading it and writing one archive that is removed again.
+Rerunning against an existing target tests convergence; a fresh target tests first-run assumptions. Both execute the
+whole bootstrap, and a restore rerun reimports its archive. Running one exact generated script over SSH tests that
+component, not the phase ordering or the complete bootstrap. Record which level was actually exercised.
 
 ### Known gaps
 
-- The ubiworker image (Ubuntu 26.04) may be newer than the newest LTS image the real box's provider offers, so a
-  rehearsal is not always the same distro. The agent absorbs the drift.
+- Test targets and destination providers may offer different Ubuntu releases. Record the release used; success on one
+  image does not establish compatibility with another. The agent absorbs installer drift.
 - A rehearsal changes the worker's OS hostname in the system phase. That does not rename the tailnet node mid-run only
   because `kd ubiworker create` pins `--hostname` at enrollment; if that ever changes, the rehearsal transport breaks.
 - An hours-long SSH session from a laptop is the weakest link. `ServerAliveInterval` and running under `caffeinate -i`
   are the mitigation; idempotent reruns cover the rest. Running the agent under tmux with a done-file is not planned
   unless that proves insufficient.
-- Copying OAuth state to a second machine is known to work for Claude and Codex; OpenCode and Muse are unverified.
-- A rehearsal arrives over Tailscale SSH, which may not create a logind session. `hermes gateway install`,
-  `systemctl --user`, and `loginctl enable-linger` all want `XDG_RUNTIME_DIR` and the user bus; if the first rehearsal
-  shows them failing, the fix is `loginctl enable-linger` first and `XDG_RUNTIME_DIR=/run/user/$(id -u)` in the prompt's
-  environment.
+- A scratch bootstrap exercised copied credentials with all four agent CLIs, and Claude's interactive onboarding was
+  verified after its separate repair. That is evidence for those runs, not a guarantee about future credential formats,
+  token lifetime, provider support, or every interactive flow. Test the affected CLI behavior on each relevant change.
+- Tailscale SSH may not create a logind session. If Hermes user-service setup fails, inspect lingering, the user bus and
+  `XDG_RUNTIME_DIR` before changing units. Scratch bootstrap does not validate Hermes service startup.
 - `hermes dashboard` may try to build the web UI on every start when `npm` is on PATH and complain when it is not;
-  whether the unit needs `--skip-build` or a PATH line is a first-rehearsal question, which is why the unit body is left
-  to the agent.
-- `tailscale up` flags and `hermes` non-interactive behavior after import were checked against Hermes 0.21 and current
-  docs, not against a live run. The first rehearsal is where they get verified.
+  whether the installed version needs `--skip-build` or a PATH line must be checked on the target, which is why the unit
+  body is left to the agent.
+- Tailscale enrollment was exercised on a scratch target. That does not validate Hermes backup/import, service startup,
+  or a complete move and move-back cycle. Keep verification claims specific to the flow actually tested.

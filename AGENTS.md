@@ -34,6 +34,13 @@ Agents must conform to `SPEC.md` and `SPEC_impl.md`. If implementation and eithe
 explicitly update the file in the same change. `SPEC.md` records user-facing behavior only; implementation choices that
 are deliberate and easy to "fix" into something worse go in `SPEC_impl.md`.
 
+## Driving devbox operations
+
+Read [DEVBOX_TESTING.md](DEVBOX_TESTING.md) before driving a bootstrap, backup, restore, or manual PR test. It covers
+flow selection, private controller configuration, testing the intended revision, and what each verification proves. Keep
+it current when changing these workflows. Existing user authorization carries across steps; the runbook is not an extra
+approval gate. Report code changes, live application, and end-to-end validation separately.
+
 ## Style
 
 Comment generously — the codebase should be easy to skim for intent and functionality. Focus on _why_ and _what the
