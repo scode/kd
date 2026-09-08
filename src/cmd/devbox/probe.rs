@@ -52,6 +52,9 @@ pub fn script(
     );
     check("ssh localhost", "ssh -o BatchMode=yes localhost true");
     check("docker", "docker ps >/dev/null 2>&1");
+    // Installation is useful without cloud credentials; do not turn this
+    // availability check into a login or a billable sandbox operation.
+    check("tensorlake CLI", "tl --version >/dev/null 2>&1");
     // Check names must not spell out what the pgrep pattern matches: the
     // whole script is in the login shell's argv, so a name like "hermes
     // gateway stopped" would match `[h]ermes.*gateway` and fail every time.

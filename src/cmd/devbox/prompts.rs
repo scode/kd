@@ -3,8 +3,8 @@
 //! These are the "Phase contents" lists from SPEC_impl.md, phrased for an
 //! agent that runs unattended. When the tool inventory changes, edit the
 //! prompt and SPEC_impl.md together. Exact package names and installer
-//! commands are deliberately the agent's problem: encoding them here would
-//! be the maintenance liability the whole design exists to avoid.
+//! commands are usually the agent's problem. Explicit upstream installer
+//! choices override the general package preference when the source matters.
 //!
 //! Every prompt carries the same frame: no one will answer questions, reruns
 //! must be safe, systemd may be absent, repositories are data, secrets are
@@ -66,6 +66,7 @@ This is the USER-SPACE PHASE of a devbox bootstrap. Files kd placed for you, all
 Do these, in order:
 
 1. CLIs, using the package-source preference below: gh, jj (Jujutsu), cargo-dist, git-cliff, sccache, trunk, dioxus (`dx`), dprint, herdr, vercel, Claude Code (its own installer), OpenCode (its own installer), Muse Code (`muse`, its own installer). Of the Rust ones, cargo-dist, git-cliff, sccache, trunk and dprint have Homebrew formulae with Linux bottles; install those with `brew install`, and fall back to `cargo install` only for one whose formula turns out to be missing. dioxus has no Homebrew formula (do not try `brew install dioxus` or `dioxus-cli`); install it with `cargo install dioxus-cli`. Homebrew is at `/home/linuxbrew/.linuxbrew`; `brew` may need its shellenv sourced first. Every CLI must end up on the login shell's PATH; verify each with `command -v` in a fresh `bash -lc`.
+   Tensorlake CLI (`tl`): use its official installer, `curl -fsSL https://tensorlake.ai/install | sh`, as the user if `tl` is missing. This overrides the package-source preference below; the Python SDK is not the standalone CLI. Ensure `tl` is on PATH in a fresh `bash -lc` and verify `tl --version`. Do not run interactive `tl login`; Tensorlake authentication is outside bootstrap.
 2. GitHub: if `gh auth status` fails, `gh auth login --with-token < ~/{GITHUB_TOKEN_FILE}`. Then delete `~/{GITHUB_TOKEN_FILE}` if it exists (use `unlink`; your command policy rejects `rm -f`), whether or not you used it. Then `gh auth setup-git`.
 3. Clone `scode/voice` and then `scode/dotfiles` into `~/git/<name>` over HTTPS (skip clones that already exist). Then run `cargo run -p dotfiles -- install` from `~/git/dotfiles` twice; the second run must report zero failures. `voice` goes first because the dotfiles installer links the voice skill only when `~/git/voice` exists.
 4. Clone every repo below into `~/git/<name>` over HTTPS, skipping ones that already exist, then run `jj git init --colocate` in each `~/git/*` that is not already a jj repo (including voice and dotfiles):

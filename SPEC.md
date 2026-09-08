@@ -315,6 +315,9 @@ Terms used below:
   authenticated from the controller's caches, and `gh` authenticated. From scratch no archive is required or placed, and
   no Hermes components are installed or probed. `--hostname` is required from scratch; a restore defaults to the profile
   hostname, with an explicit override allowed. Archive selection always uses the source profile hostname.
+- Tensorlake's standalone CLI (`tl`) is installed with its official shell installer and available on the login shell's
+  PATH. Bootstrap does not log in to Tensorlake or copy its credentials; the probe checks `tl --version` without
+  requiring cloud access.
 - The target is required and never inferred from a source profile. A bare host uses `[bootstrap].user`; an explicit user
   overrides it. `root` cannot be the intended user; bootstrap falls back to root to create a missing account. SSH
   aliases and `ssh://USER@HOST:PORT` destinations are supported. Existing SSH authentication must work; the shared
@@ -364,11 +367,11 @@ Terms used below:
   state the previous attempt accumulated. Outside a rehearsal, its gateway and loopback-only dashboard are enabled and
   started.
 - Ends with a probe report printed as is: hostname, timezone, `gh auth status`, repo count against the manifest,
-  `ssh localhost`, Docker as the user, Claude's onboarding flag, and one real request through each agent CLI. Restores
-  additionally check Hermes gateway state and, outside rehearsals, dashboard reachability. Tailscale is checked only
-  with `--enroll-tailscale`. Probe failures are reported, never fatal: bootstrap exits 0 once the probe has run. After
-  the probe, each agent phase's final message is printed whole, which is where the agent lists anything it had to work
-  around, even when the run succeeded.
+  `ssh localhost`, Docker as the user, Tensorlake CLI availability, Claude's onboarding flag, and one real request
+  through each agent CLI. Restores additionally check Hermes gateway state and, outside rehearsals, dashboard
+  reachability. Tailscale is checked only with `--enroll-tailscale`. Probe failures are reported, never fatal: bootstrap
+  exits 0 once the probe has run. After the probe, each agent phase's final message is printed whole, which is where the
+  agent lists anything it had to work around, even when the run succeeded.
 - After a rehearsal the worker is left running for inspection with a reminder that it holds real credentials; `kd` does
   not destroy it.
 - Logging goes to stderr. There are no log files, receipts, or run records.
