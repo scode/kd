@@ -345,6 +345,8 @@ Terms used below:
   refuses outright. Failure to check for a process is an error. Directory existence is never a guard: every phase is
   idempotent, so the recovery for any failure is "fix or ignore, then rerun the whole command". There is no partial
   resume.
+- Idempotent reruns still execute setup and may perform upgrades or expensive agent work. A restore rerun also reimports
+  application state as described below; it is not a way to preserve work accumulated on the target.
 - The GitHub token and the agent auth files are placed on the target as mode `0600` files for the agent to consume; the
   token file is deleted once `gh` has it. They are never passed as arguments or logged.
 - Bootstrap reads the controller's global Git `user.name` and `user.email`, including global config includes, from
@@ -379,6 +381,8 @@ Terms used below:
   agent lists anything it had to work around, even when the run succeeded.
 - After a rehearsal the worker is left running for inspection with a reminder that it holds real credentials; `kd` does
   not destroy it.
+- Manually starting restored services after a rehearsal leaves the rehearsal's safety conditions. If the source is still
+  active, both copies can process work and diverge; rehearsal provides no isolation for that concurrent operation.
 - Logging goes to stderr. There are no log files, receipts, or run records.
 - The old bootstrap `--profile` and `--no-hermes` flags are removed. Restore is explicitly opt-in with `--restore`.
 - If there is no terminal, the GitHub token is read as one plain line from stdin instead of the hidden prompt, so a
