@@ -24,15 +24,24 @@ unit, and diagnosing whatever breaks along the way. The line is "does this touch
 whether it's safe to write to this machine?". If not, it goes in the prompt.
 
 Two exceptions, both accepted because there is no agent yet or because they are a few lines of shell in a script Rust
-already owns. First, Rust installs Codex during seeding: a generated script run on the target fetches
-`https://github.com/openai/codex/releases/latest/download/<name>-$(uname -m)-unknown-linux-musl.tar.gz` for the two
-names `codex` and `codex-code-mode-host`, which GitHub redirects to the newest release without any API call or JSON
-parsing, and places the one binary inside each at `~/.local/bin/<name>`. Both are needed: since Codex 0.153 the command
-runner is the separate `codex-code-mode-host` executable that `codex` looks for beside itself, and the feature is on by
-default and fails closed, so a lone `codex` can run no commands at all. `curl` and `tar` are assumed present on a
-minimal Ubuntu. That is the only release layout Rust knows about; when it drifts, update it here and in the code
-together. Second, the probe script hardcodes one real request per agent CLI (see "Probe"). A rotted probe line shows up
-as a failed probe item, never as a failed run.
+already owns. First, Rust installs Codex during seeding with the
+[official shell installer](https://learn.chatgpt.com/docs/codex/cli):
+`curl -fsSL https://chatgpt.com/codex/install.sh | sh`, run as the target user. The installer receives
+`CODEX_NON_INTERACTIVE=1` to suppress prompts and `CODEX_INSTALL_DIR="$HOME/.local/bin"` to preserve the path used by
+the agent runner before login PATH is configured. Bash pipefail and an explicit failure guard prevent a failed download
+from being hidden by a successful shell; installation and the explicit-path version check must pass before credentials
+are placed. Run the installer on every bootstrap, including reruns with an existing binary, so the old direct-download
+layout is migrated. Upstream owns architecture selection, release layout and companion binaries. A lone Codex binary
+previously left the command runner missing; maintaining that layout here is no longer necessary. Second, the probe
+script hardcodes one real request per agent CLI (see "Probe"). A rotted probe line shows up as a failed probe item,
+never as a failed run.
+
+Codex is an explicit exception to the Homebrew preference below. QR-code remote control is the feature that motivated
+this choice: it requires running the official installation, not the Homebrew distribution. Both phase prompts forbid
+replacing it and require `~/.local/bin` to precede Homebrew and npm on login PATH, including after dotfiles
+installation. Existing package-manager installs need not be deleted; the command a fresh login shell resolves must be
+the seeded installation. The probe compares file identity with `test -ef` so symlinks work and PATH shadowing is
+reported.
 
 The agent may not: modify repository contents (repos are data, not things to fix), touch controller state, read secrets
 it doesn't need, or decide the target is safe. It reports failures and workarounds in its final message; it does not
@@ -293,6 +302,9 @@ query `timedatectl` when `/run/systemd/system` exists. None can mask another's f
 daylight-saving rules, rather than only the current offset. An inherited `TZ` must be unset or exactly
 `America/Los_Angeles`; empty is an override too. Tests execute the shell checks against isolated files and a fake
 `timedatectl`, without changing the controller's timezone or process environment.
+
+A separate Codex installation check requires the `codex` found on PATH to refer to the same file as
+`~/.local/bin/codex`; a successful request through another installation cannot mask this failure.
 
 ### Backup sequence
 
