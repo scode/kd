@@ -24,6 +24,7 @@ pub mod probe;
 pub mod profile;
 pub mod prompts;
 pub mod resume;
+pub mod routers;
 pub mod secrets;
 pub mod transport;
 

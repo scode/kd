@@ -18,10 +18,10 @@ only what an agent cannot or must not do.
 ### What Rust owns and what the agent owns
 
 Rust owns: profile parsing, SSH transport, placing secrets, phase ordering, the reboot between phases, the live-devbox
-guard, prompts, and the probe script. The agent owns everything else: package installs, hardening, toolchains, cloning
-and `jj git init --colocate`, the dotfiles installer, `ssh localhost` setup, Hermes install and import, the dashboard
-unit, and diagnosing whatever breaks along the way. The line is "does this touch a secret, cross a reboot, or decide
-whether it's safe to write to this machine?". If not, it goes in the prompt.
+guard, prompts, the probe script, and the router setup (see "Routers"). The agent owns everything else: package
+installs, hardening, toolchains, cloning and `jj git init --colocate`, the dotfiles installer, `ssh localhost` setup,
+Hermes install and import, the dashboard unit, and diagnosing whatever breaks along the way. The line is "does this
+touch a secret, cross a reboot, or decide whether it's safe to write to this machine?". If not, it goes in the prompt.
 
 Small deterministic exceptions cover initial agent installation and contracts that headless agent setup cannot reliably
 verify. Rust installs Codex during seeding with the
@@ -65,9 +65,11 @@ codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check \
   -m <model> -c model_reasoning_effort=<effort> -o ~/.kd-agent-last-message.md
 ```
 
-`--skip-git-repo-check` is required because a fresh `$HOME` is not a git repo. Model and effort are two constants
-(initially `gpt-6-astra` and `medium`) so a rename is a one-line change; a fallback model is a config change, never a
-silent retry.
+`--skip-git-repo-check` is required because a fresh `$HOME` is not a git repo. The actual command also passes
+`-c 'model_provider="openai"'`: bootstrap makes codex-lb the default provider, and on a rerun that default points at a
+router with no accounts, so every agent run names the built-in provider and uses the copied native login. Model and
+effort are two constants (currently `gpt-6-sol` and `high`) so a rename is a one-line change; a fallback model is a
+config change, never a silent retry. These pin only the setup agent; the user's own Codex model is never set.
 
 There are exactly two agent runs per bootstrap: the system phase followed by a kd-driven reboot when
 `/var/run/reboot-required` exists, and the user-space phase. The reboot sits between them because the agent cannot
@@ -80,9 +82,11 @@ listed), the package-source preference (apt for slow-moving system tools; Homebr
 tools included; `cargo install` for Rust tools without a bottle or marked cargo; an upstream installer where that is the
 supported path; npm only when nothing else is supported), that the agent must not modify repository contents, and that
 its final message must end with a section listing every step that failed and how it was worked around, or "no
-workarounds" if none. After each run kd reads `~/.kd-agent-last-message.md` back and keeps it to print whole after the
-probe; there is no section parsing. Nonzero exit is phase failure: kd prints that file if it exists, then the error, and
-stops.
+workarounds" if none. Both prompts also carry a router policy: routers and their client wiring from an earlier bootstrap
+are kd's, must not be modified, stopped or recreated, and may have no accounts, so the agent tests Claude and Codex
+through the bypasses rather than "repairing" a failing default CLI. After each run kd reads
+`~/.kd-agent-last-message.md` back and keeps it to print whole after the probe; there is no section parsing. Nonzero
+exit is phase failure: kd prints that file if it exists, then the error, and stops.
 
 ### Phase contents
 
@@ -148,6 +152,63 @@ agent's problem; an explicitly chosen upstream installer overrides the general p
   rehearsal, only write it.
 - Tailscale, only with `--enroll-tailscale`: install with the official script if `tailscale` is missing. Enrollment
   itself stays with kd (see the sequence), because it needs the login URL relayed to the terminal.
+
+### Routers
+
+Every bootstrap installs codex-lb (Codex) and CLIProxyAPI (Claude) and makes them the default for plain `codex` and
+`claude`, provided `docker info` succeeds as the user. When it does not (no systemd, so the system phase did not start
+Docker; or a session without the `docker` group yet), kd warns, skips the routers and leaves the clients native rather
+than failing: degraded targets stay supported and the probe's router checks show the gap. Once Docker works, any router
+step failure aborts bootstrap. This is Rust-owned, deterministic setup in `routers.rs`, run after Claude's onboarding
+repair, because the layout is a security contract rather than a preference, and because it generates secrets:
+
+- Host networking with the listener pinned to `127.0.0.1` (codex-lb by an explicit `--host` in its command, CLIProxyAPI
+  by `host` in its `config.yaml`). Both upstreams document Docker `ports:` publishing, which binds every interface and
+  bypasses UFW, putting the proxies on the public internet; do not "simplify" back to that. Host networking also makes
+  SSH-forwarded requests look like loopback, which both management layers rely on. OAuth callbacks (1455, 54545) only
+  listen during a login. CLIProxyAPI's binds every interface: UFW's default deny keeps it off the public interface (host
+  networking does not bypass UFW), but the `tailscale0` allow rule leaves it reachable from tailnet peers during a
+  login, and a host without UFW exposes it publicly for that window.
+- Images pinned by digest. CLIProxyAPI released almost daily at the time of writing; floating `latest` with
+  `pull_policy: always` (its upstream compose) would move a box onto whatever shipped that morning. kd owns both compose
+  files under `~/.config/codex-lb/` and `~/.config/cliproxy/` and rewrites them every run; a pin bump plus a rerun is
+  the upgrade path.
+- Named volumes `codex-lb-data` and `cliproxy-data`, created by kd and marked `external`, so `docker compose down -v`
+  cannot delete account logins. Everything accumulated inside them is left alone, including CLIProxyAPI's `config.yaml`,
+  which is seeded only when absent because its management UI edits it in place. The seed sets
+  `routing.session-affinity: true`: upstream defaults it off, which rotates accounts per request and discards Claude's
+  per-account prompt cache on every turn.
+- CLIProxyAPI's client key and management key are generated on the target into `~/.config/cliproxy/secrets.env` (0600)
+  once and reused; the seeded config is built from them. New keys are written only after the seed step accepted them. If
+  secrets.env is missing but the volume already has a config, the run fails with instructions instead of generating keys
+  the proxy would reject (the client key wired into Claude would then 401 on every request, on every rerun). They reach
+  the config, jq and curl through shell builtins, pipes and the environment, never argv.
+- Boot start comes from Docker's enabled service plus `restart: unless-stopped`; there is no kd systemd unit. A
+  deliberately stopped container stays stopped after a reboot.
+
+Client wiring:
+
+- Claude: `env.ANTHROPIC_BASE_URL` and `env.ANTHROPIC_AUTH_TOKEN` merged into `~/.claude/settings.json` with jq,
+  creating the file when Claude never wrote one. settings.json rather than a shell profile, because it applies however
+  Claude is launched. The file becomes 0600 because it now holds the key. The dotfiles installer's `JsonManaged` merges
+  only its own paths into this file and preserves `env` and the file mode, so the two coexist. Same safety rules as the
+  onboarding repair: symlinks, invalid JSON, a non-object root or a non-object `env` fail; a wired file is left
+  byte-for-byte unchanged.
+- Codex: `model_provider = "codex-lb"` plus `[model_providers.codex-lb]` (`name = "openai"`,
+  `http://127.0.0.1:2455/backend-api/codex`, `wire_api = "responses"`, `requires_openai_auth = true`). The target has no
+  TOML writer, so kd reads the file over the transport, merges with `toml_edit`, and replaces the file with a rename
+  only if it changed. The read is framed by a sentinel line, because the transport's `bash -lc` lets profile scripts
+  write to stdout. Replaced values keep their spacing and trailing comments, so a wired file is a byte-identical no-op;
+  an inline `model_providers = { ... }` is converted to a standard table. The display name stays `openai` because other
+  names lost remote compaction through codex-lb during the manual setup. `model` and effort are untouched.
+- OpenCode is not wired: a custom provider needs a hardcoded model catalog and default model, which is model pinning
+  that rots. Hermes is not touched.
+
+Bypasses, used by the agent phases, the onboarding check and the probe: Codex `-c 'model_provider="openai"'`; Claude
+`--settings '{"env":{"ANTHROPIC_BASE_URL":"","ANTHROPIC_AUTH_TOKEN":""}}'`. `env -u` does not work for Claude because
+settings.json `env` wins over the process environment. The onboarding check needs the bypass too: with the proxy token
+set, `claude auth status` reports `loggedIn: true` via `oauth_token` even when the copied claude.ai login is broken.
+Both bypasses were verified on 2026-09-24 by confirming that no request reached the router.
 
 ### Transport
 
@@ -225,6 +286,10 @@ On the target, all under the user's home:
 - `~/.kd-github-token`: the GitHub token, deleted by the agent once `gh` has it.
 - `~/.kd-hermes-backup.zip`: the archive to import.
 - `~/.kd-agent-last-message.md`: the agent's final message, one per phase, overwritten.
+- `~/.config/codex-lb/compose.yaml`, `~/.config/cliproxy/compose.yaml`: kd-owned, rewritten every run.
+- `~/.config/cliproxy/secrets.env`: CLIProxyAPI's client and management keys, generated once, never regenerated.
+- Docker volumes `codex-lb-data` and `cliproxy-data`: router state; not backed up.
+- Fixed router ports on 127.0.0.1: codex-lb 2455 and OAuth 1455; CLIProxyAPI 8317 and Claude OAuth 54545.
 - `~/.config/systemd/user/hermes-dashboard.service`: the dashboard unit restore writes. `suspend` and `resume` use
   `hermes gateway stop` / `hermes gateway start` for the gateway and `hermes dashboard --stop` to stop the dashboard,
   because the source may have a hand-written unit from before kd existed. Suspend also stops the known dashboard unit
@@ -285,13 +350,16 @@ On the controller:
    rather than placing them in a prompt. Repeat after the agent because dotfiles installation can replace Git config.
    Verify the effective global values after each transfer; a write or verification failure aborts bootstrap.
    Repository-local identities and unrelated Git settings are not changed.
-9. Tailscale (only with `--enroll-tailscale`): the agent installed it in the user-space phase; kd runs
-   `sudo tailscale up --timeout 10m` with output streamed so the login URL reaches the terminal. `tailscale up` blocks
-   until the browser login completes or the timeout expires, which is the whole wait; a nonzero exit is an error. The
-   hostname defaults to the OS hostname; no `--ssh`, no tags, not ephemeral. Skipped when `tailscale status --json`
-   already reports `Running`: on an enrolled node `tailscale up` refuses unless every non-default flag from the original
-   enrollment is repeated, which would fail every rerun.
-10. Probe script over SSH, output printed as is, then both agents' final messages. Exit 0.
+9. Claude onboarding repair, then routers: service setup, Claude settings merge, Codex config merge. Any failure aborts
+   bootstrap.
+10. Tailscale (only with `--enroll-tailscale`): the agent installed it in the user-space phase; kd runs
+    `sudo tailscale up --timeout 10m` with output streamed so the login URL reaches the terminal. `tailscale up` blocks
+    until the browser login completes or the timeout expires, which is the whole wait; a nonzero exit is an error. The
+    hostname defaults to the OS hostname; no `--ssh`, no tags, not ephemeral. Skipped when `tailscale status --json`
+    already reports `Running`: on an enrolled node `tailscale up` refuses unless every non-default flag from the
+    original enrollment is repeated, which would fail every rerun.
+11. Probe script over SSH, output printed as is, then both agents' final messages, then the router login instructions
+    with the fixed tunnel ports. Exit 0.
 
 ### Probe
 
@@ -302,8 +370,13 @@ directories equals the size of the manifest deduplicated with `scode/voice` and 
 `ssh -o BatchMode=yes localhost true`; `docker ps`; `tl --version` (no cloud credentials needed); and, on restores, a
 gateway process check (absent on rehearsal, present otherwise) plus `curl -fsS 127.0.0.1:9119/api/status` outside
 rehearsals. `tailscale status` is checked only with `--enroll-tailscale`. One real request per agent CLI:
-`codex exec --skip-git-repo-check "reply ok"`, `claude -p ok`, `opencode run ok`, `muse exec ok`. Every check is
-reported; none is fatal.
+`codex exec --skip-git-repo-check -c 'model_provider="openai"' "reply ok"`, `claude --settings '<bypass>' -p ok`,
+`opencode run ok`, `muse exec ok`. Codex and Claude bypass the routers because a fresh box's routers have no accounts;
+these lines check the copied credentials. Router checks: codex-lb `/health`; CLIProxyAPI returns 401 on `/v1/models`
+without a key and succeeds with the client key (passed to curl as a config file on stdin); `ss` shows both router ports
+listening and every listener on `127.0.0.1`; Claude settings carry the router URL and the current client key from
+secrets.env; Codex's effective provider (after any active `profile`) is `codex-lb` and its `base_url` is the router's.
+Account presence is not checked. Every check is reported; none is fatal.
 
 Timezone checks compare `/etc/localtime` with the named zoneinfo file using `cmp`, check `/etc/timezone` if present, and
 query `timedatectl` when `/run/systemd/system` exists. None can mask another's failure. Comparing zoneinfo data covers
@@ -333,16 +406,27 @@ informational; colocated jj repos are just git repos for this purpose.
 
 Unit tests cover profile parsing, bootstrap plan selection, CLI constraints, transport command lines, service-control
 scripts and conditional prompt/probe content. Full prompt snapshots are unnecessary; tests focus on mode boundaries.
-Executable shell tests cover deterministic repairs using isolated files and child-process environments. Manual
-integration testing uses an explicitly authorized target; it need not be a ubiworker. Follow
-[DEVBOX_TESTING.md](DEVBOX_TESTING.md) for commands and evidence expectations. Consistent backup testing suspends the
-source first; a live backup is a separate best-effort case. Scratch bootstrap needs no source or backup.
+Executable shell tests cover deterministic repairs using isolated files and child-process environments. The router
+service script runs against a stub `docker` that records its arguments; the Claude settings merge runs with real jq; the
+Codex merge and the probe's loopback check are tested against fixture configs and fake `ss` output. Manual integration
+testing uses an explicitly authorized target; it need not be a ubiworker. Follow [DEVBOX_TESTING.md](DEVBOX_TESTING.md)
+for commands and evidence expectations. Consistent backup testing suspends the source first; a live backup is a separate
+best-effort case. Scratch bootstrap needs no source or backup.
 
 Rerunning against an existing target tests convergence; a fresh target tests first-run assumptions. Both execute the
 whole bootstrap, and a restore rerun reimports its archive. Running one exact generated script over SSH tests that
 component, not the phase ordering or the complete bootstrap. Record which level was actually exercised.
 
 ### Known gaps
+
+- Router setup was developed against a manually installed production host and verified there only by running the probe
+  and a compose `--dry-run` (no container recreate); a scratch bootstrap is the first end-to-end run. Router accounts,
+  failover and long sessions are outside what bootstrap validates.
+- Router images come from ghcr.io and Docker Hub (anonymous pulls, rate limited). A registry failure aborts bootstrap
+  before the probe; fix or wait, then rerun.
+- If the controller's SSH config multiplexes connections (`ControlMaster`/`ControlPersist`) and no reboot happened, a
+  master opened before the system phase added the user to `docker` keeps the old groups. `docker info` then fails and
+  the routers are skipped with a warning; rerun on a fresh connection.
 
 - Test targets and destination providers may offer different Ubuntu releases. Record the release used; success on one
   image does not establish compatibility with another. The agent absorbs installer drift.

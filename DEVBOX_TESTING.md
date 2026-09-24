@@ -104,6 +104,12 @@ headless request. Reaching a workspace-trust prompt can prove the login wizard w
 starting work. Close test sessions afterwards. Do not kill the user's sessions or race an active CLI's config writes;
 coordinate closure when the operation requires it.
 
+For router work, remember the probe checks health, loopback-only listeners, the CLIProxyAPI key gate and client wiring,
+but not accounts: a fresh box's plain `codex` and `claude` fail until someone logs accounts in through the printed
+tunnel. Proving routing needs that login plus a request through each default CLI, which is a separate, user-driven step.
+On a host whose routers already serve real sessions, a changed compose file can make a rerun recreate a container and
+cut active streams; check `docker compose ... up -d --dry-run` first when that matters.
+
 For timezone work, inspect localtime data, any legacy timezone file, systemd and relevant environment overrides;
 checking today's offset alone misses daylight-saving errors. For Git author work, verify the intended user's global
 defaults and remember that repository-local or environment overrides may select another identity for a particular

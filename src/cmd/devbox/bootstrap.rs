@@ -17,7 +17,7 @@
 
 use super::{
     BootstrapArgs, agent, claude, confirm, git_identity::GitIdentity, home_dir, probe, profile,
-    prompts, secrets, transport::Transport, wait_for_enter,
+    prompts, routers, secrets, transport::Transport, wait_for_enter,
 };
 use anyhow::{Context, bail};
 use std::io::BufRead;
@@ -147,6 +147,12 @@ pub fn run(args: BootstrapArgs) -> anyhow::Result<()> {
     // first-run gate. Repair only that gate after the installer has finished.
     claude::complete_onboarding(&run.t)?;
 
+    // Routers come after the onboarding check, whose `claude auth status`
+    // must describe the native login, and after the phases that install
+    // Docker and jq. Wiring switches the default CLIs to routers with no
+    // accounts yet, so everything later (the probe) bypasses them.
+    let routers_installed = routers::install(&run.t)?;
+
     // 9. Tailscale, only when requested. The agent installed it; kd enrolls,
     // because the login URL has to reach this terminal.
     if args.enroll_tailscale {
@@ -168,6 +174,16 @@ pub fn run(args: BootstrapArgs) -> anyhow::Result<()> {
     println!("\n== probe on {}\n{}", run.t.destination, report.trim_end());
     println!("\n== system phase report\n{}", system_report.trim_end());
     println!("\n== user-space phase report\n{}", user_report.trim_end());
+    if routers_installed {
+        println!(
+            "\n== router login\n{}",
+            routers::login_help(&run.t.destination)
+        );
+    } else {
+        println!(
+            "\n== routers\nNot installed: Docker was not usable. Codex and Claude stay on their native logins."
+        );
+    }
     if rehearsal {
         println!(
             "\nrehearsal done. The target holds real credentials; destroy it when you are finished."

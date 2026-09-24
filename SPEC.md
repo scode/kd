@@ -363,6 +363,28 @@ Terms used below:
   Homebrew is not an equivalent substitute. Bootstrap reruns the installer even when a Codex binary already exists, so
   rerunning bootstrap migrates the old direct-download installation too. The probe reports when another Codex
   installation takes precedence on PATH.
+- Every bootstrap installs two local subscription routers as Docker Compose services and makes them the default for
+  plain `codex` and `claude` on the target: codex-lb for Codex and CLIProxyAPI for Claude. A target where Docker is not
+  usable by the user gets a warning instead; routers are skipped and the clients stay native. Both listen on loopback
+  only, on fixed ports: codex-lb on 2455 (dashboard and proxy) with its ChatGPT OAuth callback on 1455, CLIProxyAPI on
+  8317 (proxy and management UI) with its Claude OAuth callback on 54545. The ports never change between runs, so a
+  controller-side tunnel script can hardcode them. A fresh target ends with healthy routers that hold no accounts;
+  bootstrap does not log accounts in. It ends by printing the SSH tunnel command forwarding all four ports and where to
+  log in. Until accounts exist, plain `codex` and `claude` requests on the target fail; the bypasses are
+  `codex -c 'model_provider="openai"'` and
+  `claude --settings '{"env":{"ANTHROPIC_BASE_URL":"","ANTHROPIC_AUTH_TOKEN":""}}'`, which use the copied native logins.
+  Bootstrap's own setup agent and the probe's requests always use those bypasses.
+- Router client wiring changes only what it needs. Claude gets `env.ANTHROPIC_BASE_URL` and `env.ANTHROPIC_AUTH_TOKEN`
+  in `~/.claude/settings.json` (created if missing, then mode `0600` because it holds the proxy key); Codex gets
+  `model_provider = "codex-lb"` and a `[model_providers.codex-lb]` table in `~/.codex/config.toml` (created if missing).
+  Other settings, including the Codex model and reasoning effort, are preserved. If `~/.config/cliproxy/secrets.env` is
+  lost while the `cliproxy-data` volume keeps its config, bootstrap fails and says how to recover rather than generating
+  keys the proxy would reject. Symlinked or unmergeable files fail bootstrap rather than being replaced. OpenCode and
+  Hermes are not pointed at the routers.
+- Reruns keep router state: accounts, settings and history in the `codex-lb-data` and `cliproxy-data` volumes,
+  CLIProxyAPI's `config.yaml`, and its generated keys in `~/.config/cliproxy/secrets.env`. Compose files and image pins
+  are kd's and are rewritten on every run, so a rerun with a newer kd can upgrade a router. codex-lb database migrations
+  may make that one-way. Router state is not backed up or migrated; a new box needs its accounts logged in again.
 - Timezone setup uses `America/Los_Angeles` zoneinfo, including daylight-saving transitions, rather than a fixed UTC
   offset. `/etc/localtime` must match that zone's data, and `/etc/timezone`, when present, must name the same zone.
   Releases that no longer use `/etc/timezone` need not create it. A running systemd host must report the same timezone;
@@ -374,11 +396,13 @@ Terms used below:
   state the previous attempt accumulated. Outside a rehearsal, its gateway and loopback-only dashboard are enabled and
   started.
 - Ends with a probe report printed as is: hostname, timezone, `gh auth status`, repo count against the manifest,
-  `ssh localhost`, Docker as the user, Tensorlake CLI availability, Claude's onboarding flag, and one real request
-  through each agent CLI. Restores additionally check Hermes gateway state and, outside rehearsals, dashboard
-  reachability. Tailscale is checked only with `--enroll-tailscale`. Probe failures are reported, never fatal: bootstrap
-  exits 0 once the probe has run. After the probe, each agent phase's final message is printed whole, which is where the
-  agent lists anything it had to work around, even when the run succeeded.
+  `ssh localhost`, Docker as the user, Tensorlake CLI availability, Claude's onboarding flag, one real request through
+  each agent CLI (Codex and Claude past the routers), router health, loopback-only router listeners, CLIProxyAPI's
+  client-key check, and the Codex and Claude router wiring. It does not check router accounts. Restores additionally
+  check Hermes gateway state and, outside rehearsals, dashboard reachability. Tailscale is checked only with
+  `--enroll-tailscale`. Probe failures are reported, never fatal: bootstrap exits 0 once the probe has run. After the
+  probe, each agent phase's final message is printed whole, which is where the agent lists anything it had to work
+  around, even when the run succeeded.
 - After a rehearsal the worker is left running for inspection with a reminder that it holds real credentials; `kd` does
   not destroy it.
 - Manually starting restored services after a rehearsal leaves the rehearsal's safety conditions. If the source is still
@@ -388,4 +412,5 @@ Terms used below:
 - If there is no terminal, the GitHub token is read as one plain line from stdin instead of the hidden prompt, so a
   scripted real run can pipe `y` for the fingerprint and then the token.
 - Not in scope: triggering the reinstall through a provider API, Hermes version pinning or same-version restore, archive
-  retention, deleting Tailscale devices, migrating anything beyond the Hermes archive and the four agent auth files.
+  retention, deleting Tailscale devices, migrating anything beyond the Hermes archive and the four agent auth files,
+  logging router accounts in, backing up router state.

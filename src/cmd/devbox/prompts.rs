@@ -8,8 +8,10 @@
 //!
 //! Every prompt carries the same frame: no one will answer questions, reruns
 //! must be safe, systemd may be absent, repositories are data, secrets are
-//! never printed, and the final message ends with a "Workarounds" section
-//! kd prints verbatim.
+//! never printed, kd's routers and their client wiring are off limits, and
+//! the final message ends with a "Workarounds" section kd prints verbatim.
+
+use super::routers::{CLAUDE_NATIVE_SETTINGS, CODEX_NATIVE_OVERRIDE};
 
 /// The two repos the dotfiles installer depends on, cloned whether or not
 /// the manifest lists them. Deliberately compiled in; see SPEC.md.
@@ -24,6 +26,17 @@ pub const HERMES_ARCHIVE_FILE: &str = ".kd-hermes-backup.zip";
 /// in the user phase. Keep the seeded distribution in use across all of them:
 /// finding some executable named codex does not establish this contract.
 const CODEX_INSTALL_POLICY: &str = "Codex is already installed with its official shell installer at `~/.local/bin/codex`. Preserve that installation; do not replace it with Homebrew, npm, or manually downloaded binaries. QR-code remote control requires running the official installation. Keep `~/.local/bin` ahead of Homebrew and npm in the login shell's PATH, including after installing dotfiles. At the end of this phase, verify in a fresh `bash -lc` that `test \"$(command -v codex)\" -ef \"$HOME/.local/bin/codex\"` succeeds; repair PATH if it does not. This overrides the general package-source preference.";
+
+/// kd installs the routers and rewires the CLIs after the user-space phase,
+/// so on a first run neither phase sees them. A rerun does: plain `claude`
+/// and `codex` then go through routers that may hold no accounts, and an
+/// agent that "repairs" the failing CLI by editing their config undoes kd's
+/// wiring. Both phases get this, since the system phase manages Docker.
+fn router_policy() -> String {
+    format!(
+        "This machine may already run two local subscription routers from an earlier bootstrap: Docker Compose services `codex-lb` and `cliproxy` (configs in `~/.config/codex-lb` and `~/.config/cliproxy`, volumes `codex-lb-data` and `cliproxy-data`). The caller manages them and the client settings that point at them: `env` in `~/.claude/settings.json`, and `model_provider` plus `[model_providers.codex-lb]` in `~/.codex/config.toml`. Do not modify, stop, remove, or recreate any of these; leave existing Docker containers and volumes alone. The routers may have no accounts yet, so plain `claude` and `codex` requests can fail on a rerun. That is expected, not something to fix. When you test Claude or Codex, bypass the routers: `claude --settings '{CLAUDE_NATIVE_SETTINGS}' -p ...` and `codex exec {CODEX_NATIVE_OVERRIDE} ...`."
+    )
+}
 
 /// The user-space phase: everything that needs a secret, run after kd has
 /// placed credentials and, only on a restore, the Hermes archive. Service
@@ -70,6 +83,8 @@ This is the USER-SPACE PHASE of a devbox bootstrap. Files kd placed for you, all
 
 {CODEX_INSTALL_POLICY}
 
+{router_policy}
+
 Do these, in order:
 
 1. CLIs, using the package-source preference below: gh, jj (Jujutsu), cargo-dist, git-cliff, sccache, trunk, dioxus (`dx`), dprint, herdr, vercel, Claude Code (its own installer), OpenCode (its own installer), Muse Code (`muse`, its own installer). Of the Rust ones, cargo-dist, git-cliff, sccache, trunk and dprint have Homebrew formulae with Linux bottles; install those with `brew install`, and fall back to `cargo install` only for one whose formula turns out to be missing. dioxus has no Homebrew formula (do not try `brew install dioxus` or `dioxus-cli`); install it with `cargo install dioxus-cli`. Homebrew is at `/home/linuxbrew/.linuxbrew`; `brew` may need its shellenv sourced first. Every CLI must end up on the login shell's PATH; verify each with `command -v` in a fresh `bash -lc`.
@@ -90,6 +105,7 @@ Rules: do not modify the contents of any git repository beyond cloning and `jj g
 
 Your final message must end with a section titled `## Workarounds` listing every step that failed, was skipped, or needed a workaround, with what you did. If there were none, that section is the single line `no workarounds`."#,
         manifest = manifest.join("\n"),
+        router_policy = router_policy(),
     )
 }
 
@@ -102,6 +118,8 @@ pub fn system_phase(hostname: &str, user: &str) -> String {
 This is the SYSTEM PHASE of a devbox bootstrap. Do these, in order:
 
 {CODEX_INSTALL_POLICY}
+
+{router_policy}
 
 1. `apt-get update` and `apt-get full-upgrade`, non-interactively (DEBIAN_FRONTEND=noninteractive). If the dpkg lock is held by a boot-time upgrade, wait for it rather than failing. Do NOT reboot even if the upgrade asks for one; the caller handles reboots.
 2. Set the hostname to `{hostname}` and the timezone to `America/Los_Angeles`. On a running systemd host use `timedatectl set-timezone America/Los_Angeles`; without systemd, symlink `/etc/localtime` to `/usr/share/zoneinfo/America/Los_Angeles`. Verify `/etc/localtime` matches that zone's data, including its daylight-saving rules. If `/etc/timezone` exists, keep it consistent too: on Ubuntu 24.04 `timedatectl` does not maintain that legacy file, even when it changes the timezone. After setting `/etc/localtime`, run `sudo -n dpkg-reconfigure -f noninteractive tzdata` to synchronize tzdata's configuration and `/etc/timezone`, then verify both. Do not create `/etc/timezone` on releases that no longer use it. Do not set a fixed UTC offset or add a `TZ` environment override; report any existing conflicting override rather than silently changing user settings.
@@ -119,7 +137,8 @@ If this machine has no systemd (no `systemctl`; a container or a cloud sandbox),
 
 Rules: do not modify the contents of any git repository. Do not read files under the home directory that you do not need. Do not print secrets or credentials. Do not touch anything outside this machine.
 
-Your final message must end with a section titled `## Workarounds` listing every step that failed, was skipped, or needed a workaround, with what you did. If there were none, that section is the single line `no workarounds`."#
+Your final message must end with a section titled `## Workarounds` listing every step that failed, was skipped, or needed a workaround, with what you did. If there were none, that section is the single line `no workarounds`."#,
+        router_policy = router_policy(),
     )
 }
 
@@ -145,5 +164,20 @@ mod tests {
         let enrolled = user_space_phase("user", &[], false, false, true);
         assert!(enrolled.contains("Install Tailscale with its official"));
         assert!(!enrolled.contains(HERMES_ARCHIVE_FILE));
+    }
+
+    /// Reruns meet routers that may have no accounts. Both phases must be
+    /// told to leave the router wiring alone and how to test CLIs past it,
+    /// or an agent "fixes" the failing default CLI by undoing kd's setup.
+    #[test]
+    fn both_phases_protect_router_wiring_and_name_the_bypasses() {
+        for prompt in [
+            system_phase("box", "user"),
+            user_space_phase("user", &[], false, false, false),
+        ] {
+            assert!(prompt.contains("Do not modify, stop, remove, or recreate"));
+            assert!(prompt.contains(CLAUDE_NATIVE_SETTINGS));
+            assert!(prompt.contains(CODEX_NATIVE_OVERRIDE));
+        }
     }
 }
