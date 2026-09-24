@@ -103,7 +103,7 @@ agent's problem; an explicitly chosen upstream installer overrides the general p
 - SSH: key-only, `PermitRootLogin no`, `PasswordAuthentication no`. Validate with `sshd -t` before restarting.
 - UFW: default deny inbound, allow OpenSSH, `ufw allow in on tailscale0`, enable.
 - Unattended security upgrades with automatic reboot disabled.
-- Base packages: build tools, curl, git, jq, ripgrep, tmux, tree, shellcheck, unzip, ca-certificates, `emacs-nox`.
+- Base packages: build tools, curl, git, jq, ripgrep, tmux, tree, shellcheck, unzip, ca-certificates, `emacs-nox`, `mg`.
 - Media and browser dependencies: ImageMagick, ffmpeg, Xvfb, Playwright's system dependencies, GTK/WebKit runtime
   packages.
 - Docker Engine and the Compose plugin, with the user in the `docker` group.
