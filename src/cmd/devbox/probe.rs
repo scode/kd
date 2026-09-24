@@ -11,6 +11,7 @@
 //! kd accepts (see SPEC_impl.md): a rotted probe line shows up as a failed
 //! probe item, never as a failed run.
 
+use super::routers::{CLAUDE_NATIVE_SETTINGS, CLIPROXY_PORT, CODEX_LB_PORT, CODEX_NATIVE_OVERRIDE};
 use super::transport::{Transport, shell_quote};
 use std::path::Path;
 
@@ -79,18 +80,90 @@ pub fn script(
         "codex installation",
         "test \"$(command -v codex)\" -ef \"$HOME/.local/bin/codex\"",
     );
+    // Requests bypass the routers: on a fresh box they have no accounts yet,
+    // so these lines check the credentials kd copied, not the routers.
     check(
         "codex request",
-        "codex exec --skip-git-repo-check 'reply ok' >/dev/null 2>&1",
+        &format!(
+            "codex exec --skip-git-repo-check {CODEX_NATIVE_OVERRIDE} 'reply ok' >/dev/null 2>&1"
+        ),
     );
-    check("claude request", "claude -p ok >/dev/null 2>&1");
+    check(
+        "claude request",
+        &format!(
+            "claude --settings {} -p ok >/dev/null 2>&1",
+            shell_quote(CLAUDE_NATIVE_SETTINGS)
+        ),
+    );
     check(
         "claude onboarding",
         "jq -e '.hasCompletedOnboarding == true' \"$HOME/.claude.json\" >/dev/null",
     );
     check("opencode request", "opencode run ok >/dev/null 2>&1");
     check("muse request", "muse exec ok >/dev/null 2>&1");
+    for (name, command) in router_checks() {
+        check(name, &command);
+    }
     s
+}
+
+/// Router checks cover what bootstrap can promise before any login: both
+/// services answer, nothing listens beyond loopback, CLIProxyAPI rejects
+/// requests without its client key and accepts them with it, and both CLIs
+/// are wired to the routers. None of them needs an account; whether the
+/// routers hold any is the user's post-bootstrap login, not a probe item.
+fn router_checks() -> [(&'static str, String); 5] {
+    [
+        (
+            "codex-lb health",
+            format!("curl -fsS http://127.0.0.1:{CODEX_LB_PORT}/health"),
+        ),
+        (
+            // The key goes to curl as a config file on stdin, never argv.
+            "cliproxy key gate",
+            format!(
+                "url=http://127.0.0.1:{CLIPROXY_PORT}/v1/models; \
+                 [ \"$(curl -s -o /dev/null -w '%{{http_code}}' \"$url\")\" = 401 ] && \
+                 key=$(sed -n 's/^CLIPROXY_CLIENT_KEY=//p' \"$HOME/.config/cliproxy/secrets.env\") && \
+                 [ -n \"$key\" ] && \
+                 printf 'header = \"Authorization: Bearer %s\"\\n' \"$key\" | curl -fsS -K - \"$url\""
+            ),
+        ),
+        (
+            // A router on a public interface would be reachable from the
+            // internet; that must be a visible failure, not a silent pass.
+            "router listeners loopback-only",
+            format!(
+                "out=$(ss -ltnH '( sport = :{CODEX_LB_PORT} or sport = :{CLIPROXY_PORT} )') && \
+                 [ \"$(printf '%s\\n' \"$out\" | grep -c .)\" -ge 2 ] && \
+                 ! printf '%s\\n' \"$out\" | awk '{{print $4}}' | grep -qv '^127\\.0\\.0\\.1:'"
+            ),
+        ),
+        (
+            // Both keys: a stale token (say, secrets.env regenerated) would
+            // otherwise pass here while every real request gets a 401. The
+            // key reaches jq through the environment, not argv.
+            "claude uses cliproxy",
+            format!(
+                "KD_KEY=$(sed -n 's/^CLIPROXY_CLIENT_KEY=//p' \"$HOME/.config/cliproxy/secrets.env\") && \
+                 [ -n \"$KD_KEY\" ] && export KD_KEY && \
+                 jq -e '.env.ANTHROPIC_BASE_URL == \"http://127.0.0.1:{CLIPROXY_PORT}\" and .env.ANTHROPIC_AUTH_TOKEN == $ENV.KD_KEY' \"$HOME/.claude/settings.json\""
+            ),
+        ),
+        (
+            // An active `profile` can override the top-level provider, and
+            // a wrong base_url routes past codex-lb; check what Codex will
+            // actually use, not just the key kd wrote.
+            "codex uses codex-lb",
+            format!(
+                "python3 -c 'import tomllib, os
+c = tomllib.load(open(os.path.expanduser(\"~/.codex/config.toml\"), \"rb\"))
+profile = c.get(\"profiles\", {{}}).get(c.get(\"profile\"), {{}})
+assert profile.get(\"model_provider\", c.get(\"model_provider\")) == \"codex-lb\"
+assert c[\"model_providers\"][\"codex-lb\"][\"base_url\"] == \"http://127.0.0.1:{CODEX_LB_PORT}/backend-api/codex\"'"
+            ),
+        ),
+    ]
 }
 
 /// Check each timezone source independently: a correct systemd label must
@@ -154,6 +227,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
     use std::process::Command;
 
     /// Evaluate the real probe commands against a miniature filesystem. The
@@ -315,6 +389,129 @@ mod tests {
             assert!(!s.contains("'dashboard'"));
             assert_eq!(s.contains("'tailscale'"), enroll);
         }
+    }
+
+    /// Router checks are hand-escaped shell inside Rust strings; a quoting
+    /// slip there would turn into a probe line that always fails. Parse the
+    /// whole rendered probe, and each router check as the inner `bash -c`
+    /// will, before any box ever runs them.
+    #[test]
+    fn rendered_probe_and_router_checks_are_valid_bash() {
+        let parses = |script: &str| {
+            Command::new("bash")
+                .args(["-n", "-c", script])
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(parses(&script("devbox", 1, false, true, true)));
+        for (name, command) in router_checks() {
+            assert!(parses(&command), "{name}: {command}");
+        }
+    }
+
+    /// The loopback check exists to catch a router exposed on a public
+    /// interface, and a check that cannot fail proves nothing. Feed it fake
+    /// `ss` output: both routers on loopback passes; a wildcard or public
+    /// listener, a missing router, or an `ss` failure must all fail.
+    #[test]
+    fn loopback_check_fails_on_public_or_missing_listeners() {
+        let (_, command) = router_checks()
+            .into_iter()
+            .find(|(name, _)| *name == "router listeners loopback-only")
+            .unwrap();
+        let run = |listeners: &str, status: i32| {
+            let dir = tempfile::tempdir().unwrap();
+            let ss = dir.path().join("ss");
+            fs::write(
+                &ss,
+                format!(
+                    "#!/bin/sh
+printf '%s' {}
+exit {status}
+",
+                    shell_quote(listeners)
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&ss, fs::Permissions::from_mode(0o700)).unwrap();
+            let path = std::env::join_paths(
+                std::iter::once(dir.path().to_owned())
+                    .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+            )
+            .unwrap();
+            Command::new("bash")
+                .args(["-c", &command])
+                .env("PATH", path)
+                .status()
+                .unwrap()
+                .success()
+        };
+        let line = |addr: &str| format!("LISTEN 0 4096 {addr} 0.0.0.0:*\n");
+        let both = line("127.0.0.1:2455") + &line("127.0.0.1:8317");
+        assert!(run(&both, 0));
+        assert!(!run(&(line("127.0.0.1:2455") + &line("0.0.0.0:8317")), 0));
+        assert!(!run(&(both.clone() + &line("[::]:8317")), 0));
+        assert!(!run(&line("127.0.0.1:2455"), 0));
+        assert!(!run(&both, 1));
+    }
+
+    /// Run one named router check with `HOME` pointed at a fixture home.
+    fn router_check_passes(name: &str, home: &Path) -> bool {
+        let (_, command) = router_checks()
+            .into_iter()
+            .find(|(n, _)| *n == name)
+            .unwrap();
+        Command::new("bash")
+            .args(["-c", &command])
+            .env("HOME", home)
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    /// The wiring checks must fail when the wiring is subtly wrong, not only
+    /// when it is absent: a stale Claude token, a Codex profile overriding
+    /// the provider, or a provider pointing somewhere other than codex-lb.
+    #[test]
+    fn wiring_checks_catch_stale_tokens_profiles_and_wrong_urls() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        for sub in [".config/cliproxy", ".claude", ".codex"] {
+            fs::create_dir_all(home.join(sub)).unwrap();
+        }
+        fs::write(
+            home.join(".config/cliproxy/secrets.env"),
+            "CLIPROXY_CLIENT_KEY=sk-cpa-live\n",
+        )
+        .unwrap();
+        let claude = |token: &str| {
+            fs::write(
+                home.join(".claude/settings.json"),
+                format!(
+                    r#"{{"env":{{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8317","ANTHROPIC_AUTH_TOKEN":"{token}"}}}}"#
+                ),
+            )
+            .unwrap();
+            router_check_passes("claude uses cliproxy", home)
+        };
+        assert!(claude("sk-cpa-live"));
+        assert!(!claude("sk-cpa-stale"));
+
+        let wired = "model_provider = \"codex-lb\"\n[model_providers.codex-lb]\nbase_url = \"http://127.0.0.1:2455/backend-api/codex\"\n";
+        let codex = |config: &str| {
+            fs::write(home.join(".codex/config.toml"), config).unwrap();
+            router_check_passes("codex uses codex-lb", home)
+        };
+        assert!(codex(wired));
+        assert!(codex(&format!(
+            "profile = \"p\"\n{wired}[profiles.p]\nmodel = \"m\"\n"
+        )));
+        assert!(!codex(&format!(
+            "profile = \"p\"\n{wired}[profiles.p]\nmodel_provider = \"openai\"\n"
+        )));
+        assert!(!codex(&wired.replace("2455", "9999")));
+        assert!(!codex(&wired.replace("\"codex-lb\"\n[", "\"openai\"\n[")));
     }
 
     /// Expected values are rendered in, which is why the script is a
