@@ -2,6 +2,8 @@
 name = "kd"
 version = "0.1.0"
 edition = "2024"
+# Edition 2024 needs 1.85; install.sh checks the same floor before building.
+rust-version = "1.85"
 
 [dependencies]
 anyhow = "1"

@@ -2,6 +2,28 @@
 
 This file records intentional behavior that is easy to mistake for a bug during review.
 
+## install.sh
+
+The curl one-liner in the README pipes `install.sh` to bash. It is the only supported way to install kd on a machine
+without it, and it must work unattended on a fresh macOS or Linux machine that has a C toolchain.
+
+- Refuses early, with the fix, when there is no C toolchain: Xcode Command Line Tools on macOS, `cc` on Linux (rustc's
+  linker).
+- If `cargo --version` fails, installs rust with the official rustup one-liner and `-y` (rustup's defaults, including
+  its shell-profile edits), then loads rustup's environment into its own shell.
+- kd needs rust 1.85 or newer (`rust-version` in `Cargo.toml`). An older rust makes it install current stable with
+  rustup for this build only, without changing the default toolchain, or stop with an explanation when there is no
+  rustup.
+- Installs kd with `cargo install --locked --force --git https://github.com/scode/kd kd`: the same recorded source as
+  `kd cargo scode install kd`, so `kd cargo scode update` maintains it. Unlike that command it passes `--force`: it is
+  the kd installer, so replacing an existing kd (typically one from the older checkout-based installer) is intended, and
+  every rerun rebuilds kd from the default branch. It does not write cargo-update's lock setting; `update` applies it
+  before it updates.
+- Ends with a banner when `kd` does not resolve to the installed binary (not on PATH, or shadowed by another `kd`
+  earlier on PATH), and, when it installed rust itself, a note that the current shell needs rustup's env file sourced or
+  a restart. The latter is printed even when a later step fails.
+- The whole script runs from a function called on its last line, so a truncated download executes nothing.
+
 ## ImageMagick-dependent tests
 
 The image resizing tests may skip themselves when the `magick` command is unavailable.

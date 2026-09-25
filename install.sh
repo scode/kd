@@ -3,178 +3,178 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/scode/kd/main/install.sh | bash
 #
-# What it does: preflight-check git and a C toolchain (clear errors beat a
-# cryptic failure at the final build step), reserve ~/git/kd (refusing to
-# touch anything that already exists there), offer to install rust via
-# homebrew or rustup if it's missing — asking interactively via /dev/tty,
-# which works even though the script itself arrives on stdin — then clone
-# this repo into ~/git/kd and `cargo install` it, warning at the end if the
-# installed binary isn't on PATH.
+# What it does: preflight-check for a C toolchain (clear errors beat a
+# cryptic failure at the final build step), install rust with the official
+# rustup one-liner if cargo isn't usable, make sure the toolchain is new
+# enough for kd, then install kd straight from GitHub the same way
+# `kd cargo scode install kd` does, and warn at the end if the installed
+# binary isn't what `kd` resolves to. Specified in SPEC.md (`## install.sh`).
 #
-# Uninstalling is two deletions; see the Install section of README.md.
+# Installing from the repository rather than a local checkout matters: it
+# records https://github.com/scode/kd as kd's source, which is what lets
+# `kd cargo scode update` (and cargo-update) update it later.
+#
+# Uninstalling: `kd cargo scode uninstall kd` or plain `cargo uninstall kd`.
 set -euo pipefail
 
-# $HOME underpins every path below. Without this, an unset HOME (stripped
-# container, service account) dies with nounset's raw "unbound variable"
-# instead of an actionable message like every other preflight here.
-: "${HOME:?HOME is not set; export HOME and retry}"
+# Oldest rust that builds kd: it uses edition 2024 (Rust 1.85). Keep in step
+# with `rust-version` in Cargo.toml.
+min_rust_minor=85
 
-# Preflight: the clone happens partway through, but check git up front —
-# failing after installing rust would waste that whole step, and a raw
-# "git: command not found" from deep in the script is a worse error than
-# this one.
-command -v git >/dev/null 2>&1 || {
-  echo "error: git not found in PATH; install git first" >&2
-  exit 1
+# Set once rustup has been installed by this run; the EXIT trap uses it to
+# tell the user their current shell still lacks rust, whether or not the
+# rest of the install succeeded.
+installed_rustup=no
+
+rust_env_hint() {
+  if [ "$installed_rustup" = yes ]; then
+    local home="${CARGO_HOME:-$HOME/.cargo}"
+    echo "" >&2
+    echo "rust was installed by this script. Your current shell does not have it on PATH yet:" >&2
+    echo "open a new shell, or run: . \"${home%/}/env\"   (fish: source \"${home%/}/env.fish\")" >&2
+  fi
 }
 
-# cargo needs a C linker at build time even for pure-rust dependencies, and
-# hitting that at the final step — after cloning and possibly installing
-# rust — is the worst place to find out. On macOS, /usr/bin/cc exists as a
-# stub even without the developer tools, so probe xcode-select instead.
-case "$(uname -s)" in
-  Darwin)
-    xcode-select -p >/dev/null 2>&1 || {
-      echo "error: Xcode Command Line Tools not installed; run: xcode-select --install" >&2
-      exit 1
-    }
-    ;;
-  *)
-    command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1 || command -v clang >/dev/null 2>&1 || {
-      echo "error: no C compiler/linker in PATH; install one (e.g. apt install build-essential)" >&2
-      exit 1
-    }
-    ;;
-esac
-
-# Reserve the target directory atomically. `mkdir` without -p both checks
-# and claims in one step, so there's no check-then-act gap for something to
-# slip a directory (or symlink — mkdir refuses dangling symlinks too, which
-# a plain -e test would miss) into ~/git/kd during the potentially long
-# rust-install detour below.
-dir="$HOME/git/kd"
-mkdir -p "$HOME/git" 2>/dev/null || {
-  echo "error: could not create $HOME/git (permissions on \$HOME? is $HOME/git a file?)" >&2
-  exit 1
+# Prints the rustc minor version (the 85 in 1.85.0), or nothing if rustc
+# can't be run or its output isn't understood. Only 1.x exists today.
+rustc_minor() {
+  rustc --version 2>/dev/null | sed -n 's/^rustc 1\.\([0-9][0-9]*\)\..*/\1/p'
 }
-if ! mkdir "$dir" 2>/dev/null; then
-  # mkdir can fail for reasons other than EEXIST (permissions, disk full);
-  # only claim "already exists" when that's actually what happened, so the
-  # remediation hint never points at the wrong problem. The hint quotes the
-  # path: it's meant to be copy-pasted, and an unquoted path with a space in
-  # $HOME would word-split into an rm -rf of the wrong thing.
-  if [ -e "$dir" ] || [ -L "$dir" ]; then
-    echo "error: $dir already exists; not touching it" >&2
-    echo "       (a leftover from a previously failed install can be removed with: rm -rf \"$dir\")" >&2
-  else
-    echo "error: could not create $dir (permissions on $HOME/git? disk full?)" >&2
-  fi
-  exit 1
-fi
-# If we die before the clone populates the reserved directory, remove it so
-# a rerun isn't refused over an empty husk. rmdir refuses to delete
-# non-empty directories, so once the clone lands this trap is a no-op and a
-# real checkout can never be swept up by it.
-trap 'rmdir "$dir" 2>/dev/null || true' EXIT
 
-# `cargo --version` rather than `command -v cargo`: a rustup shim with no
-# default toolchain resolves on PATH but can't build anything, and it's
-# better to catch that here — where rust installation is on offer — than at
-# the final build step.
-if ! cargo --version >/dev/null 2>&1; then
-  # No terminal means no way to ask which installer to use. Check before
-  # the prompt so a headless run (container, CI) gets a real message
-  # instead of a raw redirection error from the printf below.
-  if ! { : </dev/tty; } 2>/dev/null; then
-    echo "error: rust is missing and no terminal is available to ask how to install it;" >&2
-    echo "       install rust first, then re-run" >&2
-    exit 1
-  fi
-  printf 'rust not found in PATH. install via homebrew or rustup? [homebrew/rustup] ' >/dev/tty
-  # Guard the read: EOF on a tty that opened but has no input would
-  # otherwise kill the script (set -e) with zero output. Lowercase the
-  # answer so "Homebrew"/"RUSTUP" count as valid answers.
-  read -r choice </dev/tty || {
-    echo "error: could not read a response from the terminal" >&2
-    exit 1
-  }
-  choice=$(printf '%s' "$choice" | tr '[:upper:]' '[:lower:]')
-  case "$choice" in
-    homebrew | brew)
-      command -v brew >/dev/null 2>&1 || {
-        echo "error: brew not found in PATH" >&2
+main() {
+  # $HOME underpins every path below. Without this, an unset HOME (stripped
+  # container, service account) dies with nounset's raw "unbound variable"
+  # instead of an actionable message like every other preflight here.
+  : "${HOME:?HOME is not set; export HOME and retry}"
+
+  trap rust_env_hint EXIT
+
+  # cargo needs a C linker at build time even for pure-rust dependencies,
+  # and rustup does not provide one. Hitting that at the final step, after
+  # possibly installing rust, is the worst place to find out. On macOS,
+  # /usr/bin/cc exists as a stub even without the developer tools, so probe
+  # xcode-select instead. On Linux rustc invokes `cc` specifically, so a
+  # box with only `gcc` or `clang` under those names would still fail to
+  # link; require `cc` itself.
+  case "$(uname -s)" in
+    Darwin)
+      xcode-select -p >/dev/null 2>&1 || {
+        echo "error: Xcode Command Line Tools not installed; run: xcode-select --install" >&2
         exit 1
       }
-      # </dev/tty for symmetry with the other interactive spots: our stdin
-      # is the drained script pipe, and if brew ever decides to prompt it
-      # should reach a terminal, not EOF.
-      brew install rust </dev/tty
-      ;;
-    rustup)
-      # curl is a given when this script itself arrived via curl | bash,
-      # but not when it's run from a downloaded copy.
-      command -v curl >/dev/null 2>&1 || {
-        echo "error: curl not found in PATH" >&2
-        exit 1
-      }
-      # rustup's own installer reconnects /dev/tty the same way when piped,
-      # so it stays interactive here. pipefail (set at the top) is what
-      # makes a failed download abort this line instead of handing empty
-      # input to sh and "succeeding".
-      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-      # rustup honors a custom CARGO_HOME, so source the env file from
-      # wherever it actually landed.
-      # shellcheck source=/dev/null
-      . "${CARGO_HOME:-$HOME/.cargo}/env"
       ;;
     *)
-      echo "error: answer 'homebrew' or 'rustup'" >&2
-      exit 1
+      command -v cc >/dev/null 2>&1 || {
+        echo "error: no \`cc\` in PATH, which rust uses as its linker; install a C toolchain" >&2
+        echo "       (e.g. apt install build-essential), or link cc to your gcc/clang" >&2
+        exit 1
+      }
       ;;
   esac
 
-  # Two subtleties make this recheck necessary. First, bash caches command
-  # lookups: the failed `cargo` probe above can leave a stale (broken) path
-  # hashed, and the brew branch never reassigns PATH, which is what would
-  # implicitly flush it — so flush explicitly. Second, insisting cargo
-  # actually works now keeps a failed rust install from surfacing later as
-  # a cryptic error after the clone.
-  hash -r
-  cargo --version >/dev/null 2>&1 || {
-    echo "error: rust was installed but cargo still isn't usable in this shell;" >&2
-    echo "       open a new shell and re-run" >&2
-    exit 1
-  }
-fi
+  # `cargo --version` rather than `command -v cargo`: a rustup shim with no
+  # default toolchain resolves on PATH but can't build anything, and that
+  # is exactly the case the rustup installer below fixes (with no default
+  # toolchain, rustup-init installs stable even over an existing rustup).
+  if ! cargo --version >/dev/null 2>&1; then
+    # curl is a given when this script itself arrived via curl | bash, but
+    # not when it's run from a downloaded copy.
+    command -v curl >/dev/null 2>&1 || {
+      echo "error: cargo is not usable and curl is not in PATH to install rust with" >&2
+      exit 1
+    }
+    echo "cargo not usable; installing rust with rustup (https://rustup.rs)" >&2
+    # The official rustup.rs one-liner, with `-y` so the whole kd install is
+    # one unattended copy and paste: it accepts rustup's defaults (stable
+    # toolchain, default profile, PATH added to shell profiles). pipefail
+    # (set at the top) is what makes a failed download abort this line
+    # instead of handing empty input to sh and "succeeding".
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    installed_rustup=yes
+    # rustup's profile edits only affect new shells; load its environment
+    # into this one. rustup honors a custom CARGO_HOME, so source the env
+    # file from wherever it actually landed.
+    # shellcheck source=/dev/null
+    . "${CARGO_HOME:-$HOME/.cargo}/env"
+    # bash caches command lookups, and the failed `cargo` probe above can
+    # leave a stale path hashed; flush it. Then insist cargo works now, so a
+    # failed rust install stops here rather than as a cryptic build error.
+    hash -r
+    cargo --version >/dev/null 2>&1 || {
+      echo "error: rust was installed but cargo still isn't usable in this shell;" >&2
+      echo "       open a new shell and re-run" >&2
+      exit 1
+    }
+  fi
 
-git clone https://github.com/scode/kd.git "$dir"
-# --force: overwrite a stale kd binary from an earlier install (e.g. a
-# partial uninstall that removed the checkout but not the binary). Without
-# it cargo refuses, and the resulting error loop points at the checkout —
-# the wrong thing — as the blocker.
-cargo install --force --path "$dir"
+  # A working but old cargo (a distro package, a rustup stable nobody has
+  # updated in years) would otherwise fail deep in the build with an
+  # edition error. With rustup, install a current stable just for this
+  # build rather than changing the user's default toolchain; without it,
+  # say what's needed.
+  local toolchain=()
+  local minor
+  minor=$(rustc_minor)
+  if [ -z "$minor" ] || [ "$minor" -lt "$min_rust_minor" ]; then
+    if command -v rustup >/dev/null 2>&1; then
+      echo "rust is older than 1.$min_rust_minor; installing current stable with rustup for this build" >&2
+      rustup toolchain install stable --profile minimal
+      toolchain=(+stable)
+    else
+      echo "error: kd needs rust 1.$min_rust_minor or newer, found: $(rustc --version 2>/dev/null || echo unknown)" >&2
+      echo "       update rust (for example by installing it with rustup from https://rustup.rs) and re-run" >&2
+      exit 1
+    fi
+  fi
 
-# cargo puts the binary in $CARGO_HOME/bin (~/.cargo/bin by default). rustup
-# wires that into new shells via profile edits; `brew install rust` does
-# not, so make the missing-PATH case a banner the user can't miss instead of
-# letting a "successful" install end in a quiet `kd: command not found`.
-# Strip any trailing slash from a custom CARGO_HOME so the string compare
-# below can't be defeated by a cosmetic double slash.
-cargo_home="${CARGO_HOME:-$HOME/.cargo}"
-cargo_bin="${cargo_home%/}/bin"
-# Compare the resolved path, not mere existence: a different `kd` earlier
-# on PATH would otherwise shadow the fresh install silently, and the banner
-# is exactly what should catch that. (command -v failing is fine here — a
-# command substitution in an if-condition doesn't trip errexit, and empty
-# output correctly compares unequal.)
-if [ "$(command -v kd 2>/dev/null)" != "$cargo_bin/kd" ]; then
-  echo "" >&2
-  echo "==================================================================" >&2
-  echo "  ACTION NEEDED: kd was installed to $cargo_bin," >&2
-  echo "  but typing 'kd' does not resolve there. Please add the" >&2
-  echo "  following line to your ~/.bashrc or ~/.zshrc or equivalent:" >&2
-  echo "" >&2
-  echo "      export PATH=\"\$PATH:$cargo_bin\"" >&2
-  echo "" >&2
-  echo "==================================================================" >&2
-fi
+  # The equivalent of `kd cargo scode install kd` (see SPEC.md): same
+  # recorded source (plain HTTPS URL, no `.git`, branch, tag or commit, so
+  # kd tracks the default branch and later updates recognise it), and
+  # `--locked` so the build uses the dependency versions in the committed
+  # Cargo.lock. Two deliberate differences: `--force`, because this is the
+  # kd installer and replacing an existing kd binary (typically one from the
+  # older checkout-based installer, which cargo would otherwise refuse to
+  # overwrite) is the point of running it, so a rerun rebuilds kd from the
+  # current default branch; and no cargo-update lock setting, since
+  # cargo-update is usually not installed here and `kd cargo scode update`
+  # applies that setting itself before it updates.
+  # `${arr[@]+...}`: bash 3.2 (macOS /bin/bash) treats expanding an empty
+  # array under `set -u` as an unbound variable, and `toolchain` is empty
+  # on the normal path.
+  cargo ${toolchain[@]+"${toolchain[@]}"} install --locked --force --git https://github.com/scode/kd kd
+
+  # cargo puts the binary in $CARGO_INSTALL_ROOT/bin if set, else
+  # $CARGO_HOME/bin (~/.cargo/bin by default). An `install.root` set in a
+  # cargo config file also moves it, which this does not detect. Strip a
+  # trailing slash so the string compare below can't be defeated by a
+  # cosmetic double slash.
+  local install_root="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}"
+  local bin_dir="${install_root%/}/bin"
+  # Compare the resolved path, not mere existence: a different `kd` earlier
+  # on PATH would otherwise shadow the fresh install silently. (command -v
+  # failing is fine here: a command substitution in an assignment doesn't
+  # trip errexit, and empty output is handled below.)
+  local resolved
+  resolved=$(command -v kd 2>/dev/null || true)
+  if [ "$resolved" != "$bin_dir/kd" ]; then
+    echo "" >&2
+    echo "==================================================================" >&2
+    echo "  ACTION NEEDED: kd was installed to $bin_dir," >&2
+    if [ -n "$resolved" ]; then
+      echo "  but 'kd' resolves to $resolved, which comes earlier on PATH." >&2
+      echo "  Remove that one, or put $bin_dir before it on PATH:" >&2
+    else
+      echo "  but typing 'kd' does not resolve there. Add this line to your" >&2
+      echo "  ~/.bashrc or ~/.zshrc or equivalent:" >&2
+    fi
+    echo "" >&2
+    echo "      export PATH=\"$bin_dir:\$PATH\"" >&2
+    echo "" >&2
+    echo "==================================================================" >&2
+  fi
+}
+
+# Everything runs from main, called on the last line: a download cut short
+# by a network failure defines at most part of a function and runs nothing,
+# instead of executing whatever prefix of the script arrived.
+main "$@"
