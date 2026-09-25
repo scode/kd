@@ -1,7 +1,7 @@
 //! `kd cargo`: helpers around tools installed with `cargo install`.
-//! Specified in SPEC.md (`## kd cargo scode-update`).
+//! Specified in SPEC.md (`## kd cargo scode`).
 //!
-//! `scode-update` exists because devbox bootstrap installs kd, and possibly
+//! `scode update` exists because devbox bootstrap installs kd, and possibly
 //! other tools, straight from their GitHub repositories under `scode/`, and
 //! updating exactly those is otherwise a two-step chore: remember which
 //! installed tools came from those repositories, then remember that
@@ -15,7 +15,7 @@ use clap::{Args, Subcommand};
 use xshell::{Shell, cmd};
 
 /// Source prefixes, one per URL form cargo may have recorded, that select
-/// the tools `scode-update` updates. cargo records the URL exactly as it was
+/// the tools `scode update` updates. cargo records the URL exactly as it was
 /// given to `cargo install --git`, so the same repository can appear as
 /// HTTPS, plain HTTP, or SSH. Compiled in on purpose: the command's name
 /// promises exactly this owner.
@@ -25,10 +25,22 @@ const SCODE_PREFIXES: [&str; 3] = [
     "ssh://git@github.com/scode/",
 ];
 
+/// `kd cargo ...` subcommands.
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Tools installed from github.com/scode repositories
+    Scode {
+        #[command(subcommand)]
+        cmd: ScodeCommands,
+    },
+}
+
+/// `kd cargo scode ...`: operations on tools from github.com/scode
+/// repositories, grouped so related verbs sit under one noun.
+#[derive(Subcommand, Debug)]
+pub enum ScodeCommands {
     /// Update every tool installed from a github.com/scode repository, kd included
-    ScodeUpdate(ScodeUpdateArgs),
+    Update(ScodeUpdateArgs),
 }
 
 #[derive(Args, Debug)]
@@ -41,7 +53,9 @@ pub struct ScodeUpdateArgs {
 impl Commands {
     pub fn run(self) -> anyhow::Result<()> {
         match self {
-            Commands::ScodeUpdate(args) => scode_update(args.dry_run),
+            Commands::Scode {
+                cmd: ScodeCommands::Update(args),
+            } => scode_update(args.dry_run),
         }
     }
 }
@@ -105,7 +119,7 @@ fn is_pinned(source: &str) -> bool {
         .any(|pair| pair.starts_with("tag=") || pair.starts_with("rev="))
 }
 
-/// What `scode-update` does with the installed tools from scode repositories.
+/// What `scode update` does with the installed tools from scode repositories.
 #[derive(Debug, Default, PartialEq)]
 struct Selection {
     /// Tools to update, in listing order.

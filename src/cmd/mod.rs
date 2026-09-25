@@ -125,9 +125,25 @@ mod tests {
     /// them from variant names, so pin them here.
     #[test]
     fn cargo_scode_update_parses() {
-        assert!(parses(&["kd", "cargo", "scode-update"]));
-        assert!(parses(&["kd", "cargo", "scode-update", "--dry-run"]));
-        assert!(!parses(&["kd", "cargo", "scode-update", "--apply"]));
+        assert!(parses(&["kd", "cargo", "scode", "update"]));
+        assert!(parses(&["kd", "cargo", "scode", "update", "--dry-run"]));
+        assert!(!parses(&["kd", "cargo", "scode", "update", "--apply"]));
+        assert!(
+            !parses(&["kd", "cargo", "scode-update"]),
+            "old name is gone"
+        );
+        assert!(!parses(&["kd", "cargo", "scode"]), "a verb is required");
+        let cli = TestCli::try_parse_from(["kd", "cargo", "scode", "update", "--dry-run"]).unwrap();
+        let Commands::Cargo {
+            cmd:
+                cargo::Commands::Scode {
+                    cmd: cargo::ScodeCommands::Update(args),
+                },
+        } = cli.command
+        else {
+            panic!("expected kd cargo scode update");
+        };
+        assert!(args.dry_run);
     }
 
     /// The command name is part of the user contract (SPEC.md); clap
