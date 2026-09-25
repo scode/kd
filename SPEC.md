@@ -217,7 +217,11 @@ non-ImageMagick helpers still behave correctly. It does not prove that thumbnail
   (`<user>@ubiworker-foo`), never the full forwarded argv: forwarded ssh arguments can carry secrets, and joining them
   into one string for an error message would also lose their original argument boundaries.
 
-## kd cargo scode-update
+## kd cargo scode
+
+Commands for tools installed with `cargo install --git` from repositories under github.com/scode, kd included.
+
+### kd cargo scode update [--dry-run]
 
 - Updates every tool installed with `cargo install --git` from a repository under github.com/scode (owner matched
   exactly, ignoring case; recorded as `https://`, `http://` or `ssh://git@` URLs), kd itself included, to the latest
@@ -226,8 +230,7 @@ non-ImageMagick helpers still behave correctly. It does not prove that thumbnail
   would move them to the default branch and silently drop the pin.
 - The tools are found in `cargo install --list`. Each is first marked with cargo-update's per-package lock setting
   (`cargo install-update-config --enforce-lock <name>`, idempotent), then all are updated with
-  `cargo install-update
-  -g <names>`, so only tools whose branch moved are rebuilt, with the dependency versions from
+  `cargo install-update -g <names>`, so only tools whose branch moved are rebuilt, with the dependency versions from
   each repository's committed `Cargo.lock`. The global `--locked` flag is not used: combined with the per-package
   setting it would pass `--locked` to cargo twice, which cargo rejects. The per-package setting stays in place
   afterwards, so later plain `cargo install-update -a -g` runs are locked for these tools too.
