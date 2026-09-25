@@ -10,20 +10,22 @@ Works on macOS and Linux:
 curl -fsSL https://raw.githubusercontent.com/scode/kd/main/install.sh | bash
 ```
 
-It clones into `~/git/kd` (failing rather than touching a checkout that's already there) and runs `cargo install` on the
-checkout. It needs `git` and a C toolchain already installed — it checks and says so if they're missing. If cargo isn't
-working (missing, or a toolchain-less rustup shim), it asks whether to install rust via homebrew or rustup first. Read
+If cargo isn't usable (missing, or a toolchain-less rustup shim), it first installs rust with the official
+[rustup](https://rustup.rs) one-liner, accepting rustup's defaults; if rust is older than 1.85 and rustup is present, it
+installs current stable just for the build. Then it runs
+`cargo install --locked --force --git https://github.com/scode/kd kd`, which records the same source
+`kd cargo scode install kd` would, so `kd cargo scode update` (which needs cargo-update) can keep kd current from its
+default branch later. Rerunning the one-liner rebuilds kd from the current default branch. It needs a C toolchain (Xcode
+Command Line Tools on macOS; `cc`, e.g. from `build-essential`, on Linux) and says so if one is missing. Read
 [`install.sh`](install.sh) before piping it if you (sensibly) don't run shell scripts off the internet blind.
+
+Earlier versions of this installer cloned kd into `~/git/kd` and installed from that checkout. Rerunning the one-liner
+replaces such an install; the old checkout is no longer used and can be deleted.
 
 ### Uninstall
 
-Deletes the checkout and the installed binary; rust itself is left alone. (With a custom `CARGO_HOME`, the binary is
-under `$CARGO_HOME/bin` instead.)
-
-```sh
-rm -f ~/.cargo/bin/kd
-rm -rf ~/git/kd
-```
+`kd cargo scode uninstall kd`, or `cargo uninstall kd` for a kd installed by the older checkout-based installer (which
+`kd cargo scode uninstall` does not recognise as a github.com/scode install). Rust itself is left alone.
 
 ## Commands TLDR
 
