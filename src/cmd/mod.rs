@@ -1,5 +1,6 @@
 //! Top-level command dispatch. Each submodule owns a domain of functionality.
 
+pub mod cargo;
 pub mod cli_proxy_api;
 pub mod devbox;
 pub mod gh;
@@ -10,6 +11,11 @@ use clap::Subcommand;
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Helpers for tools installed with `cargo install`
+    Cargo {
+        #[command(subcommand)]
+        cmd: cargo::Commands,
+    },
     /// Operate a CLIProxyAPI instance through its management API
     CliProxyApi {
         #[command(subcommand)]
@@ -40,6 +46,7 @@ pub enum Commands {
 impl Commands {
     pub fn run(self) -> anyhow::Result<()> {
         match self {
+            Commands::Cargo { cmd } => cmd.run(),
             Commands::CliProxyApi { cmd } => cmd.run(),
             Commands::Devbox { cmd } => cmd.run(),
             Commands::Gh { cmd } => cmd.run(),
@@ -112,6 +119,15 @@ mod tests {
             .map(|a| a.to_str().expect("test args are UTF-8").to_string())
             .collect();
         (args, cli.verbose)
+    }
+
+    /// Command names are part of the user contract (SPEC.md); clap derives
+    /// them from variant names, so pin them here.
+    #[test]
+    fn cargo_scode_update_parses() {
+        assert!(parses(&["kd", "cargo", "scode-update"]));
+        assert!(parses(&["kd", "cargo", "scode-update", "--dry-run"]));
+        assert!(!parses(&["kd", "cargo", "scode-update", "--apply"]));
     }
 
     /// The command name is part of the user contract (SPEC.md); clap
