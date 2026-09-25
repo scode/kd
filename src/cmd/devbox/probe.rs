@@ -99,7 +99,11 @@ pub fn script(
         "claude onboarding",
         "jq -e '.hasCompletedOnboarding == true' \"$HOME/.claude.json\" >/dev/null",
     );
-    check("opencode request", "opencode run ok >/dev/null 2>&1");
+    // No OpenCode request: OpenCode picks its own default model from the
+    // copied credentials, and on recent scratch bootstraps that model was
+    // one its provider rejected, a failure unrelated to the box. It kept
+    // every report red without saying anything about bootstrap, so it was
+    // dropped; OpenCode is still installed, just not probed.
     check("muse request", "muse exec ok >/dev/null 2>&1");
     for (name, command) in router_checks() {
         check(name, &command);
