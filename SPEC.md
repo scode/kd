@@ -452,12 +452,12 @@ Terms used below:
   started.
 - Ends with a probe report printed as is: hostname, timezone, `gh auth status`, repo count against the manifest,
   `ssh localhost`, Docker as the user, Tensorlake CLI availability, Claude's onboarding flag, one real request through
-  each agent CLI (Codex and Claude past the routers), router health, loopback-only router listeners, CLIProxyAPI's
-  client-key check, and the Codex and Claude router wiring. It does not check router accounts. Restores additionally
-  check Hermes gateway state and, outside rehearsals, dashboard reachability. Tailscale is checked only with
-  `--enroll-tailscale`. Probe failures are reported, never fatal: bootstrap exits 0 once the probe has run. After the
-  probe, each agent phase's final message is printed whole, which is where the agent lists anything it had to work
-  around, even when the run succeeded.
+  Codex, Claude and Muse (Codex and Claude past the routers; OpenCode is installed but not probed), router health,
+  loopback-only router listeners, CLIProxyAPI's client-key check, and the Codex and Claude router wiring. It does not
+  check router accounts. Restores additionally check Hermes gateway state and, outside rehearsals, dashboard
+  reachability. Tailscale is checked only with `--enroll-tailscale`. Probe failures are reported, never fatal: bootstrap
+  exits 0 once the probe has run. After the probe, each agent phase's final message is printed whole, which is where the
+  agent lists anything it had to work around, even when the run succeeded.
 - After a rehearsal the worker is left running for inspection with a reminder that it holds real credentials; `kd` does
   not destroy it.
 - Manually starting restored services after a rehearsal leaves the rehearsal's safety conditions. If the source is still

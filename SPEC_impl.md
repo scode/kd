@@ -93,8 +93,8 @@ from being hidden by a successful shell; installation and the explicit-path vers
 are placed. Run the installer on every bootstrap, including reruns with an existing binary, so the old direct-download
 layout is migrated. Upstream owns architecture selection, release layout and companion binaries. A lone Codex binary
 previously left the command runner missing; maintaining that layout here is no longer necessary. The probe script
-hardcodes one real request per agent CLI (see "Probe"). A rotted probe line shows up as a failed probe item, never as a
-failed run.
+hardcodes one real request per probed agent CLI (see "Probe"). A rotted probe line shows up as a failed probe item,
+never as a failed run.
 
 Codex is an explicit exception to the Homebrew preference below. QR-code remote control is the feature that motivated
 this choice: it requires running the official installation, not the Homebrew distribution. Both phase prompts forbid
@@ -431,12 +431,14 @@ directories equals the size of the manifest deduplicated with `scode/voice` and 
 gateway process check (absent on rehearsal, present otherwise) plus `curl -fsS 127.0.0.1:9119/api/status` outside
 rehearsals. `tailscale status` is checked only with `--enroll-tailscale`. One real request per agent CLI:
 `codex exec --skip-git-repo-check -c 'model_provider="openai"' "reply ok"`, `claude --settings '<bypass>' -p ok`,
-`opencode run ok`, `muse exec ok`. Codex and Claude bypass the routers because a fresh box's routers have no accounts;
-these lines check the copied credentials. Router checks: codex-lb `/health`; CLIProxyAPI returns 401 on `/v1/models`
-without a key and succeeds with the client key (passed to curl as a config file on stdin); `ss` shows both router ports
-listening and every listener on `127.0.0.1`; Claude settings carry the router URL and the current client key from
-secrets.env; Codex's effective provider (after any active `profile`) is `codex-lb` and its `base_url` is the router's.
-Account presence is not checked. Every check is reported; none is fatal.
+`muse exec ok`. OpenCode is not probed: it chooses its own default model from the copied credentials, and on recent
+scratch bootstraps it chose one its provider rejected, a failure that said nothing about the box and kept every report
+red. Codex and Claude bypass the routers because a fresh box's routers have no accounts; these lines check the copied
+credentials. Router checks: codex-lb `/health`; CLIProxyAPI returns 401 on `/v1/models` without a key and succeeds with
+the client key (passed to curl as a config file on stdin); `ss` shows both router ports listening and every listener on
+`127.0.0.1`; Claude settings carry the router URL and the current client key from secrets.env; Codex's effective
+provider (after any active `profile`) is `codex-lb` and its `base_url` is the router's. Account presence is not checked.
+Every check is reported; none is fatal.
 
 Timezone checks compare `/etc/localtime` with the named zoneinfo file using `cmp`, check `/etc/timezone` if present, and
 query `timedatectl` when `/run/systemd/system` exists. None can mask another's failure. Comparing zoneinfo data covers
