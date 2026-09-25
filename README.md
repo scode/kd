@@ -99,6 +99,11 @@ kd ubiworker ssh -L 8080:localhost:80
 kd ubiworker ssh -- -v
 kd ubiworker ssh -- -L 8080:localhost:80
 
+# Update kd and every other tool installed from a github.com/scode repository
+# to the latest commit of its branch (needs cargo-update).
+kd cargo scode-update
+kd cargo scode-update --dry-run
+
 # Show how CLIProxyAPI's Claude accounts would be reordered so the quota
 # that resets soonest is used first (dry run), then actually write it.
 kd cli-proxy-api manage-priorities
@@ -171,7 +176,8 @@ history live in Docker volumes and are not backed up.
 Bootstrap installs `kd` itself from this repository's default branch with `cargo install --locked --git`, plus
 cargo-update, configured to keep kd's updates locked to the committed `Cargo.lock` as well. On a bootstrapped box,
 `cargo install-update -a -g` updates kd to the latest `main` (the `-g` matters: without it, cargo-update skips tools
-installed from git).
+installed from git), and `kd cargo scode-update` updates just kd and any other tool installed from a github.com/scode
+repository.
 
 Bootstrap copies the controller's global Git `user.name` and `user.email` to the target user's global config. Both must
 be configured before running it. Other Git settings and repository-specific identities are not copied.

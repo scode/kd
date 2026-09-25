@@ -217,6 +217,26 @@ non-ImageMagick helpers still behave correctly. It does not prove that thumbnail
   (`<user>@ubiworker-foo`), never the full forwarded argv: forwarded ssh arguments can carry secrets, and joining them
   into one string for an error message would also lose their original argument boundaries.
 
+## kd cargo scode-update
+
+- Updates every tool installed with `cargo install --git` from a repository under github.com/scode (owner matched
+  exactly, ignoring case; recorded as `https://`, `http://` or `ssh://git@` URLs), kd itself included, to the latest
+  commit of the branch it was installed from. Tools from crates.io, other owners, or local paths are left alone.
+- Tools pinned to a tag or commit (`?tag=` or `?rev=` in the recorded source) are skipped and reported: cargo-update
+  would move them to the default branch and silently drop the pin.
+- The tools are found in `cargo install --list`. Each is first marked with cargo-update's per-package lock setting
+  (`cargo install-update-config --enforce-lock <name>`, idempotent), then all are updated with
+  `cargo install-update
+  -g <names>`, so only tools whose branch moved are rebuilt, with the dependency versions from
+  each repository's committed `Cargo.lock`. The global `--locked` flag is not used: combined with the per-package
+  setting it would pass `--locked` to cargo twice, which cargo rejects. The per-package setting stays in place
+  afterwards, so later plain `cargo install-update -a -g` runs are locked for these tools too.
+- cargo-update's output is shown as it runs. A missing cargo-update is an error that says how to install it. A
+  repository cargo-update cannot reach shows as "git error" in its table and is treated as not needing an update;
+  cargo-update still exits 0, and so does this command.
+- `--dry-run` lists the tools and the commands without running them.
+- No matching tools is not an error; the command says so and exits 0.
+
 ## kd cli-proxy-api manage-priorities
 
 NOTE: This manages routing priorities for one CLIProxyAPI instance's Claude accounts. It does not log accounts in,
