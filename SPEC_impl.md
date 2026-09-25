@@ -177,12 +177,32 @@ agent's problem; an explicitly chosen upstream installer overrides the general p
 
 **User-space phase**, as the user, after kd has placed the secrets:
 
-- CLIs: `gh`, `jj`, `cargo-dist`, `git-cliff`, `sccache`, `trunk`, `dioxus`, `dprint`, `herdr`, `vercel`, Claude Code
-  (its own installer), OpenCode, Muse. The Rust tools come from Homebrew bottles where a formula exists (`cargo-dist`,
-  `git-cliff`, `sccache`, `trunk`, `dprint`), not `cargo install`: the first ubiworker rehearsals spent about 20 of the
-  user-space phase's 22 minutes compiling them from source. `dioxus` has no Homebrew formula (checked 2026-09-05; an
-  agent guessing `dioxus-cli` fails too) and is `cargo install dioxus-cli`. Cargo stays the fallback for any Rust tool
-  without a bottle, or one deliberately moved back to cargo later.
+- CLIs: `gh`, `jj`, `cargo-dist`, `git-cliff`, `sccache`, `trunk`, `dioxus`, `dprint`, `cargo-update`, `herdr`,
+  `vercel`, Claude Code (its own installer), OpenCode, Muse. The Rust tools come from Homebrew bottles where a formula
+  exists (`cargo-dist`, `git-cliff`, `sccache`, `trunk`, `dprint`, `cargo-update`), not `cargo install`: the first
+  ubiworker rehearsals spent about 20 of the user-space phase's 22 minutes compiling them from source. `dioxus` has no
+  Homebrew formula (checked 2026-09-05; an agent guessing `dioxus-cli` fails too) and is `cargo install dioxus-cli`.
+  Cargo stays the fallback for any Rust tool without a bottle, or one deliberately moved back to cargo later.
+- Rust tools from a GitHub repository (`CARGO_GIT_PACKAGES`, currently only `scode/kd`):
+  `cargo install --locked --git https://github.com/<owner>/<name>` with no `--branch`, `--tag` or `--rev`, never a
+  same-named crates.io or Homebrew package, then `cargo install-update-config --enforce-lock <name>`. `cargo install`
+  ignores a package's `Cargo.lock` unless given `--locked`, re-resolving every dependency to its newest compatible
+  release; a dependency that raises its minimum Rust version in a minor release then breaks a build CI never saw.
+  `--locked` builds what CI tested, and dependency updates arrive through the repository's own `Cargo.lock` updates.
+  cargo-update does not remember how a package was first installed. Its reinstalls are locked either by the per-package
+  `enforce_lock = true` it keeps in `$CARGO_HOME/.install_config.toml`, which bootstrap sets so a plain
+  `cargo
+  install-update -a -g` stays locked, or by its global `--locked` flag. The two must not be combined:
+  cargo-update then passes `--locked` twice and cargo rejects the install ("cannot be used multiple times"), so anything
+  that drives cargo-update for these tools relies on the per-package setting alone. cargo-update records a git install's
+  source and, for an install without a branch, compares it with the remote's `HEAD` (through libgit2, or `git` when
+  cargo's `net.git-fetch-with-cli` is set), so `cargo install-update -a -g` follows the default branch. `-g` is
+  required: cargo-update skips git installs by default "because it's expensive" (its manual). Each repository must hold
+  a single binary package whose package name is the repository name: `cargo install --git` without a package name needs
+  exactly one, and the probe and cargo-update's per-package config key on the package name, so a repository breaking
+  this would install but get its locked-update setting under the wrong name. cargo-update itself comes from Homebrew,
+  which has a Linux bottle; building it with cargo instead needs OpenSSL headers and `pkg-config` (libgit2 falls back to
+  a bundled copy), which the prompt tells the agent to install first.
 - Tensorlake CLI (`tl`): if missing, run `curl -fsSL https://tensorlake.ai/install | sh` as the user, following
   [Tensorlake's CLI instructions](https://docs.tensorlake.ai/sandboxes/computer-use). Use the standalone installer, not
   the Python SDK. Verify `tl --version` in a fresh login shell, fixing PATH if needed. Do not run `tl login`; Tensorlake
@@ -427,18 +447,21 @@ One shell script, rendered per run because it carries expected values, run as th
 the form `<name>: ok` or `<name>: FAIL (exit N)`. Pass is exit status 0 unless stated. Checks: `hostname` equals the
 resolved target hostname; independent timezone checks described below; `gh auth status`; the count of `~/git/*`
 directories equals the size of the manifest deduplicated with `scode/voice` and `scode/dotfiles`;
-`ssh -o BatchMode=yes localhost true`; `docker ps`; `tl --version` (no cloud credentials needed); and, on restores, a
-gateway process check (absent on rehearsal, present otherwise) plus `curl -fsS 127.0.0.1:9119/api/status` outside
-rehearsals. `tailscale status` is checked only with `--enroll-tailscale`. One real request per agent CLI:
-`codex exec --skip-git-repo-check -c 'model_provider="openai"' "reply ok"`, `claude --settings '<bypass>' -p ok`,
-`muse exec ok`. OpenCode is not probed: it chooses its own default model from the copied credentials, and on recent
-scratch bootstraps it chose one its provider rejected, a failure that said nothing about the box and kept every report
-red. Codex and Claude bypass the routers because a fresh box's routers have no accounts; these lines check the copied
-credentials. Router checks: codex-lb `/health`; CLIProxyAPI returns 401 on `/v1/models` without a key and succeeds with
-the client key (passed to curl as a config file on stdin); `ss` shows both router ports listening and every listener on
-`127.0.0.1`; Claude settings carry the router URL and the current client key from secrets.env; Codex's effective
-provider (after any active `profile`) is `codex-lb` and its `base_url` is the router's. Account presence is not checked.
-Every check is reported; none is fatal.
+`ssh -o BatchMode=yes localhost true`; `docker ps`; `tl --version` (no cloud credentials needed); for each git-installed
+Rust tool, `cargo install --list` showing it with its `https://github.com/<repo>#` source (a crates.io install of the
+same name or a fork fails this) and `enforce_lock = true` for it in cargo-update's config (`.install_config.toml` under
+`$CARGO_INSTALL_ROOT`, else `$CARGO_HOME`, else `~/.cargo`; the check needs Python 3.11+ for `tomllib`);
+`cargo install-update --help`; and, on restores, a gateway process check (absent on rehearsal, present otherwise) plus
+`curl -fsS 127.0.0.1:9119/api/status` outside rehearsals. `tailscale status` is checked only with `--enroll-tailscale`.
+One real request per probed agent CLI: `codex exec --skip-git-repo-check -c 'model_provider="openai"' "reply ok"`,
+`claude --settings '<bypass>' -p ok`, `muse exec ok`. OpenCode is not probed: it chooses its own default model from the
+copied credentials, and on recent scratch bootstraps it chose one its provider rejected, a failure that said nothing
+about the box and kept every report red. Codex and Claude bypass the routers because a fresh box's routers have no
+accounts; these lines check the copied credentials. Router checks: codex-lb `/health`; CLIProxyAPI returns 401 on
+`/v1/models` without a key and succeeds with the client key (passed to curl as a config file on stdin); `ss` shows both
+router ports listening and every listener on `127.0.0.1`; Claude settings carry the router URL and the current client
+key from secrets.env; Codex's effective provider (after any active `profile`) is `codex-lb` and its `base_url` is the
+router's. Account presence is not checked. Every check is reported; none is fatal.
 
 Timezone checks compare `/etc/localtime` with the named zoneinfo file using `cmp`, check `/etc/timezone` if present, and
 query `timedatectl` when `/run/systemd/system` exists. None can mask another's failure. Comparing zoneinfo data covers

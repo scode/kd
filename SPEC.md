@@ -370,6 +370,12 @@ Terms used below:
   authenticated from the controller's caches, and `gh` authenticated. From scratch no archive is required or placed, and
   no Hermes components are installed or probed. `--hostname` is required from scratch; a restore defaults to the profile
   hostname, with an explicit override allowed. Archive selection always uses the source profile hostname.
+- `kd` itself is installed for the user with `cargo install --locked --git https://github.com/scode/kd`, tracking the
+  repository's default branch rather than a release and building the dependency versions in its committed `Cargo.lock`,
+  and cargo-update is installed so `cargo install-update` is available, configured with `--enforce-lock` for kd so its
+  updates stay locked too. `cargo install-update -a -g` then updates kd to the latest commit on that branch; plain `-a`
+  skips packages installed from git. Rust tools installed this way are a compiled-in list, like the other package
+  choices.
 - Tensorlake's standalone CLI (`tl`) is installed with its official shell installer and available on the login shell's
   PATH. Bootstrap does not log in to Tensorlake or copy its credentials; the probe checks `tl --version` without
   requiring cloud access.
@@ -451,13 +457,14 @@ Terms used below:
   state the previous attempt accumulated. Outside a rehearsal, its gateway and loopback-only dashboard are enabled and
   started.
 - Ends with a probe report printed as is: hostname, timezone, `gh auth status`, repo count against the manifest,
-  `ssh localhost`, Docker as the user, Tensorlake CLI availability, Claude's onboarding flag, one real request through
-  Codex, Claude and Muse (Codex and Claude past the routers; OpenCode is installed but not probed), router health,
-  loopback-only router listeners, CLIProxyAPI's client-key check, and the Codex and Claude router wiring. It does not
-  check router accounts. Restores additionally check Hermes gateway state and, outside rehearsals, dashboard
-  reachability. Tailscale is checked only with `--enroll-tailscale`. Probe failures are reported, never fatal: bootstrap
-  exits 0 once the probe has run. After the probe, each agent phase's final message is printed whole, which is where the
-  agent lists anything it had to work around, even when the run succeeded.
+  `ssh localhost`, Docker as the user, Tensorlake CLI availability, kd installed from its GitHub repository with locked
+  updates, `cargo install-update` availability, Claude's onboarding flag, one real request through Codex, Claude and
+  Muse (Codex and Claude past the routers; OpenCode is installed but not probed), router health, loopback-only router
+  listeners, CLIProxyAPI's client-key check, and the Codex and Claude router wiring. It does not check router accounts.
+  Restores additionally check Hermes gateway state and, outside rehearsals, dashboard reachability. Tailscale is checked
+  only with `--enroll-tailscale`. Probe failures are reported, never fatal: bootstrap exits 0 once the probe has run.
+  After the probe, each agent phase's final message is printed whole, which is where the agent lists anything it had to
+  work around, even when the run succeeded.
 - After a rehearsal the worker is left running for inspection with a reminder that it holds real credentials; `kd` does
   not destroy it.
 - Manually starting restored services after a rehearsal leaves the rehearsal's safety conditions. If the source is still

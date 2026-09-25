@@ -168,6 +168,11 @@ default CLIs fail on that box; `codex -c 'model_provider="openai"'` and
 `claude --settings '{"env":{"ANTHROPIC_BASE_URL":"","ANTHROPIC_AUTH_TOKEN":""}}'` bypass them. Router accounts and
 history live in Docker volumes and are not backed up.
 
+Bootstrap installs `kd` itself from this repository's default branch with `cargo install --locked --git`, plus
+cargo-update, configured to keep kd's updates locked to the committed `Cargo.lock` as well. On a bootstrapped box,
+`cargo install-update -a -g` updates kd to the latest `main` (the `-g` matters: without it, cargo-update skips tools
+installed from git).
+
 Bootstrap copies the controller's global Git `user.name` and `user.email` to the target user's global config. Both must
 be configured before running it. Other Git settings and repository-specific identities are not copied.
 
