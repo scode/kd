@@ -1,5 +1,6 @@
 //! Top-level command dispatch. Each submodule owns a domain of functionality.
 
+pub mod cli_proxy_api;
 pub mod devbox;
 pub mod gh;
 pub mod ubiworker;
@@ -9,6 +10,11 @@ use clap::Subcommand;
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Operate a CLIProxyAPI instance through its management API
+    CliProxyApi {
+        #[command(subcommand)]
+        cmd: cli_proxy_api::Commands,
+    },
     /// Bootstrap development environments and manage stateful instances
     Devbox {
         #[command(subcommand)]
@@ -34,6 +40,7 @@ pub enum Commands {
 impl Commands {
     pub fn run(self) -> anyhow::Result<()> {
         match self {
+            Commands::CliProxyApi { cmd } => cmd.run(),
             Commands::Devbox { cmd } => cmd.run(),
             Commands::Gh { cmd } => cmd.run(),
             Commands::Ubiworker { cmd } => cmd.run(),
@@ -105,6 +112,25 @@ mod tests {
             .map(|a| a.to_str().expect("test args are UTF-8").to_string())
             .collect();
         (args, cli.verbose)
+    }
+
+    /// The command name is part of the user contract (SPEC.md); clap
+    /// derives it from the variant name, so pin it here.
+    #[test]
+    fn cli_proxy_api_manage_priorities_parses() {
+        assert!(parses(&["kd", "cli-proxy-api", "manage-priorities"]));
+        assert!(parses(&[
+            "kd",
+            "cli-proxy-api",
+            "manage-priorities",
+            "--apply",
+            "--url",
+            "http://127.0.0.1:18317",
+            "--key-file",
+            "/tmp/k",
+            "--log-file",
+            "/tmp/l",
+        ]));
     }
 
     #[test]

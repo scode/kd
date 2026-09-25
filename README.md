@@ -98,6 +98,11 @@ kd ubiworker ssh -L 8080:localhost:80
 # (normalized to `ubiworker-uptime`), it does not run `uptime` anywhere.
 kd ubiworker ssh -- -v
 kd ubiworker ssh -- -L 8080:localhost:80
+
+# Show how CLIProxyAPI's Claude accounts would be reordered so the quota
+# that resets soonest is used first (dry run), then actually write it.
+kd cli-proxy-api manage-priorities
+kd cli-proxy-api manage-priorities --apply
 ```
 
 ## Development environments and stateful instances
@@ -167,6 +172,16 @@ Bootstrap copies the controller's global Git `user.name` and `user.email` to the
 be configured before running it. Other Git settings and repository-specific identities are not copied.
 
 ## Command Notes
+
+`kd cli-proxy-api manage-priorities` talks to CLIProxyAPI's management API, by default at `http://127.0.0.1:8317` with
+the key from `~/.config/cliproxy/secrets.env` (where `kd devbox bootstrap` puts it). It gives the Claude account whose
+weekly quota resets soonest the highest priority, so quota about to expire is spent before quota that is not at risk. It
+changes nothing unless you pass `--apply`. Every run appends a JSON line to
+`$XDG_STATE_HOME/kd/cli-proxy-api-priorities.jsonl`, which is where to look for accounts CLIProxyAPI keeps in cooldown
+after Anthropic says their quota is back (`cooldown_outlives_reset`). From another machine, forward the port with SSH
+and pass `--key-file` with a file holding only the management key. If you run it on a timer, stop the timer when the key
+stops working: CLIProxyAPI bans an address from its management API for 30 minutes after five failed keys, which also
+locks out its web panel.
 
 Timezone setup keeps `/etc/localtime` and any existing `/etc/timezone` consistent with `America/Los_Angeles`. The probe
 checks them independently, along with systemd's timezone and any inherited `TZ` override; application and container

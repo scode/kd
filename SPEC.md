@@ -217,6 +217,61 @@ non-ImageMagick helpers still behave correctly. It does not prove that thumbnail
   (`<user>@ubiworker-foo`), never the full forwarded argv: forwarded ssh arguments can carry secrets, and joining them
   into one string for an error message would also lose their original argument boundaries.
 
+## kd cli-proxy-api manage-priorities
+
+NOTE: This manages routing priorities for one CLIProxyAPI instance's Claude accounts. It does not log accounts in,
+change CLIProxyAPI's configuration, or balance load; CLIProxyAPI's own routing does the rest.
+
+- Goal: quota that is about to expire is spent before quota that is not at risk. The Claude account whose weekly quota
+  window resets soonest gets the highest priority, the next one the next highest, and so on. Accounts whose weekly
+  resets round to the same minute share a priority (Anthropic reports one nominal reset with sub-second jitter on either
+  side of the minute). An account whose weekly window has not started (Anthropic reports no reset time) goes last. Plan
+  sizes and 5-hour windows do not affect the order: CLIProxyAPI already skips an account that hits a limit and moves on
+  to the next priority.
+- Managed accounts are the enabled Claude accounts. Disabled accounts and other providers keep their priority and get no
+  usage lookup. A run that finds no managed account fails rather than reporting the pool as in order.
+- Every run observes from scratch: it lists the accounts, asks Anthropic (through CLIProxyAPI, so tokens stay on the
+  proxy) for each managed account's 5-hour and weekly utilization and reset time, and plans. There is no state between
+  runs.
+- Priorities are written only when the current values would rank the managed accounts differently (a different order, or
+  ties in the wrong places). Values that already rank them correctly are kept, hand-set ones included, so a settled pool
+  is never rewritten. When the order is wrong, the accounts are renumbered in multiples of 10 counting down to 10, and
+  only accounts whose value changes are written. This is not a minimal set of moves: when the soonest account's week
+  resets it drops to the bottom and every other account moves up, so a weekly rotation usually rewrites the whole pool.
+- It is a dry run unless `--apply` is given. With `--apply`, the run re-reads the accounts after writing and fails
+  unless every managed account reports its planned priority. Writes are sequential; a failure stops the remaining writes
+  and leaves earlier ones in place for the next run to reconcile.
+- If any managed account's usage lookup fails, nothing is written and the run fails, naming the accounts. A partial
+  picture could promote the wrong account. The consequence: one enabled account whose login no longer works freezes the
+  pool's priorities until it is disabled or logged in again.
+- Each run prints one entry per account (priority change, weekly and 5-hour usage with reset times, flags) and a
+  summary, and appends one JSON line with the same observations and decisions to the log file, even when the run fails,
+  including failures before the proxy is reached (unreadable key file, rejected `--url`). The log is created mode `0600`
+  in a `0700` directory. It holds account names and emails, CLIProxyAPI's status messages, and the first 200 characters
+  of error responses, never keys or tokens. It is appended to forever; rotate or trim it yourself if that matters.
+- Flags point out states worth a look without changing the plan. Only quota cooldowns count for them; CLIProxyAPI's
+  cooldowns of single models after errors do not. `cooldown_outlives_reset`: a quota cooldown runs more than 15 minutes
+  past the later of Anthropic's two reset times, where a window that has not started counts as available now; this is
+  the signature of an upstream bug where accounts stay blocked after their quota recovers. `blocked_with_quota`: a quota
+  cooldown is active while Anthropic reports headroom in both windows; can be transient. "Quota back" means the reset of
+  the last exhausted window, or, when neither window is exhausted, the later of the two resets. Per-model quota
+  cooldowns count too, so a per-model weekly cap (which kd does not track) can raise a flag while both tracked windows
+  look fine. `weekly_exhausted` and `five_hour_exhausted`. The first two are also printed as warnings.
+- `--url` defaults to `http://127.0.0.1:8317`. Plain HTTP is accepted only for the hosts `127.0.0.1`, `localhost` and
+  `::1`, and a URL with credentials in it is refused outright, so the management key never crosses a network
+  unencrypted; use HTTPS or an SSH tunnel. Proxy environment variables (`HTTP_PROXY` and friends) are ignored.
+  `--key-file` defaults to `~/.config/cliproxy/secrets.env` and accepts either that file's `CLIPROXY_MANAGEMENT_KEY=`
+  line or a file holding only the key. `--log-file` defaults to `$XDG_STATE_HOME/kd/cli-proxy-api-priorities.jsonl`,
+  falling back to `~/.local/state/kd/` when `XDG_STATE_HOME` is unset or not absolute.
+- `HOME` is needed only for the default key and log paths; with `--key-file` and `--log-file` both given, a run works
+  without it.
+- Exit status is nonzero when reading the key file, the `--url` check, listing, a usage lookup, finding any managed
+  account, a write, verification, or writing the log fails. Flags alone do not fail a run. Only a failure to write the
+  log itself, or a missing `HOME` with default paths, leaves no log line.
+- A wrong or rotated management key fails every run with HTTP 401, and CLIProxyAPI bans an address from its management
+  API for 30 minutes after five failed keys, loopback included. A periodic run with a stale key therefore also locks the
+  web panel out from that address every few hours; stop the periodic run until the key is fixed.
+
 ## kd devbox
 
 NOTE: This is a solo-developer convenience for bootstrapping disposable environments and moving a stateful instance. The

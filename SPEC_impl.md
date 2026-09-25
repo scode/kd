@@ -3,6 +3,66 @@
 This file records implementation choices that are deliberate and easy to "fix" into something worse. `SPEC.md` is the
 user-facing contract; this is the how and the why behind it. Both are binding on agents working in this repo.
 
+## kd cli-proxy-api manage-priorities
+
+Why strict priority by weekly reset, rather than weights: using the soonest-expiring quota first never wastes more than
+any other order, and CLIProxyAPI's cooldown-plus-failover already handles an account hitting its 5-hour or weekly limit.
+Weights proportional to remaining quota over time to reset were considered and dropped as unnecessary. A CLIProxyAPI
+scheduler plugin was rejected too: the plugin scheduler runs before, and bypasses, the built-in selector that implements
+session affinity, so a plugin would have to reimplement stickiness to protect the prompt cache, and it would run as
+native code inside the proxy.
+
+API surface, all under `/v0/management` with `Authorization: Bearer <management key>`, checked against v7.3.17:
+
+- `GET /auth-files` lists credentials with `name`, `auth_index`, `provider`, `priority`, `disabled`, `unavailable`,
+  `cooldowns[{scope, model_key, reason, retry_at, http_status}]` (`null` in CLIProxyAPI's home mode),
+  `next_retry_after`, and `recent_requests`. Cooldowns have scope `credential` or `model`. Quota cooldowns carry reason
+  `quota` or `credential_quota` (a 429 always maps to one of those); other reasons come from errors, such as a 12-hour
+  per-model cooldown after an unsupported model, and are ignored by the flags. Per-model quota cooldowns are kept on
+  purpose, because #5770 was reported per model. The disk-only listing CLIProxyAPI serves when its auth manager is
+  unavailable has no `provider`, and kd treats it as a parse error rather than an empty pool. A missing `priority` is
+  CLIProxyAPI's 0; higher wins (`highestPriorityAuths`).
+- `POST /api-call` with
+  `{auth_index, method: GET, url: https://api.anthropic.com/api/oauth/usage, header:
+  {Authorization: "Bearer $TOKEN$", anthropic-beta: oauth-2025-04-20}}`
+  is the call the web panel's Quota Management page makes. For Claude credentials CLIProxyAPI substitutes the stored
+  access token without refreshing it (`resolveTokenForAuth` falls through to `tokenValueForAuth`), so the lookup changes
+  nothing on the proxy. The response wraps the upstream `status_code` and `body`. The body's `five_hour` and `seven_day`
+  objects carry `utilization` (percent, 0-100) and `resets_at` (RFC 3339, or `null` before the window starts). The
+  endpoint is undocumented and its other fields are internal codenames, so only those two windows are parsed and the
+  rest is ignored. A missing `seven_day` object is an error, because guessing would misplace the account.
+- `PATCH /auth-files/fields` with `{name, priority}` updates the routing attribute before answering
+  (`syncAuthFilePriorityAttribute`) and then persists the credential file, ignoring persistence errors
+  (`Manager.Update`). It is the only write. The file write triggers CLIProxyAPI's watcher, which rebuilds the account
+  from the file. Whether auth-level runtime state (a live cooldown) survives that rebuild is unverified; that is one
+  reason writes happen only when the order is wrong.
+- `GET /usage-queue` is never called: reading it removes items, so it must have a single consumer.
+
+The fail-safe rule (any failed lookup means no writes) trades stale priorities for never acting on a partial picture;
+the error names the failing accounts because one dead login freezes the pool until someone acts. Verification after
+writing is a cheap end-to-end check that the value the proxy reports is the one written; it cannot detect the
+persistence failure CLIProxyAPI swallows, which would surface as a reordered pool after a restart and be fixed by the
+next run. The `cooldown_outlives_reset` flag targets upstream issue #5770 (Claude accounts kept in a days-long cooldown
+after quota recovery until a restart); it compares the latest quota-cooldown retry time with the moment Anthropic says
+the quota is back, plus 15 minutes of margin so a cooldown ending around the reset is not reported. "Back" is the reset
+of the last exhausted window (a spent 5-hour window is back at its 5-hour reset even while the week runs on, which is
+exactly when a cooldown parked until the weekly reset is wrong), or the later of the two resets when neither is
+exhausted. A window that has not started (`resets_at: null`, the state a stuck account ends up in because it serves
+nothing) counts as available now. Flags never change the plan: acting on them (a restart clears the stuck state)
+interrupts live streams, which is the operator's call.
+
+The HTTP timeout is 75 seconds because CLIProxyAPI's `api-call` waits up to 60 on the upstream; timing out first would
+replace CLIProxyAPI's own error with a bare transport timeout. The HTTP agent ignores proxy environment variables (ureq
+honours them by default, with no loopback exemption, so a proxy would receive the key in clear text) and keeps non-2xx
+bodies, because CLIProxyAPI explains its refusals there: a bad `auth_index`, an upstream failure, or a 30-minute ban of
+the caller's address after repeated bad keys all look alike by status code. Base URLs are parsed as URIs and any
+userinfo is refused, because naive string splitting treats `http://localhost:8317@elsewhere/` as loopback.
+
+Testing: planning, flags, and parsing are pure functions tested with literal data shaped like live v7.3.17 responses.
+The orchestration runs against an in-memory fake for every failure path, and the real HTTP client runs against a
+loopback stub server that records method, path, auth header and body, pinning the wire format. Live testing against a
+real proxy uses dry runs only; `--apply` against a live proxy is an operator action.
+
 ## kd devbox
 
 The terms controller, devbox, and target are defined at the top of the `kd devbox` section in `SPEC.md` and mean the
