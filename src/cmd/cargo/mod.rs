@@ -41,6 +41,22 @@ pub enum Commands {
 pub enum ScodeCommands {
     /// Update every tool installed from a github.com/scode repository, kd included
     Update(ScodeUpdateArgs),
+    /// Install a tool from github.com/scode/NAME, tracking its default branch
+    Install(ScodeToolArgs),
+    /// Uninstall a tool that was installed from github.com/scode/NAME
+    Uninstall(ScodeToolArgs),
+}
+
+/// Arguments for `install` and `uninstall`: one repository under
+/// github.com/scode holding a binary package with the same name.
+#[derive(Args, Debug)]
+pub struct ScodeToolArgs {
+    /// Repository name under github.com/scode, which is also the package name
+    pub name: String,
+
+    /// Show what would be run, without running it
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Args, Debug)]
@@ -53,9 +69,11 @@ pub struct ScodeUpdateArgs {
 impl Commands {
     pub fn run(self) -> anyhow::Result<()> {
         match self {
-            Commands::Scode {
-                cmd: ScodeCommands::Update(args),
-            } => scode_update(args.dry_run),
+            Commands::Scode { cmd } => match cmd {
+                ScodeCommands::Update(args) => scode_update(args.dry_run),
+                ScodeCommands::Install(args) => scode_install(&args.name, args.dry_run),
+                ScodeCommands::Uninstall(args) => scode_uninstall(&args.name, args.dry_run),
+            },
         }
     }
 }
@@ -197,13 +215,7 @@ fn scode_update(dry_run: bool) -> anyhow::Result<()> {
     }
     // Checked up front so a missing cargo-update gets a useful message
     // instead of cargo's generic "no such command".
-    if cmd!(sh, "cargo install-update --help")
-        .quiet()
-        .ignore_stdout()
-        .ignore_stderr()
-        .run()
-        .is_err()
-    {
+    if !cargo_update_available(&sh) {
         bail!(
             "`cargo install-update` is not available; install cargo-update (`brew install cargo-update` or `cargo install cargo-update`)"
         );
@@ -225,6 +237,223 @@ fn scode_update(dry_run: bool) -> anyhow::Result<()> {
     cmd!(sh, "cargo {args...}")
         .run()
         .context("cargo install-update failed")?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// install / uninstall
+// ---------------------------------------------------------------------------
+
+/// Accept only names that are both a valid GitHub repository name and a
+/// valid cargo package name, since `install` uses NAME as both: an ASCII
+/// letter first, then letters, digits, `-` or `_`, at most 64 characters.
+/// (GitHub also allows `.` in repository names, but cargo never allows it in
+/// a package name, so such a repository could not be installed this way.)
+/// The name becomes part of a URL and a cargo argument, so anything else is
+/// refused rather than escaped; a leading `-` would otherwise read as a
+/// cargo flag.
+fn validate_name(name: &str) -> anyhow::Result<()> {
+    let valid = name.len() <= 64
+        && name.starts_with(|c: char| c.is_ascii_alphabetic())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+    if !valid {
+        bail!(
+            "{name:?} is not a usable name: it must be both a github.com/scode repository name and a cargo package name (ASCII letter first, then letters, digits, `-` or `_`, at most 64 characters)"
+        );
+    }
+    Ok(())
+}
+
+/// `cargo install` arguments for one tool. The URL has no `.git` suffix and
+/// no `--branch`, `--tag` or `--rev`, so the install tracks the default
+/// branch and `kd cargo scode update` (and devbox bootstrap's probe) see the
+/// same recorded source as for a bootstrap-installed kd. `--locked` builds
+/// the dependency versions in the repository's committed `Cargo.lock`. The
+/// package name is passed explicitly so a repository holding more than one
+/// package still installs the one named after it.
+fn install_args(name: &str) -> Vec<String> {
+    vec![
+        "install".to_owned(),
+        "--locked".to_owned(),
+        "--git".to_owned(),
+        format!("https://github.com/scode/{name}"),
+        name.to_owned(),
+    ]
+}
+
+/// The repository path (`owner/name`) of a recorded git source in any of the
+/// URL forms `scode update` recognises, lowercased, without a `.git` suffix,
+/// query or fragment. `None` for anything that is not a scode git source.
+fn scode_repo(source: &str) -> Option<String> {
+    let prefix = SCODE_PREFIXES.iter().find(|p| {
+        source.len() > p.len()
+            && source.is_char_boundary(p.len())
+            && source[..p.len()].eq_ignore_ascii_case(p)
+    })?;
+    let rest = &source[prefix.len()..];
+    let repo = rest.split(['?', '#']).next().unwrap_or_default();
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    Some(format!("scode/{}", repo.to_ascii_lowercase()))
+}
+
+/// What `install` should do for `name`, given `cargo install --list`.
+///
+/// cargo does not protect a same-named install from another source: when
+/// the installed package has the same name, it treats a different source as
+/// an upgrade and replaces it silently (`check_upgrade` in cargo's install
+/// code deliberately ignores the source). So every existing install of the
+/// name is decided here instead of being left to cargo.
+#[derive(Debug, PartialEq)]
+enum InstallPlan {
+    /// Not installed: install it.
+    Install,
+    /// Already installed, unpinned, from exactly github.com/scode/NAME;
+    /// `update` is what keeps it current.
+    AlreadyInstalled,
+    /// Installed from github.com/scode/NAME but pinned to a tag or commit.
+    /// `update` skips pinned tools, so pointing there would be a dead end.
+    Pinned(String),
+    /// Installed from anywhere else (crates.io, another owner, a different
+    /// scode repository, a path). Replacing it is the user's decision.
+    Foreign(Option<String>),
+}
+
+fn install_plan(installed: &[Installed], name: &str) -> InstallPlan {
+    let Some(existing) = installed.iter().find(|i| i.name == name) else {
+        return InstallPlan::Install;
+    };
+    let wanted = format!("scode/{}", name.to_ascii_lowercase());
+    match existing.source.as_deref() {
+        Some(source) if scode_repo(source).as_deref() == Some(wanted.as_str()) => {
+            if is_pinned(source) {
+                InstallPlan::Pinned(source.to_owned())
+            } else {
+                InstallPlan::AlreadyInstalled
+            }
+        }
+        other => InstallPlan::Foreign(other.map(str::to_owned)),
+    }
+}
+
+/// What `uninstall` should do for `name`, given `cargo install --list`.
+#[derive(Debug, PartialEq)]
+enum UninstallPlan {
+    /// Installed from a github.com/scode repository: uninstall it.
+    Uninstall,
+    /// Not installed at all.
+    Missing,
+    /// Installed from somewhere else (crates.io, another owner, a path);
+    /// the source is carried for the error message.
+    Foreign(Option<String>),
+}
+
+fn uninstall_plan(installed: &[Installed], name: &str) -> UninstallPlan {
+    match installed.iter().find(|i| i.name == name) {
+        None => UninstallPlan::Missing,
+        Some(i) if i.source.as_deref().is_some_and(is_scode_source) => UninstallPlan::Uninstall,
+        Some(i) => UninstallPlan::Foreign(i.source.clone()),
+    }
+}
+
+fn installed_tools(sh: &Shell) -> anyhow::Result<Vec<Installed>> {
+    let listing = cmd!(sh, "cargo install --list")
+        .quiet()
+        .read()
+        .context("running `cargo install --list`")?;
+    Ok(parse_install_list(&listing))
+}
+
+fn cargo_update_available(sh: &Shell) -> bool {
+    cmd!(sh, "cargo install-update --help")
+        .quiet()
+        .ignore_stdout()
+        .ignore_stderr()
+        .run()
+        .is_ok()
+}
+
+/// Install one tool from github.com/scode/NAME and mark its future
+/// cargo-update reinstalls as locked. Every existing install of NAME is
+/// decided by [`install_plan`] first; the only case that proceeds is "not
+/// installed", so this command never replaces anything.
+///
+/// A failure of the lock step after a successful install is a warning, not
+/// an error: the tool is installed and usable, and `update` applies the
+/// same setting to every tool before it updates.
+fn scode_install(name: &str, dry_run: bool) -> anyhow::Result<()> {
+    validate_name(name)?;
+    let sh = Shell::new()?;
+    match install_plan(&installed_tools(&sh)?, name) {
+        InstallPlan::Install => {}
+        InstallPlan::AlreadyInstalled => {
+            println!(
+                "{name} is already installed from github.com/scode/{name}; use `kd cargo scode update` to update it"
+            );
+            return Ok(());
+        }
+        InstallPlan::Pinned(source) => bail!(
+            "{name} is installed from {source}, pinned to a tag or commit, which `kd cargo scode update` skips; run `kd cargo scode uninstall {name}` first to switch it to the default branch"
+        ),
+        InstallPlan::Foreign(source) => bail!(
+            "{name} is already installed from {}; run `cargo uninstall {name}` first if you want it replaced by github.com/scode/{name}",
+            source.as_deref().unwrap_or("crates.io")
+        ),
+    }
+    let install = install_args(name);
+    let lock = lock_args(name);
+    let can_lock = cargo_update_available(&sh);
+    if dry_run {
+        println!("dry run: would run `cargo {}`", install.join(" "));
+        if can_lock {
+            println!("dry run: then `cargo {}`", lock.join(" "));
+        } else {
+            println!("dry run: cargo-update is not installed, so no lock setting would be written");
+        }
+        return Ok(());
+    }
+    cmd!(sh, "cargo {install...}")
+        .run()
+        .with_context(|| format!("installing {name}"))?;
+    if !can_lock {
+        println!(
+            "note: cargo-update is not installed; `kd cargo scode update` needs it, and marks {name}'s updates as locked when it runs"
+        );
+    } else if let Err(err) = cmd!(sh, "cargo {lock...}").quiet().ignore_stdout().run() {
+        eprintln!(
+            "warning: {name} is installed, but marking its updates as locked failed ({err}); `kd cargo scode update` applies the setting before it updates"
+        );
+    }
+    Ok(())
+}
+
+/// Uninstall one tool, but only one that came from a github.com/scode
+/// repository: the command's name promises that scope, and a same-named
+/// crates.io or other-owner install is not this command's to remove.
+///
+/// The tool's cargo-update settings are deliberately left in place, even
+/// though cargo-update could delete them (`install-update-config --reset`
+/// drops an entry that ends up at its defaults): they are harmless, and
+/// they keep a later reinstall locked.
+fn scode_uninstall(name: &str, dry_run: bool) -> anyhow::Result<()> {
+    validate_name(name)?;
+    let sh = Shell::new()?;
+    match uninstall_plan(&installed_tools(&sh)?, name) {
+        UninstallPlan::Missing => bail!("{name} is not installed"),
+        UninstallPlan::Foreign(source) => bail!(
+            "{name} is installed from {}, not a github.com/scode repository; use `cargo uninstall {name}` if you mean it",
+            source.as_deref().unwrap_or("crates.io")
+        ),
+        UninstallPlan::Uninstall => {}
+    }
+    if dry_run {
+        println!("dry run: would run `cargo uninstall {name}`");
+        return Ok(());
+    }
+    cmd!(sh, "cargo uninstall {name}")
+        .run()
+        .with_context(|| format!("uninstalling {name}"))?;
     Ok(())
 }
 
@@ -315,6 +544,118 @@ local v0.1.0 (/home/me/src/local):
         assert_eq!(
             lock_args("kd"),
             vec!["install-update-config", "--enforce-lock", "kd"]
+        );
+    }
+
+    /// Names end up in a URL and a cargo argument; only GitHub-legal
+    /// repository names pass, and nothing that could read as a flag or a
+    /// path.
+    #[test]
+    fn validates_repository_names() {
+        for ok in ["kd", "voice", "my-tool", "tool_2", "A1"] {
+            assert!(validate_name(ok).is_ok(), "{ok}");
+        }
+        let long = "x".repeat(65);
+        for bad in [
+            "",
+            "-x",
+            ".x",
+            "a.b",
+            "1kd",
+            "_x",
+            "a/b",
+            "../kd",
+            "a b",
+            "kd;rm",
+            "ü",
+            long.as_str(),
+        ] {
+            assert!(validate_name(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// The install must record the same source a bootstrap install does
+    /// (no `.git`, no branch), build locked, and name the package.
+    #[test]
+    fn install_args_track_default_branch_locked() {
+        assert_eq!(
+            install_args("kd"),
+            vec![
+                "install",
+                "--locked",
+                "--git",
+                "https://github.com/scode/kd",
+                "kd"
+            ]
+        );
+    }
+
+    /// Install proceeds only when nothing of that name is installed. cargo
+    /// itself would silently replace a same-named install from another
+    /// source, and a pinned scode install cannot be helped by `update`, so
+    /// both are refused with a way out; an unpinned install from exactly
+    /// scode/NAME (in any URL form) is "already installed".
+    #[test]
+    fn install_never_replaces_an_existing_install() {
+        let installed = parse_install_list(LISTING);
+        assert_eq!(install_plan(&installed, "missing"), InstallPlan::Install);
+        assert_eq!(
+            install_plan(&installed, "kd"),
+            InstallPlan::AlreadyInstalled
+        );
+        assert_eq!(
+            install_plan(&installed, "voice"),
+            InstallPlan::AlreadyInstalled
+        );
+        assert_eq!(
+            install_plan(&installed, "viassh"),
+            InstallPlan::AlreadyInstalled
+        );
+        assert!(matches!(
+            install_plan(&installed, "pinned"),
+            InstallPlan::Pinned(_)
+        ));
+        assert!(matches!(
+            install_plan(&installed, "revved"),
+            InstallPlan::Pinned(_)
+        ));
+        assert_eq!(
+            install_plan(&installed, "cargo-update"),
+            InstallPlan::Foreign(None)
+        );
+        assert!(matches!(
+            install_plan(&installed, "other"),
+            InstallPlan::Foreign(Some(_))
+        ));
+        let other_repo =
+            parse_install_list("foo v1.0.0 (https://github.com/scode/bar#1):\n    foo\n");
+        assert!(matches!(
+            install_plan(&other_repo, "foo"),
+            InstallPlan::Foreign(Some(_))
+        ));
+    }
+
+    /// Uninstall touches only scode installs: other sources, crates.io, and
+    /// absent tools are refused with the reason.
+    #[test]
+    fn uninstall_only_removes_scode_installs() {
+        let installed = parse_install_list(LISTING);
+        assert_eq!(uninstall_plan(&installed, "kd"), UninstallPlan::Uninstall);
+        assert_eq!(
+            uninstall_plan(&installed, "viassh"),
+            UninstallPlan::Uninstall
+        );
+        assert_eq!(
+            uninstall_plan(&installed, "missing"),
+            UninstallPlan::Missing
+        );
+        assert_eq!(
+            uninstall_plan(&installed, "cargo-update"),
+            UninstallPlan::Foreign(None)
+        );
+        assert_eq!(
+            uninstall_plan(&installed, "other"),
+            UninstallPlan::Foreign(Some("https://github.com/someone/other#abc123".to_owned()))
         );
     }
 

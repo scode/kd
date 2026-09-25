@@ -144,6 +144,19 @@ mod tests {
             panic!("expected kd cargo scode update");
         };
         assert!(args.dry_run);
+        assert!(parses(&["kd", "cargo", "scode", "install", "kd"]));
+        assert!(parses(&[
+            "kd",
+            "cargo",
+            "scode",
+            "uninstall",
+            "kd",
+            "--dry-run"
+        ]));
+        assert!(
+            !parses(&["kd", "cargo", "scode", "install"]),
+            "a name is required"
+        );
     }
 
     /// The command name is part of the user contract (SPEC.md); clap

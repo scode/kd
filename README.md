@@ -104,6 +104,10 @@ kd ubiworker ssh -- -L 8080:localhost:80
 kd cargo scode update
 kd cargo scode update --dry-run
 
+# Install or uninstall a tool from github.com/scode/NAME (tracks the default branch, --locked).
+kd cargo scode install kd
+kd cargo scode uninstall kd
+
 # Show how CLIProxyAPI's Claude accounts would be reordered so the quota
 # that resets soonest is used first (dry run), then actually write it.
 kd cli-proxy-api manage-priorities
