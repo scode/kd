@@ -11,6 +11,7 @@
 //! kd accepts (see SPEC_impl.md): a rotted probe line shows up as a failed
 //! probe item, never as a failed run.
 
+use super::prompts::CARGO_GIT_PACKAGES;
 use super::routers::{CLAUDE_NATIVE_SETTINGS, CLIPROXY_PORT, CODEX_LB_PORT, CODEX_NATIVE_OVERRIDE};
 use super::transport::{Transport, shell_quote};
 use std::path::Path;
@@ -56,6 +57,35 @@ pub fn script(
     // Installation is useful without cloud credentials; do not turn this
     // availability check into a login or a billable sandbox operation.
     check("tensorlake CLI", "tl --version >/dev/null 2>&1");
+    // Installed from the repository, not a same-named crates.io or Homebrew
+    // package: only a git install is what `cargo install-update -a -g`
+    // updates from the default branch. `cargo install --list` prints
+    // `name vX.Y.Z (https://github.com/owner/name#commit):` for those.
+    for repo in CARGO_GIT_PACKAGES {
+        let name = repo.rsplit('/').next().unwrap_or(repo);
+        check(
+            &format!("{name} from github"),
+            &format!(
+                "cargo install --list | grep -q {}",
+                shell_quote(&format!("^{name} v[^ ]* (https://github.com/{repo}#"))
+            ),
+        );
+        // cargo-update keeps per-package settings in `.install_config.toml`
+        // in its install directory (`$CARGO_INSTALL_ROOT`, else
+        // `$CARGO_HOME`, else `~/.cargo`); `--enforce-lock` sets
+        // `enforce_lock = true` in the package's table. Without it, updates
+        // would build unlocked even though the first install was locked.
+        check(
+            &format!("{name} updates locked"),
+            &format!(
+                "python3 -c 'import os, tomllib; c = tomllib.load(open(os.path.join(os.environ.get(\"CARGO_INSTALL_ROOT\") or os.environ.get(\"CARGO_HOME\") or os.path.expanduser(\"~/.cargo\"), \".install_config.toml\"), \"rb\")); assert c[\"{name}\"][\"enforce_lock\"] is True'"
+            ),
+        );
+    }
+    check(
+        "cargo install-update",
+        "cargo install-update --help >/dev/null 2>&1",
+    );
     // Check names must not spell out what the pgrep pattern matches: the
     // whole script is in the login shell's argv, so a name like "hermes
     // gateway stopped" would match `[h]ermes.*gateway` and fail every time.
@@ -516,6 +546,91 @@ exit {status}
         )));
         assert!(!codex(&wired.replace("2455", "9999")));
         assert!(!codex(&wired.replace("\"codex-lb\"\n[", "\"openai\"\n[")));
+    }
+
+    /// The git-install check must accept exactly the line `cargo install
+    /// --list` prints for a git install of the repository, and reject a
+    /// crates.io install of the same name or a fork.
+    #[test]
+    fn git_install_check_matches_only_the_repository_source() {
+        let s = script("devbox", 1, false, false, false);
+        let line = s
+            .lines()
+            .find(|l| l.starts_with("check 'kd from github'"))
+            .expect("kd check present");
+        let command = line.strip_prefix("check 'kd from github' ").unwrap();
+        // Unwrap the single-quoted argument the script passes to `check`.
+        let inner = Command::new("bash")
+            .args(["-c", &format!("printf '%s' {command}")])
+            .output()
+            .unwrap();
+        let inner = String::from_utf8(inner.stdout).unwrap();
+        let run = |listing: &str| {
+            Command::new("bash")
+                .args([
+                    "-c",
+                    &inner.replace(
+                        "cargo install --list",
+                        &format!("printf '%s\\n' {}", shell_quote(listing)),
+                    ),
+                ])
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(run(
+            "kd v0.1.0 (https://github.com/scode/kd#8e691195):\n    kd"
+        ));
+        assert!(!run("kd v0.1.0:\n    kd"));
+        assert!(!run("kd v0.1.0 (https://github.com/someone/kd#1234):"));
+        assert!(s.contains("'cargo install-update'"));
+    }
+
+    /// Updates must stay locked: the check passes only when cargo-update's
+    /// config sets `enforce_lock = true` for the package, and honours
+    /// `CARGO_HOME`. Run with a fixture home instead of the real one. The
+    /// check needs Python 3.11+ (`tomllib`), which every supported target
+    /// has; a controller whose `python3` is older skips this test with a
+    /// note rather than failing it.
+    #[test]
+    fn locked_update_check_reads_cargo_update_config() {
+        let has_tomllib = Command::new("python3")
+            .args(["-c", "import tomllib"])
+            .status()
+            .is_ok_and(|s| s.success());
+        if !has_tomllib {
+            eprintln!("skipping: python3 without tomllib (needs 3.11+)");
+            return;
+        }
+        let command = script("devbox", 1, false, false, false)
+            .lines()
+            .find_map(|l| l.strip_prefix("check 'kd updates locked' "))
+            .unwrap()
+            .to_owned();
+        let inner = Command::new("bash")
+            .args(["-c", &format!("printf '%s' {command}")])
+            .output()
+            .unwrap();
+        let inner = String::from_utf8(inner.stdout).unwrap();
+        let run = |config: Option<&str>| {
+            let home = tempfile::tempdir().unwrap();
+            let cargo = home.path().join("cargo");
+            fs::create_dir_all(&cargo).unwrap();
+            if let Some(config) = config {
+                fs::write(cargo.join(".install_config.toml"), config).unwrap();
+            }
+            Command::new("bash")
+                .args(["-c", &inner])
+                .env("CARGO_HOME", &cargo)
+                .env_remove("CARGO_INSTALL_ROOT")
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(run(Some("[kd]\nenforce_lock = true\n")));
+        assert!(!run(Some("[kd]\nenforce_lock = false\n")));
+        assert!(!run(Some("[other]\nenforce_lock = true\n")));
+        assert!(!run(None));
     }
 
     /// Expected values are rendered in, which is why the script is a

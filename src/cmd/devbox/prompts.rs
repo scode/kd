@@ -17,6 +17,23 @@ use super::routers::{CLAUDE_NATIVE_SETTINGS, CODEX_NATIVE_OVERRIDE};
 /// the manifest lists them. Deliberately compiled in; see SPEC.md.
 pub const ALWAYS_CLONED: [&str; 2] = ["scode/voice", "scode/dotfiles"];
 
+/// Rust tools installed straight from their GitHub repository with
+/// `cargo install --locked --git https://github.com/<repo>`, as `owner/name`.
+/// Each repository must hold a single binary package whose package name is
+/// the repository name: `cargo install --git` without a package name needs
+/// exactly one, and the probe and cargo-update's per-package config key on
+/// the package name. A repository that breaks this rule would install, but
+/// its locked-update config would be written under the wrong name. Such an install
+/// tracks the repository's default branch, so `cargo install-update -a -g`
+/// (cargo-update; `-g` is what includes git installs) brings each one to
+/// the branch's latest commit. `--locked` builds the dependency versions in
+/// the repository's committed `Cargo.lock`, the ones its CI tested, instead
+/// of re-resolving to the newest compatible releases; cargo-update's
+/// per-package `--enforce-lock` keeps its reinstalls locked too. kd itself
+/// is here so every devbox has it. Compiled in like the other package
+/// preferences; see SPEC_impl.md.
+pub const CARGO_GIT_PACKAGES: [&str; 1] = ["scode/kd"];
+
 /// Home-relative paths kd places before the user-space run; the prompt
 /// names them so the agent knows where to look.
 pub const GITHUB_TOKEN_FILE: &str = ".kd-github-token";
@@ -87,7 +104,9 @@ This is the USER-SPACE PHASE of a devbox bootstrap. Files kd placed for you, all
 
 Do these, in order:
 
-1. CLIs, using the package-source preference below: gh, jj (Jujutsu), cargo-dist, git-cliff, sccache, trunk, dioxus (`dx`), dprint, herdr, vercel, Claude Code (its own installer), OpenCode (its own installer), Muse Code (`muse`, its own installer). Of the Rust ones, cargo-dist, git-cliff, sccache, trunk and dprint have Homebrew formulae with Linux bottles; install those with `brew install`, and fall back to `cargo install` only for one whose formula turns out to be missing. dioxus has no Homebrew formula (do not try `brew install dioxus` or `dioxus-cli`); install it with `cargo install dioxus-cli`. Homebrew is at `/home/linuxbrew/.linuxbrew`; `brew` may need its shellenv sourced first. Every CLI must end up on the login shell's PATH; verify each with `command -v` in a fresh `bash -lc`.
+1. CLIs, using the package-source preference below: gh, jj (Jujutsu), cargo-dist, git-cliff, sccache, trunk, dioxus (`dx`), dprint, cargo-update (provides `cargo install-update`), herdr, vercel, Claude Code (its own installer), OpenCode (its own installer), Muse Code (`muse`, its own installer). Of the Rust ones, cargo-dist, git-cliff, sccache, trunk, dprint and cargo-update have Homebrew formulae with Linux bottles; install those with `brew install`, and fall back to `cargo install` only for one whose formula turns out to be missing (for cargo-update, first install `pkg-config` and `libssl-dev` with apt: its build needs OpenSSL headers). dioxus has no Homebrew formula (do not try `brew install dioxus` or `dioxus-cli`); install it with `cargo install dioxus-cli`. Homebrew is at `/home/linuxbrew/.linuxbrew`; `brew` may need its shellenv sourced first. Every CLI must end up on the login shell's PATH; verify each with `command -v` in a fresh `bash -lc`.
+   Rust tools built from their GitHub repository, after cargo-update is installed: for each repository below, run `cargo install --locked --git https://github.com/<owner>/<name>` as the user (no `--branch`, `--tag` or `--rev`: the install must track the repository's default branch so `cargo install-update -a -g` can update it; `--locked` builds the dependency versions in the repository's `Cargo.lock`). Each repository holds a single binary package named after the repository. Do not install these from crates.io or Homebrew, even if a package with the same name exists there. Then run `cargo install-update-config --enforce-lock <name>` for each, so cargo-update's reinstalls stay locked as well. Verify each with `cargo install --list` showing it with its `https://github.com/...` source, and `command -v <name>` in a fresh `bash -lc`:
+{cargo_git}
    Tensorlake CLI (`tl`): use its official installer, `curl -fsSL https://tensorlake.ai/install | sh`, as the user if `tl` is missing. This overrides the package-source preference below; the Python SDK is not the standalone CLI. Ensure `tl` is on PATH in a fresh `bash -lc` and verify `tl --version`. Do not run interactive `tl login`; Tensorlake authentication is outside bootstrap.
 2. GitHub: if `gh auth status` fails, `gh auth login --with-token < ~/{GITHUB_TOKEN_FILE}`. Then delete `~/{GITHUB_TOKEN_FILE}` if it exists (use `unlink`; your command policy rejects `rm -f`), whether or not you used it. Then `gh auth setup-git`.
 3. Clone `scode/voice` and then `scode/dotfiles` into `~/git/<name>` over HTTPS (skip clones that already exist). Then run `cargo run -p dotfiles -- install` from `~/git/dotfiles` twice; the second run must report zero failures. `voice` goes first because the dotfiles installer links the voice skill only when `~/git/voice` exists.
@@ -106,6 +125,11 @@ Rules: do not modify the contents of any git repository beyond cloning and `jj g
 Your final message must end with a section titled `## Workarounds` listing every step that failed, was skipped, or needed a workaround, with what you did. If there were none, that section is the single line `no workarounds`."#,
         manifest = manifest.join("\n"),
         router_policy = router_policy(),
+        cargo_git = CARGO_GIT_PACKAGES
+            .iter()
+            .map(|r| format!("     - {r}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
     )
 }
 
@@ -164,6 +188,39 @@ mod tests {
         let enrolled = user_space_phase("user", &[], false, false, true);
         assert!(enrolled.contains("Install Tailscale with its official"));
         assert!(!enrolled.contains(HERMES_ARCHIVE_FILE));
+    }
+
+    /// kd must come from its GitHub repository tracking the default branch,
+    /// or `cargo install-update -a -g` cannot keep it current; cargo-update
+    /// itself must be installed for that command to exist.
+    #[test]
+    fn user_space_installs_git_crates_and_cargo_update() {
+        let prompt = user_space_phase("user", &[], false, false, false);
+        assert!(prompt.contains("cargo install --locked --git https://github.com/<owner>/<name>"));
+        assert!(prompt.contains("cargo install-update-config --enforce-lock <name>"));
+        assert!(prompt.contains("     - scode/kd"));
+        assert!(prompt.contains("no `--branch`, `--tag` or `--rev`"));
+        assert!(prompt.contains("cargo-update (provides `cargo install-update`)"));
+        // Each listed repository is a line of its own, so no following
+        // instruction reads as a note about the last item (a missing newline
+        // once glued the dioxus and PATH rules onto the kd line).
+        for repo in CARGO_GIT_PACKAGES {
+            assert!(
+                prompt.lines().any(|l| l == format!("     - {repo}")),
+                "{repo} is not on its own line"
+            );
+        }
+        // cargo-update must be installed before `install-update-config`
+        // runs, and the dioxus rule must stay with the Homebrew paragraph.
+        let brew = prompt.find("cargo-update (provides").unwrap();
+        let dioxus = prompt.find("dioxus has no Homebrew formula").unwrap();
+        let git = prompt
+            .find("Rust tools built from their GitHub repository")
+            .unwrap();
+        let config = prompt
+            .find("cargo install-update-config --enforce-lock")
+            .unwrap();
+        assert!(brew < dioxus && dioxus < git && git < config);
     }
 
     /// Reruns meet routers that may have no accounts. Both phases must be
