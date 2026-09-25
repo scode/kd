@@ -240,6 +240,35 @@ Commands for tools installed with `cargo install --git` from repositories under 
 - `--dry-run` lists the tools and the commands without running them.
 - No matching tools is not an error; the command says so and exits 0.
 
+### kd cargo scode install NAME [--dry-run]
+
+- Installs the tool from `https://github.com/scode/NAME` with
+  `cargo install --locked --git
+  https://github.com/scode/NAME NAME`: no `.git`, no branch, tag or commit, so it tracks
+  the default branch and `update` can update it later, built with the repository's committed `Cargo.lock`. The
+  repository must hold a binary package named NAME.
+- If cargo-update is installed, the tool is then marked with its per-package lock setting
+  (`cargo install-update-config --enforce-lock NAME`) so later updates stay locked. Without cargo-update it says so;
+  `update` needs cargo-update anyway and applies the setting when it runs. If that step fails after a successful
+  install, it is a warning, not an error.
+- NAME must work as both a GitHub repository name and a cargo package name: an ASCII letter first, then letters, digits,
+  `-` or `_`, at most 64 characters. Anything else is refused before cargo runs.
+- It never replaces an existing install of NAME. An unpinned install from github.com/scode/NAME is reported as already
+  installed, with a pointer to `update`. A pinned one (tag or commit) is refused with a pointer to `uninstall`, since
+  `update` skips pins. An install from anywhere else (crates.io, another owner, a different scode repository, a path) is
+  refused with a pointer to `cargo uninstall`: cargo itself would silently replace a same-named package from another
+  source.
+- `--dry-run` shows the commands without running them, including whether the lock step would run.
+
+### kd cargo scode uninstall NAME [--dry-run]
+
+- Runs `cargo uninstall NAME`, but only for a tool installed from a github.com/scode repository (in any URL form
+  `update` recognises). A tool that is not installed, or installed from crates.io, another owner or a path, is refused
+  with the reason.
+- The tool's cargo-update settings are deliberately left in place, even though `cargo install-update-config --reset`
+  could remove them: they are harmless, and they keep a later reinstall locked.
+- `--dry-run` shows the command without running it.
+
 ## kd cli-proxy-api manage-priorities
 
 NOTE: This manages routing priorities for one CLIProxyAPI instance's Claude accounts. It does not log accounts in,
