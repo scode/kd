@@ -135,13 +135,58 @@ main() {
   # kd installer and replacing an existing kd binary (typically one from the
   # older checkout-based installer, which cargo would otherwise refuse to
   # overwrite) is the point of running it, so a rerun rebuilds kd from the
-  # current default branch; and no cargo-update lock setting, since
-  # cargo-update is usually not installed here and `kd cargo scode update`
-  # applies that setting itself before it updates.
+  # current default branch; and no cargo-update lock setting here, since
+  # cargo-update may not exist yet (it is installed, and the setting
+  # written, just below).
   # `${arr[@]+...}`: bash 3.2 (macOS /bin/bash) treats expanding an empty
   # array under `set -u` as an unbound variable, and `toolchain` is empty
   # on the normal path.
   cargo ${toolchain[@]+"${toolchain[@]}"} install --locked --force --git https://github.com/scode/kd kd
+
+  # cargo-update provides `cargo install-update`, which `kd cargo scode
+  # update` drives; without it kd can be installed but never updated. An
+  # existing cargo-update, from cargo or Homebrew, is left alone. Every
+  # failure in this block is a warning, not an error: kd itself is installed
+  # and usable by now, only updating it needs cargo-update.
+  if ! cargo install-update --help >/dev/null 2>&1; then
+    # cargo-update links OpenSSL on every Unix, macOS included (libssh2-sys,
+    # pulled in by git2, requires openssl-sys everywhere). `vendored-openssl`
+    # builds OpenSSL from source instead of needing its headers and
+    # pkg-config, which a fresh machine usually lacks. That build runs make
+    # and a Perl with the core modules OpenSSL's Configure uses; check for
+    # them first so a missing one gets a fix instead of a long build error.
+    local cu_cmd=(cargo)
+    # Current cargo-update may need a newer rust than kd does (22.1.1 wants
+    # 1.86). With rustup, build it with the latest stable toolchain,
+    # installing it if needed, whatever the default is; without rustup, use
+    # the cargo at hand and let a too-old one fail with the warning below.
+    if command -v rustup >/dev/null 2>&1; then
+      rustup toolchain install stable --profile minimal >/dev/null 2>&1 || true
+      cu_cmd=(cargo +stable)
+    fi
+    cu_cmd+=(install --locked --features vendored-openssl cargo-update)
+    if ! command -v make >/dev/null 2>&1 || ! perl -MFindBin -MIPC::Cmd -MFile::Compare -e 1 >/dev/null 2>&1; then
+      echo "" >&2
+      echo "warning: kd is installed, but cargo-update was not: building it needs \`make\` and a" >&2
+      echo "         full perl (e.g. apt install make perl). Install those, then run:" >&2
+      echo "         ${cu_cmd[*]}" >&2
+    else
+      echo "installing cargo-update (for \`kd cargo scode update\`)" >&2
+      if ! "${cu_cmd[@]}"; then
+        echo "" >&2
+        echo "warning: kd is installed, but installing cargo-update failed, so" >&2
+        echo "         \`kd cargo scode update\` won't work until it is installed; retry with:" >&2
+        echo "         ${cu_cmd[*]}" >&2
+      fi
+    fi
+  fi
+  # Mark kd's future cargo-update rebuilds as locked, as `kd cargo scode
+  # install` does. `kd cargo scode update` also writes this before every
+  # update, so a failure here only costs a warning.
+  if cargo install-update --help >/dev/null 2>&1; then
+    cargo install-update-config --enforce-lock kd >/dev/null ||
+      echo "warning: could not mark kd's updates as locked; \`kd cargo scode update\` will do it" >&2
+  fi
 
   # cargo puts the binary in $CARGO_INSTALL_ROOT/bin if set, else
   # $CARGO_HOME/bin (~/.cargo/bin by default). An `install.root` set in a
