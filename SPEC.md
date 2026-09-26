@@ -17,8 +17,17 @@ without it, and it must work unattended on a fresh macOS or Linux machine that h
 - Installs kd with `cargo install --locked --force --git https://github.com/scode/kd kd`: the same recorded source as
   `kd cargo scode install kd`, so `kd cargo scode update` maintains it. Unlike that command it passes `--force`: it is
   the kd installer, so replacing an existing kd (typically one from the older checkout-based installer) is intended, and
-  every rerun rebuilds kd from the default branch. It does not write cargo-update's lock setting; `update` applies it
-  before it updates.
+  every rerun rebuilds kd from the default branch.
+- Then, unless `cargo install-update` already works (a cargo-update from cargo or Homebrew is left alone), it tries to
+  install cargo-update with `cargo install --locked --features vendored-openssl cargo-update`. cargo-update needs
+  OpenSSL on every Unix, macOS included; the vendored build compiles it from source, so no OpenSSL headers or
+  `pkg-config` are needed, but `make` and a full Perl are, and their absence is reported before building. With rustup,
+  cargo-update is built with `+stable` (installed if missing), because current cargo-update can need a newer rust than
+  kd. With cargo-update available it writes kd's lock setting (`cargo install-update-config --enforce-lock kd`). Every
+  failure in these steps is a warning with the command to retry, not an error: kd is already installed, and
+  `kd cargo
+  scode update` also writes the lock setting before it updates. A successful installer run therefore does
+  not guarantee cargo-update is present; the warning says so.
 - Ends with a banner when `kd` does not resolve to the installed binary (not on PATH, or shadowed by another `kd`
   earlier on PATH), and, when it installed rust itself, a note that the current shell needs rustup's env file sourced or
   a restart. The latter is printed even when a later step fails.
