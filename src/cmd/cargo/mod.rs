@@ -70,9 +70,13 @@ impl Commands {
     pub fn run(self) -> anyhow::Result<()> {
         match self {
             Commands::Scode { cmd } => match cmd {
-                ScodeCommands::Update(args) => scode_update(args.dry_run),
-                ScodeCommands::Install(args) => scode_install(&args.name, args.dry_run),
-                ScodeCommands::Uninstall(args) => scode_uninstall(&args.name, args.dry_run),
+                ScodeCommands::Update(args) => scode_update(&Shell::new()?, args.dry_run),
+                ScodeCommands::Install(args) => {
+                    scode_install(&Shell::new()?, &args.name, args.dry_run)
+                }
+                ScodeCommands::Uninstall(args) => {
+                    scode_uninstall(&Shell::new()?, &args.name, args.dry_run)
+                }
             },
         }
     }
@@ -187,8 +191,53 @@ fn update_args(tools: &[String]) -> Vec<String> {
     args
 }
 
-fn scode_update(dry_run: bool) -> anyhow::Result<()> {
-    let sh = Shell::new()?;
+/// Set so that installing and updating tools from private github.com/scode
+/// repositories, which require authentication, works. It is cargo's switch
+/// for fetching git sources with the `git` command, which uses the
+/// credentials the user's git is already configured with, instead of
+/// cargo's bundled libgit2, which supports some credential setups but fails
+/// with others (it failed with "failed to acquire username/password" for a
+/// private repository `git ls-remote` read fine). cargo-update reads the
+/// same variable (and the `net.git-fetch-with-cli` config key) for its own
+/// remote lookups.
+const GIT_FETCH_WITH_CLI: &str = "CARGO_NET_GIT_FETCH_WITH_CLI";
+
+/// Whether an executable `git` is on the shell's PATH.
+fn git_available(sh: &Shell) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let path = sh.var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path).any(|dir| {
+        std::fs::metadata(dir.join("git"))
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    })
+}
+
+/// Make a cargo or cargo-update command that fetches from GitHub use the
+/// `git` command, so private github.com/scode repositories, which require
+/// authentication, can be installed and updated with the user's git
+/// credentials (see [`GIT_FETCH_WITH_CLI`]).
+///
+/// - A non-empty value the user set in the environment, even `false`, wins
+///   and is passed through untouched. (A `net.git-fetch-with-cli` setting in
+///   cargo's config is overridden when kd sets the variable.)
+/// - Otherwise the `git` command is used only if `git` is on PATH. Fetching
+///   with the CLI makes git a hard requirement, and a machine set up by
+///   install.sh need not have it; there, cargo's built-in fetching still
+///   serves public repositories, so it is left in place.
+/// - An empty value counts as unset, and is removed rather than passed on
+///   when git is absent, since cargo rejects an empty boolean.
+fn with_git_cli<'a>(sh: &Shell, cmd: xshell::Cmd<'a>) -> xshell::Cmd<'a> {
+    let explicit = sh.var_os(GIT_FETCH_WITH_CLI).filter(|v| !v.is_empty());
+    if explicit.is_some() {
+        cmd
+    } else if git_available(sh) {
+        cmd.env(GIT_FETCH_WITH_CLI, "true")
+    } else {
+        cmd.env_remove(GIT_FETCH_WITH_CLI)
+    }
+}
+
+fn scode_update(sh: &Shell, dry_run: bool) -> anyhow::Result<()> {
     let listing = cmd!(sh, "cargo install --list")
         .quiet()
         .read()
@@ -215,7 +264,7 @@ fn scode_update(dry_run: bool) -> anyhow::Result<()> {
     }
     // Checked up front so a missing cargo-update gets a useful message
     // instead of cargo's generic "no such command".
-    if !cargo_update_available(&sh) {
+    if !cargo_update_available(sh) {
         bail!(
             "`cargo install-update` is not available; install cargo-update (`brew install cargo-update` or `cargo install cargo-update`)"
         );
@@ -234,7 +283,7 @@ fn scode_update(dry_run: bool) -> anyhow::Result<()> {
     // writing a new file and renaming it into place, and the running process
     // keeps its old inode.
     let args = update_args(tools);
-    cmd!(sh, "cargo {args...}")
+    with_git_cli(sh, cmd!(sh, "cargo {args...}"))
         .run()
         .context("cargo install-update failed")?;
     Ok(())
@@ -382,10 +431,9 @@ fn cargo_update_available(sh: &Shell) -> bool {
 /// A failure of the lock step after a successful install is a warning, not
 /// an error: the tool is installed and usable, and `update` applies the
 /// same setting to every tool before it updates.
-fn scode_install(name: &str, dry_run: bool) -> anyhow::Result<()> {
+fn scode_install(sh: &Shell, name: &str, dry_run: bool) -> anyhow::Result<()> {
     validate_name(name)?;
-    let sh = Shell::new()?;
-    match install_plan(&installed_tools(&sh)?, name) {
+    match install_plan(&installed_tools(sh)?, name) {
         InstallPlan::Install => {}
         InstallPlan::AlreadyInstalled => {
             println!(
@@ -403,7 +451,7 @@ fn scode_install(name: &str, dry_run: bool) -> anyhow::Result<()> {
     }
     let install = install_args(name);
     let lock = lock_args(name);
-    let can_lock = cargo_update_available(&sh);
+    let can_lock = cargo_update_available(sh);
     if dry_run {
         println!("dry run: would run `cargo {}`", install.join(" "));
         if can_lock {
@@ -413,7 +461,7 @@ fn scode_install(name: &str, dry_run: bool) -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    cmd!(sh, "cargo {install...}")
+    with_git_cli(sh, cmd!(sh, "cargo {install...}"))
         .run()
         .with_context(|| format!("installing {name}"))?;
     if !can_lock {
@@ -436,10 +484,9 @@ fn scode_install(name: &str, dry_run: bool) -> anyhow::Result<()> {
 /// though cargo-update could delete them (`install-update-config --reset`
 /// drops an entry that ends up at its defaults): they are harmless, and
 /// they keep a later reinstall locked.
-fn scode_uninstall(name: &str, dry_run: bool) -> anyhow::Result<()> {
+fn scode_uninstall(sh: &Shell, name: &str, dry_run: bool) -> anyhow::Result<()> {
     validate_name(name)?;
-    let sh = Shell::new()?;
-    match uninstall_plan(&installed_tools(&sh)?, name) {
+    match uninstall_plan(&installed_tools(sh)?, name) {
         UninstallPlan::Missing => bail!("{name} is not installed"),
         UninstallPlan::Foreign(source) => bail!(
             "{name} is installed from {}, not a github.com/scode repository; use `cargo uninstall {name}` if you mean it",
@@ -657,6 +704,98 @@ local v0.1.0 (/home/me/src/local):
             uninstall_plan(&installed, "other"),
             UninstallPlan::Foreign(Some("https://github.com/someone/other#abc123".to_owned()))
         );
+    }
+
+    /// Runs the real command functions against a stub `cargo` whose
+    /// directory is the xshell `Shell`'s entire PATH (the test process
+    /// environment is never touched), plus a stub `git` when `git` is true,
+    /// so both the git-present and git-absent cases are testable on any
+    /// machine. The stubs use only shell builtins. `cargo` answers
+    /// `install --list` from `listing`, succeeds at everything else, and
+    /// logs `<CARGO_NET_GIT_FETCH_WITH_CLI or unset>|<args>` per call.
+    /// `fetch_with_cli` of `""` stands for "not set": kd treats an empty value
+    /// as unset, and a Shell cannot remove a variable the test process has.
+    fn run_with_stub_cargo(
+        listing: &str,
+        fetch_with_cli: &str,
+        git: bool,
+        run: impl FnOnce(&Shell) -> anyhow::Result<()>,
+    ) -> Vec<String> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let list = dir.path().join("listing");
+        std::fs::write(&list, listing).unwrap();
+        let exe = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        };
+        exe(
+            "cargo",
+            "#!/bin/sh\nprintf '%s|%s\\n' \"${CARGO_NET_GIT_FETCH_WITH_CLI-unset}\" \"$*\" >> \"$STUB_LOG\"\nif [ \"$1 $2\" = 'install --list' ]; then while IFS= read -r l; do printf '%s\\n' \"$l\"; done < \"$STUB_LISTING\"; fi\nexit 0\n",
+        );
+        if git {
+            exe("git", "#!/bin/sh\nexit 0\n");
+        }
+        let sh = Shell::new().unwrap();
+        sh.set_var("PATH", dir.path());
+        sh.set_var("STUB_LOG", &log);
+        sh.set_var("STUB_LISTING", &list);
+        sh.set_var(GIT_FETCH_WITH_CLI, fetch_with_cli);
+        run(&sh).unwrap();
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    const KD_LISTING: &str = "kd v0.1.0 (https://github.com/scode/kd#abc):\n    kd\n";
+    const TOOL_INSTALL: &str = "install --locked --git https://github.com/scode/tool tool";
+
+    /// Private scode repositories only install and update when cargo and
+    /// cargo-update fetch with the `git` command (whose credentials work),
+    /// so with git on PATH and no explicit setting, both fetching commands
+    /// must get the variable.
+    #[test]
+    fn fetching_commands_use_the_git_cli_when_git_exists() {
+        let log = run_with_stub_cargo(KD_LISTING, "", true, |sh| scode_update(sh, false));
+        assert!(
+            log.contains(&"true|install-update -g kd".to_owned()),
+            "{log:?}"
+        );
+        let log = run_with_stub_cargo("", "", true, |sh| scode_install(sh, "tool", false));
+        assert!(log.contains(&format!("true|{TOOL_INSTALL}")), "{log:?}");
+    }
+
+    /// Without git the CLI cannot be used at all; public repositories must
+    /// keep working through cargo's built-in fetching, so the variable is
+    /// not set (and an empty one is removed, not passed on).
+    #[test]
+    fn without_git_cargo_keeps_its_builtin_fetching() {
+        let log = run_with_stub_cargo(KD_LISTING, "", false, |sh| scode_update(sh, false));
+        assert!(
+            log.contains(&"unset|install-update -g kd".to_owned()),
+            "{log:?}"
+        );
+        let log = run_with_stub_cargo("", "", false, |sh| scode_install(sh, "tool", false));
+        assert!(log.contains(&format!("unset|{TOOL_INSTALL}")), "{log:?}");
+    }
+
+    /// An explicit user setting, even `false`, is passed through untouched
+    /// for both commands, git or not.
+    #[test]
+    fn explicit_setting_wins() {
+        for git in [true, false] {
+            let log = run_with_stub_cargo(KD_LISTING, "false", git, |sh| scode_update(sh, false));
+            assert!(
+                log.contains(&"false|install-update -g kd".to_owned()),
+                "{log:?}"
+            );
+            let log = run_with_stub_cargo("", "false", git, |sh| scode_install(sh, "tool", false));
+            assert!(log.contains(&format!("false|{TOOL_INSTALL}")), "{log:?}");
+        }
     }
 
     /// Nothing that looks unlike a header may become a tool name.

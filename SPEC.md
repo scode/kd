@@ -252,6 +252,13 @@ non-ImageMagick helpers still behave correctly. It does not prove that thumbnail
 
 Commands for tools installed with `cargo install --git` from repositories under github.com/scode, kd included.
 
+Private repositories, which require authentication, work: when `git` is on PATH, the commands that fetch from GitHub
+(`install` and `update`) run cargo and cargo-update with `CARGO_NET_GIT_FETCH_WITH_CLI=true`, so they fetch with the
+`git` command and whatever credentials it is configured with. cargo's built-in git support handles some credential
+setups but fails with others. Without `git` on PATH, cargo's built-in fetching is left in place, so public repositories
+still work on a machine without git. A non-empty `CARGO_NET_GIT_FETCH_WITH_CLI` in the environment, even `false`, is
+passed through unchanged; a `net.git-fetch-with-cli` setting in cargo's config is overridden when kd sets the variable.
+
 ### kd cargo scode update [--dry-run]
 
 - Updates every tool installed with `cargo install --git` from a repository under github.com/scode (owner matched
