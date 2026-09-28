@@ -163,21 +163,24 @@ Bootstrap first tries that user, then root if the login fails, including during 
 account if missing, authorizes the configured key, and grants passwordless sudo. An existing user login needs
 passwordless sudo to perform setup.
 
-The controller must have credentials for Codex, Claude, OpenCode and Muse. Bootstrap copies them to the target, uses two
-remote Codex runs for setup, and prints a probe report plus each phase's workarounds. Probe failures do not change the
-command's exit status; inspect the report before relying on the box. Destroy disposable targets yourself when done.
+The controller must have logins for Codex, OpenCode and Muse. OpenCode's and Muse's are copied to the target. The Codex
+login (a file-backed ChatGPT login with at least a day left before its access token expires; `codex login` gives a fresh
+one) is only lent to the two remote Codex runs that do the setup, then taken back and deleted from the target, because
+two live copies of one ChatGPT login break each other. Claude's login is not used. Bootstrap prints a probe report plus
+each phase's workarounds. Probe failures do not change the command's exit status; inspect the report before relying on
+the box. Destroy disposable targets yourself when done.
 
-Keep interactive Claude sessions closed during bootstrap. After installing Claude and verifying its copied login, kd
-completes its first-run onboarding state so opening `claude` does not ask you to log in again. Existing settings and
-project trust decisions are preserved. `backup --yes` skips its confirmation, not the preflight report. See
-[SPEC.md](SPEC.md#kd-devbox) for prompts, restore semantics, and migrating the old per-box configuration format.
+Keep interactive Claude and Codex sessions closed during bootstrap, on the target and on the controller. After wiring
+Claude to its router, kd completes its first-run onboarding state so opening `claude` does not ask you to log in.
+Existing settings and project trust decisions are preserved. `backup --yes` skips its confirmation, not the preflight
+report. See [SPEC.md](SPEC.md#kd-devbox) for prompts, restore semantics, and migrating the old per-box configuration
+format.
 
 Bootstrap also runs two local subscription routers in Docker, bound to loopback only: codex-lb for Codex and CLIProxyAPI
-for Claude. Plain `codex` and `claude` on the box then go through them. They start with no accounts, and logging
-accounts in is a manual step after bootstrap (bootstrap prints the tunnel command and where to go). Until then the
-default CLIs fail on that box; `codex -c 'model_provider="openai"'` and
-`claude --settings '{"env":{"ANTHROPIC_BASE_URL":"","ANTHROPIC_AUTH_TOKEN":""}}'` bypass them. Router accounts and
-history live in Docker volumes and are not backed up.
+for Claude. They are the only way `codex` and `claude` on the box reach a model, so Docker must work there or bootstrap
+fails. They start with no accounts, and logging accounts in is a manual step after bootstrap (bootstrap prints the
+tunnel command and where to go). Until then `codex` and `claude` on that box fail; there is no native login to fall back
+to. Router accounts and history live in Docker volumes and are not backed up.
 
 Bootstrap installs `kd` itself from this repository's default branch with `cargo install --locked --git`. On a
 bootstrapped box, `kd cargo scode update` updates kd, and any other tool installed from a github.com/scode repository,

@@ -7,12 +7,12 @@
 //! own final messages are printed after it; between the two, a person can
 //! see what the box actually is.
 //!
-//! It deliberately hardcodes one real request per agent CLI. That is drift
-//! kd accepts (see SPEC_impl.md): a rotted probe line shows up as a failed
-//! probe item, never as a failed run.
+//! It deliberately hardcodes one real request per probed agent CLI (Codex
+//! and Muse). That is drift kd accepts (see SPEC_impl.md): a rotted probe
+//! line shows up as a failed probe item, never as a failed run.
 
 use super::prompts::CARGO_GIT_PACKAGES;
-use super::routers::{CLAUDE_NATIVE_SETTINGS, CLIPROXY_PORT, CODEX_LB_PORT, CODEX_NATIVE_OVERRIDE};
+use super::routers::{CLIPROXY_PORT, CODEX_LB_PORT, CODEX_NATIVE_OVERRIDE};
 use super::transport::{Transport, shell_quote};
 use std::path::Path;
 
@@ -95,19 +95,16 @@ pub fn script(
         "codex installation",
         "test \"$(command -v codex)\" -ef \"$HOME/.local/bin/codex\"",
     );
-    // Requests bypass the routers: on a fresh box they have no accounts yet,
-    // so these lines check the credentials kd copied, not the routers.
+    // The request bypasses codex-lb, which has no accounts on a fresh box,
+    // and uses the login kd lent for this run. The probe runs before kd takes
+    // that login back, so this checks the installed CLI end to end, not the
+    // router. There is no Claude request: the box has no claude.ai login,
+    // and CLIProxyAPI has no accounts yet. The router checks below cover
+    // Claude's wiring; interactive readiness is the onboarding line.
     check(
         "codex request",
         &format!(
             "codex exec --skip-git-repo-check {CODEX_NATIVE_OVERRIDE} 'reply ok' >/dev/null 2>&1"
-        ),
-    );
-    check(
-        "claude request",
-        &format!(
-            "claude --settings {} -p ok >/dev/null 2>&1",
-            shell_quote(CLAUDE_NATIVE_SETTINGS)
         ),
     );
     check(

@@ -18,6 +18,7 @@ pub mod agent;
 pub mod backup;
 pub mod bootstrap;
 pub mod claude;
+pub mod codex_login;
 pub mod git_identity;
 pub mod hermes;
 pub mod probe;

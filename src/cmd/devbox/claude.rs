@@ -1,37 +1,29 @@
-//! Complete Claude's first-run gate after transferring working credentials.
+//! Complete Claude's first-run gate once Claude is wired to CLIProxyAPI.
 //!
-//! Claude's interactive onboarding is separate from OAuth authentication:
+//! Claude's interactive onboarding is separate from authentication:
 //! `claude -p` can succeed while the first interactive launch still asks for
 //! login. Keep this small state repair deterministic instead of depending
 //! on an agent to notice a gate that its noninteractive checks never enter.
+//!
+//! The target has no claude.ai login of its own (see SPEC_impl.md
+//! "Secrets"); Claude authenticates to the router with the proxy token in
+//! `~/.claude/settings.json`. `claude auth status` reports `loggedIn: true`
+//! for that token, so the check here is that Claude picked up the router
+//! wiring, not that any upstream account works.
 
-use super::routers::CLAUDE_NATIVE_SETTINGS;
-use super::transport::{Transport, shell_quote};
+use super::transport::Transport;
 
-/// Mark onboarding complete only after the installed CLI accepts the login.
-/// Existing preferences and project trust decisions stay on the target;
-/// copying the controller's entire `.claude.json` would transplant those too.
+/// Mark onboarding complete only after the installed CLI reports itself
+/// authenticated. Existing preferences and project trust decisions stay on
+/// the target; copying the controller's entire `.claude.json` would
+/// transplant those too.
 pub fn complete_onboarding(t: &Transport) -> anyhow::Result<()> {
-    t.run(&complete_onboarding_script())
+    t.run(COMPLETE_ONBOARDING)
 }
 
-/// The auth check bypasses CLIProxyAPI. On a rerun settings.json already
-/// carries the proxy token, and `claude auth status` then reports
-/// `loggedIn: true` for that token even when the copied claude.ai login is
-/// broken; the bypass makes it answer for the native login again.
-fn complete_onboarding_script() -> String {
-    COMPLETE_ONBOARDING.replace(
-        "status=$(claude auth status)",
-        &format!(
-            "status=$(claude --settings {} auth status)",
-            shell_quote(CLAUDE_NATIVE_SETTINGS)
-        ),
-    )
-}
-
-/// Run after the user-space installer, when both Claude and jq are present.
-/// Rendered through [`complete_onboarding_script`], which adds the router
-/// bypass to the auth check; do not run this constant directly.
+/// Run after the router wiring, when Claude, jq and the proxy token in
+/// settings.json are all present. Before the wiring, a box with no
+/// claude.ai login would fail the auth check.
 /// The target must not have an interactive Claude process writing its config
 /// during bootstrap. A same-directory rename prevents a partial JSON write;
 /// it does not serialize against Claude's own concurrent config updates.
@@ -73,8 +65,9 @@ mod tests {
     use std::process::{Command, Output};
 
     /// Isolate the script's target home and CLI in child-process environment
-    /// variables. The stub answers only the router-bypassing auth check, so a
-    /// regression to plain `claude auth status` fails every test here. jq and
+    /// variables. The stub answers only plain `claude auth status`: the box
+    /// has no native login, so a regression back to a router-bypassing check
+    /// would fail on every real target and fails every test here. jq and
     /// bash are real so the test exercises the actual file update, rather
     /// than a second implementation of its JSON merge.
     fn run(home: &std::path::Path, authenticated: bool) -> Output {
@@ -84,8 +77,7 @@ mod tests {
         fs::write(
             &cli,
             format!(
-                "#!/bin/sh\n[ \"$*\" = {} ] || exit 2\nprintf '%s' '{{\"loggedIn\":{authenticated}}}'\n",
-                shell_quote(&format!("--settings {CLAUDE_NATIVE_SETTINGS} auth status"))
+                "#!/bin/sh\n[ \"$*\" = 'auth status' ] || exit 2\nprintf '%s' '{{\"loggedIn\":{authenticated}}}'\n"
             ),
         )
         .unwrap();
@@ -95,7 +87,7 @@ mod tests {
         )
         .unwrap();
         Command::new("bash")
-            .args(["-c", &complete_onboarding_script()])
+            .args(["-c", COMPLETE_ONBOARDING])
             .env("HOME", home)
             .env("PATH", path)
             .output()

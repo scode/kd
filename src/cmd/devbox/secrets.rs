@@ -1,17 +1,18 @@
-//! Controller-side credential sources for the four agent CLIs.
+//! Controller-side credential sources for the agent CLIs whose logins
+//! bootstrap copies to the target for good: OpenCode and Muse.
 //!
-//! `backup` and `bootstrap` both start by resolving these, before anything is
-//! stopped or written, so a missing login on the laptop fails fast instead
-//! of after an hour of package installs. The contents are read into memory
-//! here and only ever handed to [`super::transport::Transport::push_secret`];
-//! nothing in this module logs or prints a value.
+//! Codex and Claude are deliberately absent. On the target they go through
+//! codex-lb and CLIProxyAPI and need no login of their own; Claude's is never
+//! copied, and Codex's is only lent to the setup agent for the length of a
+//! run (see [`super::codex_login`]). A copied login whose refresh token
+//! rotates breaks whichever copy refreshes second, which is why those two
+//! stopped being copied.
 //!
-//! Locations follow SPEC_impl.md "Secrets". The one non-obvious rule is
-//! Claude on macOS: Claude Code stores its login in the Keychain whenever the
-//! Keychain is writable and writes `~/.claude/.credentials.json` only as a
-//! fallback, so a stale file can sit next to a live Keychain entry. The
-//! Keychain is therefore tried first and the file is used only when that
-//! lookup fails. The Keychain payload is the same JSON the Linux file holds.
+//! `bootstrap` resolves these before anything is written, so a missing login
+//! on the laptop fails fast instead of after an hour of package installs.
+//! The contents are read into memory here and only ever handed to
+//! [`super::transport::Transport::push_secret`]; nothing in this module logs
+//! or prints a value. Locations follow SPEC_impl.md "Secrets".
 
 use anyhow::{Context, bail};
 use std::path::Path;
@@ -22,43 +23,17 @@ use std::process::Command;
 pub struct AuthSource {
     /// CLI name, for messages only.
     pub cli: &'static str,
-    /// Home-relative destination on the target, e.g. `.codex/auth.json`.
+    /// Home-relative destination on the target, e.g. `.config/muse/auth.json`.
     pub remote_relative: &'static str,
     /// The credential bytes. Never logged.
     pub contents: Vec<u8>,
 }
 
-/// Keychain service name Claude Code uses on macOS. Observed on the
-/// controller; see SPEC_impl.md.
-const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
-
-/// Resolve all four sources from `home`, failing with one message naming
+/// Resolve both sources from `home`, failing with one message naming
 /// every missing one so a fresh laptop is fixed in one round trip.
 pub fn resolve_all(home: &Path) -> anyhow::Result<Vec<AuthSource>> {
     let mut sources = Vec::new();
     let mut missing = Vec::new();
-
-    match read_file(&home.join(".codex/auth.json")) {
-        Some(contents) => sources.push(AuthSource {
-            cli: "codex",
-            remote_relative: ".codex/auth.json",
-            contents,
-        }),
-        None => missing.push(
-            "codex: ~/.codex/auth.json (set cli_auth_credentials_store = \"file\" in ~/.codex/config.toml and run `codex login`)",
-        ),
-    }
-
-    match claude_credentials(home) {
-        Some(contents) => sources.push(AuthSource {
-            cli: "claude",
-            remote_relative: ".claude/.credentials.json",
-            contents,
-        }),
-        None => missing.push(
-            "claude: neither the Keychain item nor ~/.claude/.credentials.json (run `claude` and log in)",
-        ),
-    }
 
     match read_file(&home.join(".local/share/opencode/auth.json")) {
         Some(contents) => sources.push(AuthSource {
@@ -165,23 +140,10 @@ fn muse_schema1(
     Ok(Value::Object(root))
 }
 
-/// Keychain first, file second; see the module docs for why the order is
-/// not negotiable.
-fn claude_credentials(home: &Path) -> Option<Vec<u8>> {
-    keychain_password(CLAUDE_KEYCHAIN_SERVICE)
-        .or_else(|| read_file(&home.join(".claude/.credentials.json")))
-}
-
-/// `security find-generic-password -s <service> -w`, or `None` when the tool
-/// is absent (Linux controller), the item is absent, or the Keychain is
-/// locked. All three mean "not available here", which is all the caller
-/// distinguishes.
-fn keychain_password(service: &str) -> Option<Vec<u8>> {
-    keychain_password_for(service, None)
-}
-
-/// Like [`keychain_password`], optionally narrowed to an account name for
-/// services that hold several items.
+/// `security find-generic-password -s <service> [-a <account>] -w`, or
+/// `None` when the tool is absent (Linux controller), the item is absent, or
+/// the Keychain is locked. All three mean "not available here", which is
+/// all the caller distinguishes.
 fn keychain_password_for(service: &str, account: Option<&str>) -> Option<Vec<u8>> {
     let mut cmd = Command::new("security");
     cmd.args(["find-generic-password", "-s", service]);
@@ -193,7 +155,7 @@ fn keychain_password_for(service: &str, account: Option<&str>) -> Option<Vec<u8>
         return None;
     }
     // `-w` prints the value followed by a newline; the JSON must not carry
-    // that newline into the file Claude Code reads.
+    // that newline into the file the CLI reads.
     let mut bytes = output.stdout;
     while bytes.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
         bytes.pop();

@@ -39,10 +39,12 @@ the selected file before running; do not overwrite saved profiles to make a test
 private temporary directory with `kd/devboxes.toml` under it, and set `XDG_CONFIG_HOME` only for the child invocation.
 That overrides configuration selection, not the source of every credential or Git identity. Check those separately.
 
-Before bootstrap, verify the configured public key, the two global Git author fields, and the availability of all four
-agent credential sources. Do not print credential contents. Bootstrap copies only Git `user.name` and `user.email`; do
-not transplant the laptop's whole Git config. Credential-copy success is not evidence of provider endorsement or
-assurance about account policy. Follow the user's chosen authentication approach without silently substituting another.
+Before bootstrap, verify the configured public key, the two global Git author fields, and the controller's OpenCode,
+Muse and Codex credentials. The Codex login must be a file-backed ChatGPT login whose access token has at least 24 hours
+left, or preflight refuses it; `codex login` on the controller fixes that. Claude's controller login is not used. Do not
+print credential contents. Bootstrap copies only Git `user.name` and `user.email`; do not transplant the laptop's whole
+Git config. Credential-copy success is not evidence of provider endorsement or assurance about account policy. Follow
+the user's chosen authentication approach without silently substituting another.
 
 Keep personal hostnames, usernames, addresses, secrets and local environment details out of tracked docs, fixtures,
 screenshots and PR text. Record operational evidence in the user's designated private/excluded log when one exists;
@@ -104,6 +106,11 @@ headless request. Reaching a workspace-trust prompt can prove the login wizard w
 starting work. Close test sessions afterwards. Do not kill the user's sessions or race an active CLI's config writes;
 coordinate closure when the operation requires it.
 
+For credential work, check after the run that `~/.codex/auth.json` and `~/.claude/.credentials.json` are absent on the
+target and that the controller's Codex still works (a request through the controller's own provider, not just the file's
+presence). A failed run whose take-back could not reach the target leaves the lent Codex login there until the next run;
+say so in the report rather than deleting it by hand, since it may be the only live copy.
+
 For router work, remember the probe checks health, loopback-only listeners, the CLIProxyAPI key gate and client wiring,
 but not accounts: a fresh box's plain `codex` and `claude` fail until someone logs accounts in through the printed
 tunnel. Proving routing needs that login plus a request through each default CLI, which is a separate, user-driven step.
@@ -134,4 +141,5 @@ needed within the authorized task; this runbook does not require a fresh remote 
 Report the tested revision, validation level, remaining failures and relevant target software versions without
 publishing private host details. State separately whether code was merged, the fix was applied live, and the complete
 flow was exercised. Keep the implementation log current if the user requested one. Targets retain real credentials after
-testing; follow the user's cleanup instructions rather than automatically destroying them or deleting archives.
+testing (the GitHub login, OpenCode's and Muse's, restored Hermes state, and router accounts once logged in); follow the
+user's cleanup instructions rather than automatically destroying them or deleting archives.

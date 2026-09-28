@@ -103,10 +103,10 @@ installation. Existing package-manager installs need not be deleted; the command
 the seeded installation. The probe compares file identity with `test -ef` so symlinks work and PATH shadowing is
 reported.
 
-Rust also completes Claude's first-run onboarding after verifying authentication, and transfers only the controller's
-global Git author defaults before and after the user-space phase. Headless Claude requests missed the interactive
-onboarding gate; GitHub authentication did not supply a Git author. These narrow repairs preserve unrelated settings and
-keep identity values out of prompts. They do not move general package or dotfiles installation into Rust.
+Rust also completes Claude's first-run onboarding after the router wiring gives Claude a proxy token, and transfers only
+the controller's global Git author defaults before and after the user-space phase. Headless Claude requests missed the
+interactive onboarding gate; GitHub authentication did not supply a Git author. These narrow repairs preserve unrelated
+settings and keep identity values out of prompts. They do not move general package or dotfiles installation into Rust.
 
 The agent may not: modify repository contents (repos are data, not things to fix), touch controller state, read secrets
 it doesn't need, or decide the target is safe. It reports failures and workarounds in its final message; it does not
@@ -127,13 +127,14 @@ codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check \
 
 `--skip-git-repo-check` is required because a fresh `$HOME` is not a git repo. The actual command also passes
 `-c 'model_provider="openai"'`: bootstrap makes codex-lb the default provider, and on a rerun that default points at a
-router with no accounts, so every agent run names the built-in provider and uses the copied native login. Model and
-effort are two constants (currently `gpt-6-sol` and `high`) so a rename is a one-line change; a fallback model is a
-config change, never a silent retry. These pin only the setup agent; the user's own Codex model is never set.
+router with no accounts, so every agent run names the built-in provider and uses the Codex login kd lends for the run
+(see "Secrets"). Model and effort are two constants (currently `gpt-6-sol` and `high`) so a rename is a one-line change;
+a fallback model is a config change, never a silent retry. These pin only the setup agent; the user's own Codex model is
+never set.
 
 There are exactly two agent runs per bootstrap: the system phase followed by a kd-driven reboot when
 `/var/run/reboot-required` exists, and the user-space phase. The reboot sits between them because the agent cannot
-survive it. kd places the remaining secrets between the two runs, so the system phase sees no secret beyond Codex's own
+survive it. kd places the remaining secrets between the two runs, so the system phase sees no secret beyond Codex's lent
 auth file. Both prompts run as the user and use `sudo` for system changes. Agent output streams to the controller's
 terminal as it happens.
 
@@ -143,10 +144,13 @@ tools included; `cargo install` for Rust tools without a bottle or marked cargo;
 supported path; npm only when nothing else is supported), that the agent must not modify repository contents, and that
 its final message must end with a section listing every step that failed and how it was worked around, or "no
 workarounds" if none. Both prompts also carry a router policy: routers and their client wiring from an earlier bootstrap
-are kd's, must not be modified, stopped or recreated, and may have no accounts, so the agent tests Claude and Codex
-through the bypasses rather than "repairing" a failing default CLI. After each run kd reads
-`~/.kd-agent-last-message.md` back and keeps it to print whole after the probe; there is no section parsing. Nonzero
-exit is phase failure: kd prints that file if it exists, then the error, and stops.
+are kd's, must not be modified, stopped or recreated, and may have no accounts, so the agent tests Codex through the
+bypass rather than "repairing" a failing default CLI. The same policy says Codex and Claude have no login of their own:
+the agent must not copy or read the lent Codex login, run `codex login` or `codex logout`, log Claude in, or send Claude
+requests, and checks Claude Code with `claude --version` only. An agent "verifying" Claude by logging it in would
+recreate the copied logins this design removed. After each run kd reads `~/.kd-agent-last-message.md` back and keeps it
+to print whole after the probe; there is no section parsing. Nonzero exit is phase failure: kd prints that file if it
+exists, then the error, and stops.
 
 ### Phase contents
 
@@ -225,12 +229,13 @@ agent's problem; an explicitly chosen upstream installer overrides the general p
 
 ### Routers
 
-Every bootstrap installs codex-lb (Codex) and CLIProxyAPI (Claude) and makes them the default for plain `codex` and
-`claude`, provided `docker info` succeeds as the user. When it does not (no systemd, so the system phase did not start
-Docker; or a session without the `docker` group yet), kd warns, skips the routers and leaves the clients native rather
-than failing: degraded targets stay supported and the probe's router checks show the gap. Once Docker works, any router
-step failure aborts bootstrap. This is Rust-owned, deterministic setup in `routers.rs`, run after Claude's onboarding
-repair, because the layout is a security contract rather than a preference, and because it generates secrets:
+Every bootstrap installs codex-lb (Codex) and CLIProxyAPI (Claude) and makes them the only way plain `codex` and
+`claude` reach a model. `docker info` must succeed as the user, or bootstrap fails. There used to be a degraded path
+that skipped the routers and left the clients on their copied native logins; with no native login left on the target,
+that path would leave neither CLI working, so it was removed. The usual causes are no systemd (the system phase did not
+start Docker) and a session without the `docker` group yet (see "Known gaps"). Any router step failure aborts bootstrap.
+This is Rust-owned, deterministic setup in `routers.rs`, run before Claude's onboarding repair, because the layout is a
+security contract rather than a preference, and because it generates secrets:
 
 - Host networking with the listener pinned to `127.0.0.1` (codex-lb by an explicit `--host` in its command, CLIProxyAPI
   by `host` in its `config.yaml`). Both upstreams document Docker `ports:` publishing, which binds every interface and
@@ -265,20 +270,27 @@ Client wiring:
   onboarding repair: symlinks, invalid JSON, a non-object root or a non-object `env` fail; a wired file is left
   byte-for-byte unchanged.
 - Codex: `model_provider = "codex-lb"` plus `[model_providers.codex-lb]` (`name = "openai"`,
-  `http://127.0.0.1:2455/backend-api/codex`, `wire_api = "responses"`, `requires_openai_auth = true`). The target has no
-  TOML writer, so kd reads the file over the transport, merges with `toml_edit`, and replaces the file with a rename
+  `http://127.0.0.1:2455/backend-api/codex`, `wire_api = "responses"`, `requires_openai_auth = false`). The target has
+  no TOML writer, so kd reads the file over the transport, merges with `toml_edit`, and replaces the file with a rename
   only if it changed. The read is framed by a sentinel line, because the transport's `bash -lc` lets profile scripts
   write to stdout. Replaced values keep their spacing and trailing comments, so a wired file is a byte-identical no-op;
   an inline `model_providers = { ... }` is converted to a standard table. The display name stays `openai` because other
   names lost remote compaction through codex-lb during the manual setup. `model` and effort are untouched.
+  `requires_openai_auth` is false although the [codex-lb README](https://github.com/Soju06/codex-lb) marks `true`
+  "required for codex app": the desktop app does not run on these Linux targets. With `true`, Codex insists on its own
+  ChatGPT login even though codex-lb (with API key auth off) ignores the token Codex sends, and a dead login drops the
+  TUI to the sign-in screen; that happened on a manually configured host on 2026-09-28. `false` alone is not enough:
+  Codex still loads an `auth.json` that exists and keeps trying to refresh it, so the file must be absent, which the
+  lent-login lifecycle in "Secrets" guarantees. kd writes a comment above the key saying so, and replaces the key
+  together with its old trailing comment when the value was anything else; an already-false key is left alone. Remote
+  compaction with `false` has not been exercised.
 - OpenCode is not wired: a custom provider needs a hardcoded model catalog and default model, which is model pinning
   that rots. Hermes is not touched.
 
-Bypasses, used by the agent phases, the onboarding check and the probe: Codex `-c 'model_provider="openai"'`; Claude
-`--settings '{"env":{"ANTHROPIC_BASE_URL":"","ANTHROPIC_AUTH_TOKEN":""}}'`. `env -u` does not work for Claude because
-settings.json `env` wins over the process environment. The onboarding check needs the bypass too: with the proxy token
-set, `claude auth status` reports `loggedIn: true` via `oauth_token` even when the copied claude.ai login is broken.
-Both bypasses were verified on 2026-09-24 by confirming that no request reached the router.
+The Codex bypass, used by the agent phases and the probe, is `-c 'model_provider="openai"'` with the lent login; it was
+verified on 2026-09-24 by confirming that no request reached the router. There is no Claude bypass any more, because
+there is no native Claude login to bypass to. The onboarding check relies on the router wiring instead: with the proxy
+token set, `claude auth status` reports `loggedIn: true` via `oauth_token`.
 
 ### Transport
 
@@ -312,36 +324,75 @@ check is only done on the archive pull in `backup`; ssh's transport is the integ
 
 ### Secrets
 
-Bootstrap preflight resolves the four agent auth sources without printing them and fails before connecting if one is
-missing. Backup and service control need no agent credentials:
+NOTE: Codex and Claude logins are not copied to targets, and the one exception (the Codex login lent to bootstrap's own
+agent runs) is taken back at the end of every run. Do not "simplify" this into leaving a copy behind. A ChatGPT login
+carries a single-use refresh token that rotates on every refresh, so two copies of one login share a lineage and
+whichever refreshes second fails with `refresh_token_reused`. Claude's OAuth login is assumed to behave the same way; I
+have not verified that, and nothing on the target needs it anyway. On 2026-09-28 that broke a controller's Codex login
+after its `auth.json` had been copied elsewhere; the other copy refreshed first and was never seen again. On the target,
+codex-lb and CLIProxyAPI hold their own account logins and the CLIs need none.
 
-- Codex: `~/.codex/auth.json`, file only. If it is missing the error says to set `cli_auth_credentials_store = "file"`
-  in `~/.codex/config.toml` and log in again; Codex's keyring mode is not supported because it has never been observed
-  on the controller and its Keychain item name is only documented, not verified.
-- Claude: the Keychain item `Claude Code-credentials` first
-  (`security find-generic-password -s
-  "Claude Code-credentials" -w`; observed on the controller), and only if that
-  lookup fails, `~/.claude/.credentials.json`. The order matters: Claude Code on macOS uses the Keychain whenever it is
-  writable and only writes the file as a fallback, so a stale file can sit next to a live Keychain entry. The Keychain
-  payload is the same JSON the Linux file holds. There is no setting that forces file storage on macOS.
+Bootstrap preflight resolves the controller's credentials without printing them and fails before connecting if one is
+missing or unusable. Backup and service control need no agent credentials:
+
+- Codex: `~/.codex/auth.json`, file only, and it must be a ChatGPT login (`tokens.account_id`, JWTs in
+  `tokens.access_token` and `tokens.id_token`, a `tokens.refresh_token`, and an RFC 3339 `last_refresh` when present;
+  the same check applies to a target copy before any write-back, so a malformed one cannot break the controller). If it
+  is missing the error says to set `cli_auth_credentials_store = "file"` in `~/.codex/config.toml` and log in again;
+  Codex's keyring mode is not supported because it has never been observed on the controller and its Keychain item name
+  is only documented, not verified. Preflight also decodes the access token's `exp` (signature not checked) and refuses
+  a login that expires within 24 hours. Codex refreshes proactively only within five minutes of that expiry, or after a
+  401 (`should_refresh_proactively` in `codex-rs/login/src/auth/manager.rs` at `22a3f6d5d8`, 2026-09-23), so the margin
+  keeps both the controller and the target from refreshing during a run that takes hours. A fresh token lasts about ten
+  days, and `codex login` gives one.
 - OpenCode: `~/.local/share/opencode/auth.json`.
 - Muse: `~/.config/muse/auth.json`, but not verbatim on macOS. Muse 1.0 writes schema 1 on Linux (secrets inline) and
   schema 2 on macOS (`"storage": "keychain"`, secrets in the Keychain item `ai.meta.dev.credentials`, account `meta`, as
   a small JSON with `api_key` and `access_token`), and a Linux Muse rejects schema 2 outright. kd merges the two back
   into a schema-1 file for the target; a schema-1 file on the controller passes through unchanged.
 
-Codex's file is placed during seeding because the agent needs it. The other three and, on restores, the Hermes archive
-go to the target as `0600` files between the two agent runs. The GitHub token goes with them only when `gh auth status`
-on the target fails, on real runs and rehearsals alike, and the agent consumes it with
+Claude's controller login is not read at all. OpenCode and Muse logins are still copied and stay on the target; they are
+not routed, and neither has shown the rotating-token problem.
+
+The Codex login's lifecycle is in `codex_login.rs`. It is lent right after seeding, because the system phase agent needs
+it, and taken back after the probe, whose Codex request uses it. Everything between those two points runs in one closure
+whose result is examined only after the take-back, so a failing phase still takes the login back when the target is
+reachable. When it is not (the reboot never came back, the connection dropped), bootstrap warns and the next run takes
+it back before lending it again. Interrupting kd skips the take-back the same way. Both lending and taking back first
+reclaim whatever `~/.codex/auth.json` the target holds: if it parses as a ChatGPT login of the same account and its
+access token expires later than the controller's, the target refreshed after a 401 and now holds the only live token, so
+kd writes it back to the controller's file. Reclaiming reads only the file: Codex's default credential store is `file`
+(`AuthCredentialsStoreMode` in codex-rs/config/src/types.rs), and nothing bootstrap installs changes that on the target.
+Comparing `exp` rather than trusting either side's `last_refresh` works because every access token gets the same
+lifetime. The write-back does not import the target's file: it takes the controller's own JSON and swaps in only the
+three tokens and `last_refresh`, so a tampered target file cannot switch the controller to an API key or another auth
+mode. It cannot stop a tampered file carrying another account's genuine tokens under this account's id, because kd does
+not verify JWT signatures; a target able to do that already holds the GitHub, OpenCode and Muse logins. The write-back
+goes through a 0600 temporary file and a rename in the same directory, refuses a symlinked controller file, and refuses
+if the controller file changed since kd read it an instant earlier (the compare and the rename are not atomic together,
+which leaves a microsecond window kd accepts rather than locks). A copy of another account or an older copy (a box
+bootstrapped before this change) is not written back. A file that is not a ChatGPT login kd can parse stops the run and
+stays on the target for a person to inspect, since kd cannot rule out that it holds the only live token. A reclaim
+failure of any kind leaves the target's copy in place. The reclaim reads the target's file as base64 between begin and
+end markers, so output a login profile prints before or after the script cannot end up in a credential, and refuses a
+symlink there. The reclaim and the following delete or overwrite are two SSH commands; a Codex process on the target
+refreshing in between would lose its token, which is one more reason interactive sessions on the target must be closed
+during bootstrap. After the reclaim, taking back deletes the target's file; lending pushes the controller's current
+file, which is gated again in case the reclaim replaced it.
+
+OpenCode's and Muse's files and, on restores, the Hermes archive go to the target as `0600` files between the two agent
+runs. The same step deletes `~/.claude/.credentials.json` on the target, which older bootstraps copied there; it would
+also delete a login someone created on the box by hand, which is intended. The GitHub token goes with them only when
+`gh auth status` on the target fails, on real runs and rehearsals alike, and the agent consumes it with
 `gh auth login --with-token < file && rm file`, so a rerun that skips the login never leaves a token file behind. The
 token touches disk on the target briefly; it never appears in argv or logs anywhere.
 
-After the user-space phase, a deterministic shell step checks `claude auth status` for `loggedIn: true`, then merges
-only `hasCompletedOnboarding: true` into the target's `~/.claude.json`. Claude 2.1.263 gates interactive onboarding on
-that flag independently of OAuth state: a successful `claude -p` request does not prove interactive readiness. This
-belongs beside credential orchestration rather than in the agent prompt because the agent's headless checks missed the
-gate on a real bootstrap. The probe also checks the flag so request success cannot stand in for first-run state. Do not
-copy the controller's global config: it carries preferences and project trust decisions unrelated to this host. An
+After the router wiring, a deterministic shell step checks `claude auth status` for `loggedIn: true`, then merges only
+`hasCompletedOnboarding: true` into the target's `~/.claude.json`. Claude 2.1.263 gates interactive onboarding on that
+flag independently of OAuth state: a successful `claude -p` request does not prove interactive readiness. This belongs
+beside credential orchestration rather than in the agent prompt because the agent's headless checks missed the gate on a
+real bootstrap. The probe also checks the flag so request success cannot stand in for first-run state. Do not copy the
+controller's global config: it carries preferences and project trust decisions unrelated to this host. An
 already-complete config is left byte-for-byte unchanged. Missing config starts as an empty object; invalid JSON,
 non-object JSON and symlinks fail. An update uses a mode-0600 temporary file in the same directory and renames it over
 the config. This prevents partial writes, not concurrent updates by Claude; interactive sessions must be closed during
@@ -351,8 +402,11 @@ bootstrap. The script's regression tests execute real bash and jq with an isolat
 
 On the target, all under the user's home:
 
-- `~/.codex/auth.json`, `~/.claude/.credentials.json`, `~/.local/share/opencode/auth.json`, `~/.config/muse/auth.json`:
-  the four auth files, at their CLIs' native locations.
+- `~/.local/share/opencode/auth.json`, `~/.config/muse/auth.json`: the two copied auth files, at their CLIs' native
+  locations.
+- `~/.codex/auth.json`: the lent Codex login, present only during a run (and after a run whose take-back could not reach
+  the target).
+- `~/.claude/.credentials.json`: deleted by every bootstrap; the target has no claude.ai login.
 - `~/.kd-github-token`: the GitHub token, deleted by the agent once `gh` has it.
 - `~/.kd-hermes-backup.zip`: the archive to import.
 - `~/.kd-agent-last-message.md`: the agent's final message, one per phase, overwritten.
@@ -384,9 +438,10 @@ On the controller:
 ### Bootstrap sequence
 
 1. Controller preflight, cheap and with no connections: shared settings parse; target user and hostname validate;
-   `public_key` is readable; the four auth sources resolve. Only a restore resolves a named profile and selects its
-   newest `hermes-<source-hostname>-*.zip`. A hostname override never changes archive selection. Scratch bootstrap does
-   not read a backup directory or require any profile.
+   `public_key` is readable; the Codex login is a ChatGPT login with at least 24 hours left, and the OpenCode and Muse
+   sources resolve. Only a restore resolves a named profile and selects its newest `hermes-<source-hostname>-*.zip`. A
+   hostname override never changes archive selection. Scratch bootstrap does not read a backup directory or require any
+   profile.
 2. Non-rehearsal restore over plain SSH only: resolve `ssh -G <destination>`, then
    `ssh-keyscan -t ed25519 -p <port> <host>`, show the key's fingerprint in both SHA256 and MD5 forms (`ssh-keygen -lf`
    and `ssh-keygen -E md5 -lf`, consoles vary), ask the user to confirm it matches the console. On yes, write the
@@ -401,7 +456,9 @@ On the controller:
    install the public key if missing, passwordless sudo, prove a second connection as that user. From here on every
    connection is as the user; the root connection, if there was one, is not used again. On a ubiworker the user exists
    and there is no root, so the same seed script uses its existing passwordless sudo without creating an account. Then,
-   as the user, install Codex (the one Rust-owned installer, see above) and place its auth file.
+   as the user, install Codex (the one Rust-owned installer, see above). Then lend the Codex login: reclaim any copy the
+   target already holds, gate the controller's file again, push it. Everything from here through the probe runs in the
+   closure described in "Secrets".
 5. Decide whether a GitHub token is needed: `gh auth status` as the user fails (no `gh` counts as failing). If so, a
    real run prompts for it (hidden entry on a terminal; one plain line from stdin when there is none, so a real run can
    be scripted) and a rehearsal takes the controller's `gh auth token`; otherwise no token is fetched or placed. With
@@ -412,7 +469,7 @@ On the controller:
    over ssh, ignoring that command's own exit status since the connection drops, and poll SSH every 10 seconds for up to
    10 minutes; give up with an error after that. The per-run known-hosts file is reused because the host key survives a
    reboot.
-7. Place secrets.
+7. Place secrets, and delete an old copied Claude login.
 8. Copy the controller's global Git `user.name` and `user.email` to the target user's global Git config, then run the
    user-space agent. Read those values during controller preflight with `git config --global --includes --get`, using
    the controller home as the working directory and clearing inherited `GIT_DIR`, `GIT_WORK_TREE` and `GIT_COMMON_DIR`
@@ -420,16 +477,19 @@ On the controller:
    rather than placing them in a prompt. Repeat after the agent because dotfiles installation can replace Git config.
    Verify the effective global values after each transfer; a write or verification failure aborts bootstrap.
    Repository-local identities and unrelated Git settings are not changed.
-9. Claude onboarding repair, then routers: service setup, Claude settings merge, Codex config merge. Any failure aborts
-   bootstrap.
+9. Routers (service setup, Claude settings merge, Codex config merge), then the Claude onboarding repair, whose auth
+   check needs the proxy token the settings merge wrote. Any failure aborts bootstrap.
 10. Tailscale (only with `--enroll-tailscale`): the agent installed it in the user-space phase; kd runs
     `sudo tailscale up --timeout 10m` with output streamed so the login URL reaches the terminal. `tailscale up` blocks
     until the browser login completes or the timeout expires, which is the whole wait; a nonzero exit is an error. The
     hostname defaults to the OS hostname; no `--ssh`, no tags, not ephemeral. Skipped when `tailscale status --json`
     already reports `Running`: on an enrolled node `tailscale up` refuses unless every non-default flag from the
     original enrollment is repeated, which would fail every rerun.
-11. Probe script over SSH, output printed as is, then both agents' final messages, then the router login instructions
-    with the fixed tunnel ports. Exit 0.
+11. Probe script over SSH, while the lent Codex login still exists.
+12. Take the Codex login back (reclaim, then delete it from the target), on success and failure alike. Then print the
+    probe output as is and both agents' final messages. A take-back failure after a successful run fails bootstrap at
+    this point, after the reports, because the login may still be on the target. Otherwise print the router login
+    instructions with the fixed tunnel ports. Exit 0.
 
 ### Probe
 
@@ -442,10 +502,11 @@ Rust tool, `cargo install --list` showing it with its `https://github.com/<repo>
 same name or a fork fails this); and, on restores, a gateway process check (absent on rehearsal, present otherwise) plus
 `curl -fsS 127.0.0.1:9119/api/status` outside rehearsals. `tailscale status` is checked only with `--enroll-tailscale`.
 One real request per probed agent CLI: `codex exec --skip-git-repo-check -c 'model_provider="openai"' "reply ok"`,
-`claude --settings '<bypass>' -p ok`, `muse exec ok`. OpenCode is not probed: it chooses its own default model from the
-copied credentials, and on recent scratch bootstraps it chose one its provider rejected, a failure that said nothing
-about the box and kept every report red. Codex and Claude bypass the routers because a fresh box's routers have no
-accounts; these lines check the copied credentials. Router checks: codex-lb `/health`; CLIProxyAPI returns 401 on
+`muse exec ok`. OpenCode is not probed: it chooses its own default model from the copied credentials, and on recent
+scratch bootstraps it chose one its provider rejected, a failure that said nothing about the box and kept every report
+red. Codex bypasses codex-lb because a fresh box's routers have no accounts; that line checks the installed CLI on the
+lent login, before kd takes it back. There is no Claude request: the target has no claude.ai login, and a request
+through CLIProxyAPI would fail on every fresh box. Router checks: codex-lb `/health`; CLIProxyAPI returns 401 on
 `/v1/models` without a key and succeeds with the client key (passed to curl as a config file on stdin); `ss` shows both
 router ports listening and every listener on `127.0.0.1`; Claude settings carry the router URL and the current client
 key from secrets.env; Codex's effective provider (after any active `profile`) is `codex-lb` and its `base_url` is the
@@ -498,8 +559,8 @@ component, not the phase ordering or the complete bootstrap. Record which level 
 - Router images come from ghcr.io and Docker Hub (anonymous pulls, rate limited). A registry failure aborts bootstrap
   before the probe; fix or wait, then rerun.
 - If the controller's SSH config multiplexes connections (`ControlMaster`/`ControlPersist`) and no reboot happened, a
-  master opened before the system phase added the user to `docker` keeps the old groups. `docker info` then fails and
-  the routers are skipped with a warning; rerun on a fresh connection.
+  master opened before the system phase added the user to `docker` keeps the old groups. `docker info` then fails, and
+  so does bootstrap, with an error naming this cause; close the master and rerun.
 
 - Test targets and destination providers may offer different Ubuntu releases. Record the release used; success on one
   image does not establish compatibility with another. The agent absorbs installer drift.
@@ -511,6 +572,13 @@ component, not the phase ordering or the complete bootstrap. Record which level 
 - A scratch bootstrap exercised copied credentials with all four agent CLIs, and Claude's interactive onboarding was
   verified after its separate repair. That is evidence for those runs, not a guarantee about future credential formats,
   token lifetime, provider support, or every interactive flow. Test the affected CLI behavior on each relevant change.
+- The lent-login design (no Codex or Claude login left on the target, `requires_openai_auth = false`, onboarding checked
+  through the proxy token) is covered by unit and script tests only until a bootstrap exercises it. What a live run has
+  to show: interactive `codex` and `claude` start to a prompt with no login screen, `~/.codex/auth.json` and
+  `~/.claude/.credentials.json` are absent afterwards, and the controller's Codex login still works.
+- The 24-hour expiry gate assumes Codex's proactive refresh window stays small. If a Codex release starts refreshing
+  well before expiry, both copies can refresh during a run again; the write-back then recovers only when the target
+  refreshes and the controller does not.
 - Tailscale SSH may not create a logind session. If Hermes user-service setup fails, inspect lingering, the user bus and
   `XDG_RUNTIME_DIR` before changing units. Scratch bootstrap does not validate Hermes service startup.
 - `hermes dashboard` may try to build the web UI on every start when `npm` is on PATH and complain when it is not;
