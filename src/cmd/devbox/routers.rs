@@ -4,9 +4,11 @@
 //! Every bootstrap installs both as Docker Compose services and points plain
 //! `codex` and `claude` at them. A fresh box ends with healthy routers that
 //! hold no accounts; the user logs accounts in afterwards through an SSH
-//! tunnel (see [`login_help`]). Until then the default CLIs fail, which is
-//! why kd's own agent runs and probe requests bypass the routers explicitly
-//! ([`CODEX_NATIVE_OVERRIDE`], [`CLAUDE_NATIVE_SETTINGS`]).
+//! tunnel (see [`login_help`]). Until then plain `codex` and `claude` fail:
+//! the routers are the only way either reaches a model, because bootstrap
+//! leaves no native login on the target (see SPEC_impl.md "Secrets"). kd's
+//! own Codex runs bypass codex-lb with [`CODEX_NATIVE_OVERRIDE`] and the
+//! login lent for the run (see [`super::codex_login`]).
 //!
 //! This is deterministic Rust-owned setup rather than an agent prompt item
 //! because the router layout is a security contract, not a preference: both
@@ -24,7 +26,7 @@
 use super::transport::Transport;
 use anyhow::{Context, bail};
 use toml_edit::{DocumentMut, Item, Table, Value};
-use tracing::{info, warn};
+use tracing::info;
 
 /// codex-lb's dashboard and proxy. Codex, SSH tunnels and the probe all use
 /// this exact port; it is fixed so controller-side tunnel scripts can be too.
@@ -42,43 +44,32 @@ pub const CLIPROXY_PORT: u16 = 8317;
 pub const CLIPROXY_CLAUDE_OAUTH_PORT: u16 = 54545;
 
 /// `codex` config override that selects the built-in provider for one run.
-/// kd's agent phases and probe use it so they work before any codex-lb
-/// account exists, including on reruns where config.toml already points at
-/// codex-lb. Verified 2026-09-24: the request reports `provider: openai` and
-/// never reaches codex-lb.
+/// kd's agent phases and probe use it with the login lent for the run, so
+/// they work before any codex-lb account exists, including on reruns where
+/// config.toml already points at codex-lb. Verified 2026-09-24: the request
+/// reports `provider: openai` and never reaches codex-lb.
 pub const CODEX_NATIVE_OVERRIDE: &str = r#"-c 'model_provider="openai"'"#;
-
-/// `claude --settings` value that routes one run past CLIProxyAPI to the
-/// native login. `env -u` is not enough, because settings.json `env` wins
-/// over the process environment; emptying both variables through a higher
-/// precedence settings layer does work (verified 2026-09-24, zero requests
-/// reached the proxy). `claude auth status` also needs it: with the proxy
-/// token set it reports `loggedIn: true` via `oauth_token` even when the
-/// copied claude.ai login is broken.
-pub const CLAUDE_NATIVE_SETTINGS: &str =
-    r#"{"env":{"ANTHROPIC_BASE_URL":"","ANTHROPIC_AUTH_TOKEN":""}}"#;
 
 /// Install or converge both services, then point Claude and Codex at them.
 /// Runs after the user-space phase, when Docker, jq and dotfiles are in
-/// place. Returns whether the routers were installed.
+/// place.
 ///
-/// A target whose Docker daemon is not usable (no systemd, so the system
-/// phase skipped starting it; or a session that does not have the docker
-/// group yet) skips the routers with a warning instead of failing: bootstrap
-/// supports such degraded targets, and the probe's router checks then report
-/// the gap. The clients are not rewired in that case, because pointing them
-/// at routers that do not exist would break the native CLIs for nothing.
-/// Once Docker works, every other failure aborts bootstrap; every step is
-/// safe to rerun.
-pub fn install(t: &Transport) -> anyhow::Result<bool> {
+/// Docker must be usable by the user; otherwise bootstrap fails. There used
+/// to be a degraded path that skipped the routers and left the clients on
+/// their copied native logins, but no native login is left on the target
+/// any more, so a box without routers would have no working Codex or Claude
+/// at all. Every step is safe to rerun.
+pub fn install(t: &Transport) -> anyhow::Result<()> {
     let docker = t.capture("docker info >/dev/null")?;
     if !docker.success() {
-        warn!(
-            "Docker is not usable on {} ({}); skipping codex-lb and CLIProxyAPI, clients stay native",
+        bail!(
+            "Docker is not usable by the user on {} ({}), and the routers need it. \
+             If the system phase just added the user to the docker group and your SSH \
+             config multiplexes connections (ControlMaster), close the master connection \
+             and rerun; a box without systemd cannot run the routers at all.",
             t.destination,
             docker.stderr.trim()
         );
-        return Ok(false);
     }
     info!("installing codex-lb and CLIProxyAPI on {}", t.destination);
     t.run(&services_script())
@@ -86,7 +77,7 @@ pub fn install(t: &Transport) -> anyhow::Result<bool> {
     t.run(CLAUDE_SETTINGS)
         .context("pointing Claude at CLIProxyAPI failed")?;
     wire_codex(t).context("pointing Codex at codex-lb failed")?;
-    Ok(true)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +363,12 @@ fn wire_codex(t: &Transport) -> anyhow::Result<()> {
 /// the TUI, `/status` shows the localhost URL. `model` and reasoning effort
 /// are deliberately not touched, since those are the user's choice.
 ///
+/// `requires_openai_auth` is false, although codex-lb's README calls `true`
+/// required. It is required only for the Codex desktop app, which does not
+/// run on these Linux boxes. With `true`, Codex demands a local ChatGPT login
+/// even though codex-lb ignores the token it sends, and a dead login drops
+/// the TUI to the sign-in screen. See [`REQUIRES_OPENAI_AUTH_COMMENT`].
+///
 /// Values kd replaces keep their surrounding whitespace and trailing
 /// comments, so an already-wired file is a byte-for-byte no-op and reruns do
 /// not rewrite it. Keys inside `[model_providers.codex-lb]` that kd does not
@@ -404,8 +401,35 @@ fn codex_config(existing: Option<&str>) -> anyhow::Result<String> {
         format!("http://127.0.0.1:{CODEX_LB_PORT}/backend-api/codex").into(),
     );
     set_keeping_decor(provider, "wire_api", "responses".into());
-    set_keeping_decor(provider, "requires_openai_auth", true.into());
+    set_requires_openai_auth_false(provider);
     Ok(doc.to_string())
+}
+
+/// Comment kd puts above `requires_openai_auth` whenever it writes that key,
+/// so a person reading the file does not "fix" it back to codex-lb's
+/// documented `true`.
+const REQUIRES_OPENAI_AUTH_COMMENT: &str = "\
+# false on purpose (kd devbox bootstrap): codex-lb ignores Codex's own token,
+# so no local ChatGPT login is needed; true makes a dead login block startup.
+# Keep ~/.codex/auth.json absent too: Codex still loads one that exists and
+# keeps trying to refresh it.
+";
+
+/// Set `requires_openai_auth = false`, leaving an already-false key exactly
+/// as it is. Any other value is replaced together with its decor: the
+/// trailing comment on a hand-written `true` is typically codex-lb's
+/// "required for codex app", which would contradict the new value.
+fn set_requires_openai_auth_false(provider: &mut Table) {
+    const KEY: &str = "requires_openai_auth";
+    if provider.get(KEY).and_then(Item::as_bool) == Some(false) {
+        return;
+    }
+    provider.remove(KEY);
+    provider.insert(KEY, Item::Value(false.into()));
+    if let Some(mut key) = provider.key_mut(KEY) {
+        key.leaf_decor_mut()
+            .set_prefix(REQUIRES_OPENAI_AUTH_COMMENT);
+    }
 }
 
 /// Get `key` as a standard `[table]`, creating it when missing and
@@ -457,9 +481,8 @@ pub fn login_help(destination: &str) -> String {
     format!(
         "\
 Routers: codex-lb and CLIProxyAPI are running with no accounts. Until you log
-accounts in, plain `codex` and `claude` on the box fail. The native bypasses
-still work: `codex {CODEX_NATIVE_OVERRIDE} ...` and
-`claude --settings '{CLAUDE_NATIVE_SETTINGS}' ...`.
+accounts in, plain `codex` and `claude` on the box fail: the box has no native
+login for either, on purpose.
 
 From this machine, keep this tunnel open while logging in (fixed ports):
 
@@ -725,7 +748,8 @@ esac
             Some("http://127.0.0.1:2455/backend-api/codex")
         );
         assert_eq!(provider["wire_api"].as_str(), Some("responses"));
-        assert_eq!(provider["requires_openai_auth"].as_bool(), Some(true));
+        assert_eq!(provider["requires_openai_auth"].as_bool(), Some(false));
+        assert!(fresh.contains(REQUIRES_OPENAI_AUTH_COMMENT));
         assert_eq!(codex_config(Some(&fresh)).unwrap(), fresh);
 
         let existing = r#"# my settings
@@ -783,8 +807,28 @@ http_headers = { "X-Extra" = "1" }
                 .starts_with("model_provider = \"codex-lb\" # mine\n")
         );
 
-        let compact = "model_provider=\"codex-lb\"\n[model_providers.codex-lb]\nname=\"openai\"\nbase_url=\"http://127.0.0.1:2455/backend-api/codex\"\nwire_api=\"responses\"\nrequires_openai_auth=true\n";
+        let compact = "model_provider=\"codex-lb\"\n[model_providers.codex-lb]\nname=\"openai\"\nbase_url=\"http://127.0.0.1:2455/backend-api/codex\"\nwire_api=\"responses\"\nrequires_openai_auth=false\n";
         assert_eq!(codex_config(Some(compact)).unwrap(), compact);
+    }
+
+    /// Boxes wired before logins stopped being copied carry
+    /// `requires_openai_auth = true`, often with codex-lb's "required for
+    /// codex app" comment. A rerun must flip it, drop that contradicting
+    /// comment, explain the new value, and then leave it alone.
+    #[test]
+    fn codex_config_merge_turns_off_requires_openai_auth() {
+        let old = "[model_providers.codex-lb]\nname = \"openai\"\nrequires_openai_auth = true # required for codex app\n";
+        let merged = codex_config(Some(old)).unwrap();
+        let parsed: toml::Table = toml::from_str(&merged).unwrap();
+        assert_eq!(
+            parsed["model_providers"]["codex-lb"]["requires_openai_auth"].as_bool(),
+            Some(false)
+        );
+        assert!(merged.contains(&format!(
+            "{REQUIRES_OPENAI_AUTH_COMMENT}requires_openai_auth = false\n"
+        )));
+        assert!(!merged.contains("required for codex app"));
+        assert_eq!(codex_config(Some(&merged)).unwrap(), merged);
     }
 
     /// Shapes kd cannot merge into without guessing are errors, not rewrites.
@@ -799,17 +843,19 @@ http_headers = { "X-Extra" = "1" }
         }
     }
 
-    /// Controller-side tunnel scripts depend on these exact ports and on the
-    /// bypass commands being spelled out, so pin the rendered text.
+    /// Controller-side tunnel scripts depend on these exact ports, and the
+    /// login pages are the only way a fresh box gets working CLIs, so pin the
+    /// rendered text. The native bypasses must not come back: with no login
+    /// left on the box they would only fail.
     #[test]
-    fn login_help_names_the_fixed_ports_and_bypasses() {
+    fn login_help_names_the_fixed_ports_and_login_pages() {
         let help = login_help("user@box");
         assert!(help.contains(
             "ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:2455:127.0.0.1:2455 -L 127.0.0.1:1455:127.0.0.1:1455 -L 127.0.0.1:8317:127.0.0.1:8317 -L 127.0.0.1:54545:127.0.0.1:54545 user@box"
         ));
         assert!(help.contains("http://127.0.0.1:2455"));
         assert!(help.contains("http://127.0.0.1:8317/management.html"));
-        assert!(help.contains(CODEX_NATIVE_OVERRIDE));
-        assert!(help.contains(CLAUDE_NATIVE_SETTINGS));
+        // No native login is left on the box, so a bypass would only fail.
+        assert!(!help.contains(CODEX_NATIVE_OVERRIDE));
     }
 }

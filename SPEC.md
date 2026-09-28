@@ -364,7 +364,9 @@ describes only what the user sees.
 
 `kd` never wipes anything. Create or reinstall machines by hand. Hermes is currently the only migrated application
 state. Repositories are cloned from GitHub, not copied: local files, uncommitted changes, unpushed commits, Docker
-volumes, and other application state are not backed up. Agent credentials come from the controller.
+volumes, and other application state are not backed up. OpenCode and Muse credentials come from the controller. Codex
+and Claude on the target have no login of their own and reach models only through the target's routers; the controller's
+Codex login is lent to bootstrap's setup agent for the length of a run and taken back afterwards.
 
 `suspend → backup → resume` returns the services to operation and leaves a new archive.
 `suspend → backup → bootstrap
@@ -375,8 +377,8 @@ copies.
 Terms used below:
 
 - The **controller** is the machine `kd devbox` runs on, in practice your laptop. It is the one machine that survives
-  the reinstall, so it is where Hermes archives land, where the agent CLI credentials to copy onto the devbox come from,
-  and where prompts are answered. It is never the box being rebuilt.
+  the reinstall, so it is where Hermes archives land, where the agent CLI credentials bootstrap copies or lends to the
+  devbox come from, and where prompts are answered. It is never the box being rebuilt.
 - An **instance** is the stateful application described by a named profile. Its current machine is the **source**. The
   **target** is the explicit SSH destination bootstrap writes to. A target need not replace any existing machine. A
   **rehearsal** is an explicit `--rehearsal` restore that leaves restored services disabled and stopped.
@@ -448,9 +450,10 @@ Terms used below:
   inbound firewall with SSH and the Tailscale interface allowed, unattended security updates without automatic reboot,
   the development toolchain and CLIs, every repo in the shared manifest cloned as a colocated Jujutsu repo,
   `scode/dotfiles` installed via its own installer, passwordless key-based `ssh localhost`, the four agent CLIs
-  authenticated from the controller's caches, and `gh` authenticated. From scratch no archive is required or placed, and
-  no Hermes components are installed or probed. `--hostname` is required from scratch; a restore defaults to the profile
-  hostname, with an explicit override allowed. Archive selection always uses the source profile hostname.
+  installed (OpenCode and Muse authenticated from the controller's caches, Codex and Claude wired to the local routers
+  with no login of their own), and `gh` authenticated. From scratch no archive is required or placed, and no Hermes
+  components are installed or probed. `--hostname` is required from scratch; a restore defaults to the profile hostname,
+  with an explicit override allowed. Archive selection always uses the source profile hostname.
 - `kd` itself is installed for the user with `cargo install --locked --git https://github.com/scode/kd`, tracking the
   repository's default branch rather than a release and building the dependency versions in its committed `Cargo.lock`.
   `kd cargo scode update` then updates kd to the latest commit on that branch. Rust tools installed this way are a
@@ -475,7 +478,18 @@ Terms used below:
   host-key acceptance.
 - If `gh` on the target is unauthenticated, a rehearsal copies the controller's `gh auth token`; other runs prompt for a
   new classic token using the prefilled URL (scopes `repo`, `workflow`, `read:org`, `gist`). Authenticated reruns skip
-  token collection. The four agent credentials must exist locally before connecting.
+  token collection. The controller's Codex, OpenCode and Muse credentials must exist locally before connecting. Claude's
+  is not needed.
+- The controller's Codex login (`~/.codex/auth.json`, a ChatGPT login) is lent to the target only for bootstrap's own
+  agent runs and probe, then written back if the target refreshed it and deleted from the target. Its refresh token is
+  single-use, so two live copies eventually break each other, which has already broken a controller's login once.
+  Bootstrap therefore refuses to start when the login's access token expires within 24 hours, since Codex refreshes only
+  near expiry and that margin keeps both copies from refreshing mid-run. The fix is `codex login` on the controller. If
+  a run fails, bootstrap still takes the login back when the target is reachable; otherwise the next run does, before
+  lending it again. The target's copy is written back only when it belongs to the same account and its access token was
+  issued after the controller's, so a `codex login` on the controller during the run wins. Only the tokens are copied
+  back, never the rest of the target's file. Keep Codex sessions on the target and the controller closed during
+  bootstrap, like Claude sessions.
 - `--enroll-tailscale` opts into installation, enrollment and its probe check. Existing enrollment is preserved. Before
   the agent phases, an unenrolled target prompts to free the intended hostname if replacing a stale device. At the end
   it prints the browser login URL and waits up to ten minutes. Enrollment is untagged, non-ephemeral and without
@@ -488,35 +502,37 @@ Terms used below:
 - Idempotent reruns still execute setup and may perform upgrades or expensive agent work. A restore rerun also reimports
   application state as described below; it is not a way to preserve work accumulated on the target.
 - The GitHub token and the agent auth files are placed on the target as mode `0600` files for the agent to consume; the
-  token file is deleted once `gh` has it. They are never passed as arguments or logged.
+  token file is deleted once `gh` has it. They are never passed as arguments or logged. A claude.ai login left on the
+  target by an older bootstrap (`~/.claude/.credentials.json`) is deleted, including one created there by hand.
 - Bootstrap reads the controller's global Git `user.name` and `user.email`, including global config includes, from
   outside the invoking repository. Both must be nonempty single-line values; a missing value or read failure aborts
   before SSH. Only these two fields are copied to the target user's global Git config, replacing existing defaults.
   Other Git settings and repository-local identities are preserved. No identity is inferred from GitHub login.
-- After installing Claude, bootstrap verifies its login and marks first-run onboarding complete on the target. Copied
-  credentials alone do not prevent interactive startup from asking for login again. Existing settings and project trust
-  decisions are preserved; the controller's global Claude settings are not copied. Malformed or symlinked target
-  configuration is refused rather than overwritten. Keep interactive Claude sessions closed during bootstrap so they
-  cannot race the configuration update. Authentication or configuration errors in this step fail bootstrap.
+- After wiring Claude to CLIProxyAPI, bootstrap verifies that Claude reports itself authenticated with the proxy token
+  and marks first-run onboarding complete on the target. Authentication alone does not prevent interactive startup from
+  asking for login again. Existing settings and project trust decisions are preserved; the controller's global Claude
+  settings are not copied. Malformed or symlinked target configuration is refused rather than overwritten. Keep
+  interactive Claude sessions closed during bootstrap so they cannot race the configuration update. Authentication or
+  configuration errors in this step fail bootstrap.
 - Codex uses the official shell installer, and the login shell must run that installation. This is a deliberate
   feature-compatibility choice: QR-code remote control requires Codex to be running from the official installation;
   Homebrew is not an equivalent substitute. Bootstrap reruns the installer even when a Codex binary already exists, so
   rerunning bootstrap migrates the old direct-download installation too. The probe reports when another Codex
   installation takes precedence on PATH.
-- Every bootstrap installs two local subscription routers as Docker Compose services and makes them the default for
-  plain `codex` and `claude` on the target: codex-lb for Codex and CLIProxyAPI for Claude. A target where Docker is not
-  usable by the user gets a warning instead; routers are skipped and the clients stay native. Both listen on loopback
+- Every bootstrap installs two local subscription routers as Docker Compose services and makes them the only way plain
+  `codex` and `claude` on the target reach a model: codex-lb for Codex and CLIProxyAPI for Claude. A target where Docker
+  is not usable by the user fails bootstrap, since without the routers neither CLI would work. Both listen on loopback
   only, on fixed ports: codex-lb on 2455 (dashboard and proxy) with its ChatGPT OAuth callback on 1455, CLIProxyAPI on
   8317 (proxy and management UI) with its Claude OAuth callback on 54545. The ports never change between runs, so a
   controller-side tunnel script can hardcode them. A fresh target ends with healthy routers that hold no accounts;
   bootstrap does not log accounts in. It ends by printing the SSH tunnel command forwarding all four ports and where to
-  log in. Until accounts exist, plain `codex` and `claude` requests on the target fail; the bypasses are
-  `codex -c 'model_provider="openai"'` and
-  `claude --settings '{"env":{"ANTHROPIC_BASE_URL":"","ANTHROPIC_AUTH_TOKEN":""}}'`, which use the copied native logins.
-  Bootstrap's own setup agent and the probe's requests always use those bypasses.
+  log in. Until accounts exist, plain `codex` and `claude` requests on the target fail, and there is no native fallback.
+  Bootstrap's own setup agent and the probe's Codex request bypass codex-lb with `codex -c 'model_provider="openai"'`
+  and the lent login.
 - Router client wiring changes only what it needs. Claude gets `env.ANTHROPIC_BASE_URL` and `env.ANTHROPIC_AUTH_TOKEN`
   in `~/.claude/settings.json` (created if missing, then mode `0600` because it holds the proxy key); Codex gets
-  `model_provider = "codex-lb"` and a `[model_providers.codex-lb]` table in `~/.codex/config.toml` (created if missing).
+  `model_provider = "codex-lb"` and a `[model_providers.codex-lb]` table in `~/.codex/config.toml` (created if missing),
+  with `requires_openai_auth = false` so Codex does not ask for a local ChatGPT login that codex-lb would ignore anyway.
   Other settings, including the Codex model and reasoning effort, are preserved. If `~/.config/cliproxy/secrets.env` is
   lost while the `cliproxy-data` volume keeps its config, bootstrap fails and says how to recover rather than generating
   keys the proxy would reject. Symlinked or unmergeable files fail bootstrap rather than being replaced. OpenCode and
@@ -537,14 +553,15 @@ Terms used below:
   started.
 - Ends with a probe report printed as is: hostname, timezone, `gh auth status`, repo count against the manifest,
   `ssh localhost`, Docker as the user, Tensorlake CLI availability, kd installed from its GitHub repository, Claude's
-  onboarding flag, one real request through Codex, Claude and Muse (Codex and Claude past the routers; OpenCode is
-  installed but not probed), router health, loopback-only router listeners, CLIProxyAPI's client-key check, and the
-  Codex and Claude router wiring. It does not check router accounts. Restores additionally check Hermes gateway state
-  and, outside rehearsals, dashboard reachability. Tailscale is checked only with `--enroll-tailscale`. Probe failures
-  are reported, never fatal: bootstrap exits 0 once the probe has run. After the probe, each agent phase's final message
-  is printed whole, which is where the agent lists anything it had to work around, even when the run succeeded.
-- After a rehearsal the worker is left running for inspection with a reminder that it holds real credentials; `kd` does
-  not destroy it.
+  onboarding flag, one real request through Codex (past codex-lb, on the lent login) and Muse (Claude has no login to
+  test before router accounts exist; OpenCode is installed but not probed), router health, loopback-only router
+  listeners, CLIProxyAPI's client-key check, and the Codex and Claude router wiring. It does not check router accounts.
+  Restores additionally check Hermes gateway state and, outside rehearsals, dashboard reachability. Tailscale is checked
+  only with `--enroll-tailscale`. Probe failures are reported, never fatal: bootstrap exits 0 once the probe has run.
+  After the probe, each agent phase's final message is printed whole, which is where the agent lists anything it had to
+  work around, even when the run succeeded.
+- After a rehearsal the worker is left running for inspection with a reminder that it holds real credentials (the GitHub
+  login, OpenCode's, Muse's and Hermes's); `kd` does not destroy it.
 - Manually starting restored services after a rehearsal leaves the rehearsal's safety conditions. If the source is still
   active, both copies can process work and diverge; rehearsal provides no isolation for that concurrent operation.
 - Logging goes to stderr. There are no log files, receipts, or run records.
@@ -552,5 +569,5 @@ Terms used below:
 - If there is no terminal, the GitHub token is read as one plain line from stdin instead of the hidden prompt, so a
   scripted real run can pipe `y` for the fingerprint and then the token.
 - Not in scope: triggering the reinstall through a provider API, Hermes version pinning or same-version restore, archive
-  retention, deleting Tailscale devices, migrating anything beyond the Hermes archive and the four agent auth files,
-  logging router accounts in, backing up router state.
+  retention, deleting Tailscale devices, migrating anything beyond the Hermes archive and the OpenCode and Muse auth
+  files, logging router accounts in, backing up router state.

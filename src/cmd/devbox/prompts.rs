@@ -11,7 +11,7 @@
 //! never printed, kd's routers and their client wiring are off limits, and
 //! the final message ends with a "Workarounds" section kd prints verbatim.
 
-use super::routers::{CLAUDE_NATIVE_SETTINGS, CODEX_NATIVE_OVERRIDE};
+use super::routers::CODEX_NATIVE_OVERRIDE;
 
 /// The two repos the dotfiles installer depends on, cloned whether or not
 /// the manifest lists them. Deliberately compiled in; see SPEC.md.
@@ -45,9 +45,14 @@ const CODEX_INSTALL_POLICY: &str = "Codex is already installed with its official
 /// and `codex` then go through routers that may hold no accounts, and an
 /// agent that "repairs" the failing CLI by editing their config undoes kd's
 /// wiring. Both phases get this, since the system phase manages Docker.
+///
+/// The login rules exist because the box is meant to end with no native
+/// Codex or Claude login (SPEC_impl.md "Secrets"). An agent that logs Claude
+/// in to "verify" it, or copies Codex's lent login somewhere kd does not
+/// clean up, recreates exactly the shared-refresh-token copies kd removed.
 fn router_policy() -> String {
     format!(
-        "This machine may already run two local subscription routers from an earlier bootstrap: Docker Compose services `codex-lb` and `cliproxy` (configs in `~/.config/codex-lb` and `~/.config/cliproxy`, volumes `codex-lb-data` and `cliproxy-data`). The caller manages them and the client settings that point at them: `env` in `~/.claude/settings.json`, and `model_provider` plus `[model_providers.codex-lb]` in `~/.codex/config.toml`. Do not modify, stop, remove, or recreate any of these; leave existing Docker containers and volumes alone. The routers may have no accounts yet, so plain `claude` and `codex` requests can fail on a rerun. That is expected, not something to fix. When you test Claude or Codex, bypass the routers: `claude --settings '{CLAUDE_NATIVE_SETTINGS}' -p ...` and `codex exec {CODEX_NATIVE_OVERRIDE} ...`."
+        "This machine may already run two local subscription routers from an earlier bootstrap: Docker Compose services `codex-lb` and `cliproxy` (configs in `~/.config/codex-lb` and `~/.config/cliproxy`, volumes `codex-lb-data` and `cliproxy-data`). The caller manages them and the client settings that point at them: `env` in `~/.claude/settings.json`, and `model_provider` plus `[model_providers.codex-lb]` in `~/.codex/config.toml`. Do not modify, stop, remove, or recreate any of these; leave existing Docker containers and volumes alone. The routers may have no accounts yet, so plain `claude` and `codex` requests can fail on a rerun. That is expected, not something to fix.\n\nCodex and Claude intentionally have no login of their own on this machine; the routers are how they reach a model. The caller lends you `~/.codex/auth.json` for this run only and removes it afterwards. Do not copy, move, or read it, and do not run `codex login` or `codex logout`. When you test Codex, bypass the router with `codex exec {CODEX_NATIVE_OVERRIDE} ...`. Do not log Claude in, run `claude setup-token`, or send Claude requests; verify Claude Code with `claude --version` only."
     )
 }
 
@@ -92,7 +97,7 @@ pub fn user_space_phase(
     format!(
         r#"You are configuring a development machine over a non-interactive session as user `{user}`, who has passwordless sudo. The system phase (packages, toolchains, Docker) is already done. Nobody will answer questions: decide yourself and keep going. Every step must be idempotent, because this whole prompt may be run again after a failure. Toolchains installed earlier may need `~/.cargo/env`, Homebrew's shellenv, or a similar file sourced; find and source what the previous phase left.
 
-This is the USER-SPACE PHASE of a devbox bootstrap. Files kd placed for you, all under your home: `{GITHUB_TOKEN_FILE}` (a GitHub token, present only if `gh` was not already logged in){archive_note}, and the agent CLIs' credential files at their native locations (`~/.codex/auth.json`, `~/.claude/.credentials.json`, `~/.local/share/opencode/auth.json`, `~/.config/muse/auth.json`). Never print any of their contents.
+This is the USER-SPACE PHASE of a devbox bootstrap. Files kd placed for you, all under your home: `{GITHUB_TOKEN_FILE}` (a GitHub token, present only if `gh` was not already logged in){archive_note}, and the OpenCode and Muse credential files at their native locations (`~/.local/share/opencode/auth.json`, `~/.config/muse/auth.json`). Never print any of their contents.
 
 {CODEX_INSTALL_POLICY}
 
@@ -216,17 +221,21 @@ mod tests {
     }
 
     /// Reruns meet routers that may have no accounts. Both phases must be
-    /// told to leave the router wiring alone and how to test CLIs past it,
+    /// told to leave the router wiring alone and how to test Codex past it,
     /// or an agent "fixes" the failing default CLI by undoing kd's setup.
+    /// They must also be told not to create native logins, which would
+    /// bring back the shared-refresh-token copies kd removed.
     #[test]
-    fn both_phases_protect_router_wiring_and_name_the_bypasses() {
+    fn both_phases_protect_router_wiring_and_stay_logged_out() {
         for prompt in [
             system_phase("box", "user"),
             user_space_phase("user", &[], false, false, false),
         ] {
             assert!(prompt.contains("Do not modify, stop, remove, or recreate"));
-            assert!(prompt.contains(CLAUDE_NATIVE_SETTINGS));
             assert!(prompt.contains(CODEX_NATIVE_OVERRIDE));
+            assert!(prompt.contains("Do not log Claude in"));
+            assert!(prompt.contains("do not run `codex login`"));
+            assert!(!prompt.contains("~/.claude/.credentials.json"));
         }
     }
 }

@@ -13,7 +13,8 @@
 //! Every phase selects Codex's built-in provider explicitly. Bootstrap makes
 //! codex-lb the default provider, and codex-lb has no accounts until the user
 //! logs in after bootstrap, so on a rerun the configured default would fail.
-//! The agent always runs on the native login kd copied from the controller.
+//! The agent always runs on the controller's login, which kd lends to the
+//! target for the length of the run (see [`super::codex_login`]).
 
 use super::routers::CODEX_NATIVE_OVERRIDE;
 use super::transport::Transport;

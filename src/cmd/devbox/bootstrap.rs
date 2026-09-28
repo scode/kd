@@ -8,6 +8,11 @@
 //! the guard, creating the user, installing Codex, placing secrets, the
 //! prompts, the reboot, and the probe. Two Codex runs on the box do the rest.
 //!
+//! The Codex login those runs use is the controller's, lent for the run and
+//! taken back at the end, on failure too (see [`ControllerLogin`]). That is
+//! why everything from placing it to the probe runs inside one closure whose
+//! result is inspected only after the login has been retired.
+//!
 //! Shared settings describe the environment. Only `--restore` selects
 //! state to import; `--rehearsal` keeps that state's services stopped.
 //! Tailscale enrollment is independent and explicitly requested.
@@ -16,8 +21,8 @@
 //! any failure is "fix or ignore, then rerun the whole command".
 
 use super::{
-    BootstrapArgs, agent, claude, confirm, git_identity::GitIdentity, home_dir, probe, profile,
-    prompts, routers, secrets, transport::Transport, wait_for_enter,
+    BootstrapArgs, agent, claude, codex_login::ControllerLogin, confirm, git_identity::GitIdentity,
+    home_dir, probe, profile, prompts, routers, secrets, transport::Transport, wait_for_enter,
 };
 use anyhow::{Context, bail};
 use std::io::BufRead;
@@ -50,6 +55,7 @@ pub fn run(args: BootstrapArgs) -> anyhow::Result<()> {
 
     // 1. Controller preflight: cheap, no connections, before any prompt.
     let git_identity = GitIdentity::read(&home)?;
+    let codex_login = ControllerLogin::preflight(&home)?;
     let sources = secrets::resolve_all(&home)?;
     info!("{}", secrets::describe(&sources));
     let public_key_path = profile::expand_tilde(&config.bootstrap.public_key, &home);
@@ -97,93 +103,124 @@ pub fn run(args: BootstrapArgs) -> anyhow::Result<()> {
 
     // 4. Seed: the user, the key, sudo, a proven second connection, Codex.
     seed(&seed_transport, &run.t, &run.user, &public_key)?;
-    let codex = sources
-        .iter()
-        .find(|s| s.cli == "codex")
-        .context("codex credentials missing after preflight")?;
-    install_codex(&run.t, codex)?;
+    install_codex(&run.t)?;
 
-    // 5. Token and Tailscale decisions, now that the box is reachable.
-    let github_token = github_token(&run.t, rehearsal)?;
-    if args.enroll_tailscale {
-        tailscale_device_prompt(&run.t, &plan.hostname)?;
-    }
+    // Everything from lending the Codex login to the probe. The closure is
+    // called at once; it exists so every early `?` still reaches the retire
+    // step below instead of returning with the login left on the target.
+    let outcome = (|| -> anyhow::Result<Reports> {
+        codex_login.place(&run.t)?;
 
-    // 6. System phase, then the reboot if the upgrade asked for one.
-    let system_report = agent::run_phase(
-        &run.t,
-        "system",
-        &prompts::system_phase(&plan.hostname, &run.user),
+        // 5. Token and Tailscale decisions, now that the box is reachable.
+        let github_token = github_token(&run.t, rehearsal)?;
+        if args.enroll_tailscale {
+            tailscale_device_prompt(&run.t, &plan.hostname)?;
+        }
+
+        // 6. System phase, then the reboot if the upgrade asked for one.
+        let system_report = agent::run_phase(
+            &run.t,
+            "system",
+            &prompts::system_phase(&plan.hostname, &run.user),
+        )?;
+        reboot_if_required(&mut run)?;
+
+        // 7. Secrets: OpenCode's and Muse's logins, the archive, the token.
+        place_secrets(
+            &run.t,
+            &sources,
+            archive.as_deref(),
+            github_token.as_deref(),
+        )?;
+
+        // 8. User-space phase.
+        // Repository initialization needs an author before the agent starts.
+        git_identity.install(&run.t)?;
+        let user_report = agent::run_phase(
+            &run.t,
+            "user-space",
+            &prompts::user_space_phase(
+                &run.user,
+                &config.bootstrap.repos,
+                rehearsal,
+                hermes,
+                args.enroll_tailscale,
+            ),
+        )?;
+
+        // Dotfiles may have replaced Git config; restore the copied defaults.
+        git_identity.install(&run.t)?;
+
+        // Routers come after the phases that install Docker and jq. Wiring
+        // switches the default CLIs to routers with no accounts yet, so the
+        // probe's Codex request bypasses them.
+        routers::install(&run.t)?;
+
+        // A successful headless request does not complete Claude's interactive
+        // first-run gate. Repair only that gate, after the router wiring gave
+        // Claude the proxy token its auth check accepts.
+        claude::complete_onboarding(&run.t)?;
+
+        // 9. Tailscale, only when requested. The agent installed it; kd enrolls,
+        // because the login URL has to reach this terminal.
+        if args.enroll_tailscale {
+            tailscale_up(&run.t)?;
+        }
+
+        // 10. Probe, while the lent login still exists for its Codex request.
+        let expected_repos = expected_repo_count(&config.bootstrap.repos);
+        let probe = probe::run(
+            &run.t,
+            &probe::script(
+                &plan.hostname,
+                expected_repos,
+                rehearsal,
+                hermes,
+                args.enroll_tailscale,
+            ),
+        )?;
+        Ok(Reports {
+            probe,
+            system: system_report,
+            user_space: user_report,
+        })
+    })();
+
+    // 11. Take the Codex login back, whatever happened above. A failed run
+    // keeps its own error; a failed retire is then only a warning, and a
+    // rerun reclaims and removes the leftover copy.
+    let retired = codex_login.retire(&run.t);
+    let reports = match outcome {
+        Ok(reports) => reports,
+        Err(e) => {
+            if let Err(r) = retired {
+                warn!(
+                    "the target may still hold the controller's Codex login (~/.codex/auth.json); rerun to reclaim and remove it: {r:#}"
+                );
+            }
+            return Err(e);
+        }
+    };
+
+    // The reports come before a retire failure so the run's work is visible.
+    // Exit 0 regardless of probe results.
+    println!(
+        "\n== probe on {}\n{}",
+        run.t.destination,
+        reports.probe.trim_end()
+    );
+    println!("\n== system phase report\n{}", reports.system.trim_end());
+    println!(
+        "\n== user-space phase report\n{}",
+        reports.user_space.trim_end()
+    );
+    retired.context(
+        "bootstrap finished, but taking the Codex login back from the target failed; rerun to retry",
     )?;
-    reboot_if_required(&mut run)?;
-
-    // 7. Secrets: the other three auth files, the archive, the token.
-    place_secrets(
-        &run.t,
-        &sources,
-        archive.as_deref(),
-        github_token.as_deref(),
-    )?;
-
-    // 8. User-space phase.
-    // Repository initialization needs an author before the agent starts.
-    git_identity.install(&run.t)?;
-    let user_report = agent::run_phase(
-        &run.t,
-        "user-space",
-        &prompts::user_space_phase(
-            &run.user,
-            &config.bootstrap.repos,
-            rehearsal,
-            hermes,
-            args.enroll_tailscale,
-        ),
-    )?;
-
-    // Dotfiles may have replaced Git config; restore the copied defaults.
-    git_identity.install(&run.t)?;
-
-    // A successful headless request does not complete Claude's interactive
-    // first-run gate. Repair only that gate after the installer has finished.
-    claude::complete_onboarding(&run.t)?;
-
-    // Routers come after the onboarding check, whose `claude auth status`
-    // must describe the native login, and after the phases that install
-    // Docker and jq. Wiring switches the default CLIs to routers with no
-    // accounts yet, so everything later (the probe) bypasses them.
-    let routers_installed = routers::install(&run.t)?;
-
-    // 9. Tailscale, only when requested. The agent installed it; kd enrolls,
-    // because the login URL has to reach this terminal.
-    if args.enroll_tailscale {
-        tailscale_up(&run.t)?;
-    }
-
-    // 10. Probe, then the agents' own reports. Exit 0 regardless.
-    let expected_repos = expected_repo_count(&config.bootstrap.repos);
-    let report = probe::run(
-        &run.t,
-        &probe::script(
-            &plan.hostname,
-            expected_repos,
-            rehearsal,
-            hermes,
-            args.enroll_tailscale,
-        ),
-    )?;
-    println!("\n== probe on {}\n{}", run.t.destination, report.trim_end());
-    println!("\n== system phase report\n{}", system_report.trim_end());
-    println!("\n== user-space phase report\n{}", user_report.trim_end());
-    if routers_installed {
-        println!(
-            "\n== router login\n{}",
-            routers::login_help(&run.t.destination)
-        );
-    } else {
-        println!(
-            "\n== routers\nNot installed: Docker was not usable. Codex and Claude stay on their native logins."
-        );
-    }
+    println!(
+        "\n== router login\n{}",
+        routers::login_help(&run.t.destination)
+    );
     if rehearsal {
         println!(
             "\nrehearsal done. The target holds real credentials; destroy it when you are finished."
@@ -198,6 +235,13 @@ pub fn run(args: BootstrapArgs) -> anyhow::Result<()> {
         println!("\nbootstrap done. The target holds real credentials.");
     }
     Ok(())
+}
+
+/// What a successful run prints once the Codex login has been taken back.
+struct Reports {
+    probe: String,
+    system: String,
+    user_space: String,
 }
 
 /// Resolve identity and archive selection before credentials or SSH are
@@ -264,10 +308,16 @@ impl BootstrapPlan {
     }
 }
 
-/// Everything secret except Codex's own login (placed during seeding) goes
-/// over now, between the two agent runs, so the system phase never saw it.
-/// The token is written only when one was collected, i.e. when `gh` on the
-/// box was not already logged in, so a rerun never leaves a token file.
+/// Everything secret except Codex's lent login (placed before the system
+/// phase) goes over now, between the two agent runs, so the system phase
+/// never saw it. The token is written only when one was collected, i.e.
+/// when `gh` on the box was not already logged in, so a rerun never leaves a
+/// token file.
+///
+/// This is also where a claude.ai login copied by an older kd is removed:
+/// Claude now reaches models only through CLIProxyAPI, and a leftover copy
+/// shares a rotating refresh token with the controller's. It goes before the
+/// user-space agent runs, so the agent never finds a native Claude login.
 fn place_secrets(
     t: &Transport,
     sources: &[secrets::AuthSource],
@@ -275,7 +325,9 @@ fn place_secrets(
     github_token: Option<&str>,
 ) -> anyhow::Result<()> {
     info!("placing credentials on {}", t.destination);
-    for s in sources.iter().filter(|s| s.cli != "codex") {
+    t.run(REMOVE_STALE_CLAUDE_LOGIN)
+        .context("removing an old copied Claude login failed")?;
+    for s in sources {
         t.push_secret(&s.contents, s.remote_relative)?;
     }
     if let Some(archive) = archive {
@@ -287,6 +339,11 @@ fn place_secrets(
     }
     Ok(())
 }
+
+/// Delete the claude.ai login an older kd copied to the target. This also
+/// deletes one someone created on the box by hand; the target is meant to
+/// have none.
+const REMOVE_STALE_CLAUDE_LOGIN: &str = r#"rm -f -- "$HOME/.claude/.credentials.json""#;
 
 /// The manifest deduplicated with the always-cloned repos, by repo name,
 /// which is what `~/git/*` will contain.
@@ -588,12 +645,10 @@ $S visudo -cf "/etc/sudoers.d/90-kd-$u" >/dev/null
 /// The upstream installer owns the release layout and companion binaries;
 /// a working standalone installation is also required for QR-code remote
 /// control. Reruns migrate older direct-download installs at the same path.
-/// Credentials are placed only after installation and its version check pass.
-fn install_codex(t: &Transport, auth: &secrets::AuthSource) -> anyhow::Result<()> {
+/// The login is lent only after installation and its version check pass.
+fn install_codex(t: &Transport) -> anyhow::Result<()> {
     info!("installing Codex on {}", t.destination);
-    t.run(CODEX_INSTALL_SCRIPT)?;
-    t.push_secret(&auth.contents, auth.remote_relative)?;
-    Ok(())
+    t.run(CODEX_INSTALL_SCRIPT)
 }
 
 const CODEX_INSTALL_SCRIPT: &str = r#"
