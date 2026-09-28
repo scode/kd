@@ -3,12 +3,24 @@
 //!
 //! `scode update` exists because devbox bootstrap installs kd, and possibly
 //! other tools, straight from their GitHub repositories under `scode/`, and
-//! updating exactly those is otherwise a two-step chore: remember which
-//! installed tools came from those repositories, then remember that
-//! cargo-update needs `-g` to touch git installs at all. The command finds
-//! them in `cargo install --list` and hands them to cargo-update, which
-//! already knows how to compare a git install with its branch head and
-//! rebuild only what moved.
+//! updating exactly those is otherwise a chore: remember which installed
+//! tools came from those repositories and how each was installed. The
+//! command finds them in `cargo install --list` and reruns
+//! `cargo install --git` for each with the recorded URL and branch. cargo
+//! itself compares the installed commit with the branch head, rebuilds a tool
+//! whose branch moved, and skips one that is current.
+//!
+//! It deliberately does not go through cargo-update (`cargo install-update
+//! -g`). cargo-update does its own update check, and as released that check
+//! ignores `CARGO_NET_GIT_FETCH_WITH_CLI=true`: it parses the variable as a
+//! TOML document, so a bare `true` is silently dropped, and it checks through
+//! libgit2, which cannot authenticate to a private repository whose
+//! credentials only the `git` command has. Such a tool then shows as "git
+//! error" / "Needs update: No" and is never updated. A fix is proposed
+//! upstream in <https://github.com/nabijaczleweli/cargo-update/pull/345>. If
+//! it is released, cargo-update would work here again, but there is no need
+//! to switch back: plain `cargo install` does the same job with fewer moving
+//! parts, and without cargo-update having to be installed.
 
 use anyhow::{Context, bail};
 use clap::{Args, Subcommand};
@@ -127,10 +139,9 @@ fn is_scode_source(source: &str) -> bool {
     })
 }
 
-/// Whether a git install is pinned to a tag or a commit. cargo-update only
-/// understands `?branch=`: it would compare a pinned install with the
-/// default branch and reinstall it from there, silently dropping the pin
-/// (confirmed against cargo-update 22.1.1). Such tools are skipped.
+/// Whether a git install is pinned to a tag or a commit. `update` reinstalls
+/// from the recorded URL and branch only, so it would move a pinned tool to
+/// its branch head and silently drop the pin. Such tools are skipped.
 fn is_pinned(source: &str) -> bool {
     let query = source
         .split_once('?')
@@ -144,8 +155,8 @@ fn is_pinned(source: &str) -> bool {
 /// What `scode update` does with the installed tools from scode repositories.
 #[derive(Debug, Default, PartialEq)]
 struct Selection {
-    /// Tools to update, in listing order.
-    update: Vec<String>,
+    /// Tools to update, in listing order, with their recorded source.
+    update: Vec<(String, String)>,
     /// Tools skipped because they are pinned, with their recorded source.
     pinned: Vec<(String, String)>,
 }
@@ -159,22 +170,21 @@ fn select(installed: &[Installed]) -> Selection {
         if is_pinned(source) {
             selection.pinned.push((i.name.clone(), source.to_owned()));
         } else {
-            selection.update.push(i.name.clone());
+            selection.update.push((i.name.clone(), source.to_owned()));
         }
     }
     selection
 }
 
 /// Arguments that mark one tool's cargo-update reinstalls as locked
-/// (`enforce_lock = true` in its per-package config), so it is built with
-/// the dependency versions in its repository's committed `Cargo.lock`.
-/// Idempotent, and a no-op for tools devbox bootstrap already configured.
+/// (`enforce_lock = true` in its per-package config), so that a
+/// `cargo install-update -a -g` the user runs themselves builds it with the
+/// dependency versions in its repository's committed `Cargo.lock`, as
+/// `kd cargo scode install` and `update` do. Idempotent.
 ///
-/// This per-package setting is the only way to lock these updates. Passing
-/// cargo-update's global `--locked` as well would make it hand `--locked` to
-/// cargo twice for every configured tool, and cargo rejects that ("cannot be
-/// used multiple times"), so the update would fail exactly when there is
-/// something to install.
+/// cargo-update's global `--locked` is no substitute: combined with this
+/// per-package setting it makes cargo-update hand `--locked` to cargo twice,
+/// which cargo rejects ("cannot be used multiple times").
 fn lock_args(tool: &str) -> Vec<String> {
     vec![
         "install-update-config".to_owned(),
@@ -183,12 +193,62 @@ fn lock_args(tool: &str) -> Vec<String> {
     ]
 }
 
-/// Arguments for the update itself. `-g` is required: cargo-update skips
-/// git-installed packages without it. No `--locked`; see [`lock_args`].
-fn update_args(tools: &[String]) -> Vec<String> {
-    let mut args = vec!["install-update".to_owned(), "-g".to_owned()];
-    args.extend(tools.iter().cloned());
+/// `cargo install` arguments that update one tool: the URL exactly as cargo
+/// recorded it (so the recorded source stays the same) and its `?branch=`, if
+/// any, as `--branch`, percent-decoded, since cargo records a branch such as
+/// `topic/x` as `topic%2Fx`. No `--force`: cargo skips the tool when the branch has
+/// not moved and rebuilds it when it has, which is exactly the update check.
+/// `--locked` builds the dependency versions in the repository's committed
+/// `Cargo.lock`, like `install`.
+///
+/// Only called for unpinned sources (see [`is_pinned`]), whose query holds at
+/// most a `branch`.
+fn update_args(name: &str, source: &str) -> Vec<String> {
+    let without_commit = source.split('#').next().unwrap_or_default();
+    let (url, query) = without_commit
+        .split_once('?')
+        .unwrap_or((without_commit, ""));
+    let mut args = vec![
+        "install".to_owned(),
+        "--locked".to_owned(),
+        "--git".to_owned(),
+        url.to_owned(),
+    ];
+    if let Some(branch) = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("branch="))
+    {
+        args.push("--branch".to_owned());
+        args.push(percent_decode(branch));
+    }
+    args.push(name.to_owned());
     args
+}
+
+/// Undo the percent-encoding cargo applies to a query value in a recorded
+/// source. A `%` not followed by two hex digits is kept as is, and so is the
+/// whole input if the decoded bytes are not UTF-8 (no valid branch name
+/// produces that).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[i] == b'%'
+            && let (Some(hi), Some(lo)) = (
+                bytes.get(i + 1).and_then(|&b| hex(b)),
+                bytes.get(i + 2).and_then(|&b| hex(b)),
+            )
+        {
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_owned())
 }
 
 /// Set so that installing and updating tools from private github.com/scode
@@ -197,9 +257,8 @@ fn update_args(tools: &[String]) -> Vec<String> {
 /// credentials the user's git is already configured with, instead of
 /// cargo's bundled libgit2, which supports some credential setups but fails
 /// with others (it failed with "failed to acquire username/password" for a
-/// private repository `git ls-remote` read fine). cargo-update reads the
-/// same variable (and the `net.git-fetch-with-cli` config key) for its own
-/// remote lookups.
+/// private repository `git ls-remote` read fine). cargo-update is supposed to
+/// honour it too but, as released, does not; see the module docs.
 const GIT_FETCH_WITH_CLI: &str = "CARGO_NET_GIT_FETCH_WITH_CLI";
 
 /// Whether an executable `git` is on the shell's PATH.
@@ -212,7 +271,7 @@ fn git_available(sh: &Shell) -> bool {
     })
 }
 
-/// Make a cargo or cargo-update command that fetches from GitHub use the
+/// Make a cargo command that fetches from GitHub use the
 /// `git` command, so private github.com/scode repositories, which require
 /// authentication, can be installed and updated with the user's git
 /// credentials (see [`GIT_FETCH_WITH_CLI`]).
@@ -237,55 +296,178 @@ fn with_git_cli<'a>(sh: &Shell, cmd: xshell::Cmd<'a>) -> xshell::Cmd<'a> {
     }
 }
 
+/// The install options cargo recorded for one package in `.crates2.json`,
+/// limited to those that decide whether a plain `cargo install` counts as
+/// current (`is_up_to_date` in cargo's install tracking; the set of binaries
+/// is the other one, and a change there is a real update).
+#[derive(Debug, Default, PartialEq, serde::Deserialize)]
+#[serde(default)]
+struct InstallOptions {
+    features: Vec<String>,
+    all_features: bool,
+    no_default_features: bool,
+    profile: String,
+    target: Option<String>,
+    /// `rustc -vV` output at install time; its `host:` line is the target a
+    /// plain `cargo install` builds for.
+    rustc: Option<String>,
+}
+
+impl InstallOptions {
+    /// What differs from the options `update` passes (none: default features,
+    /// the release profile, the host target), or `None` if nothing does.
+    ///
+    /// cargo rebuilds an install whose recorded options differ from the
+    /// requested ones even when its branch has not moved, so `update` would
+    /// silently turn e.g. a `--features extra` or `--profile dev` install into
+    /// a default one. Such tools are skipped instead, as pinned ones are.
+    fn non_default(&self) -> Option<String> {
+        let mut differences = Vec::new();
+        if !self.features.is_empty() {
+            differences.push(format!("--features {}", self.features.join(",")));
+        }
+        if self.all_features {
+            differences.push("--all-features".to_owned());
+        }
+        if self.no_default_features {
+            differences.push("--no-default-features".to_owned());
+        }
+        if !self.profile.is_empty() && self.profile != "release" {
+            differences.push(format!("--profile {}", self.profile));
+        }
+        let host = self
+            .rustc
+            .as_deref()
+            .and_then(|r| r.lines().find_map(|l| l.strip_prefix("host: ")));
+        if let (Some(target), Some(host)) = (self.target.as_deref(), host)
+            && target != host
+        {
+            differences.push(format!("--target {target}"));
+        }
+        (!differences.is_empty()).then(|| differences.join(" "))
+    }
+}
+
+/// Parse cargo's `.crates2.json` into install options by package name. Keys
+/// look like `name version (source)`; cargo keeps at most one install per
+/// package name, so the name alone identifies the entry.
+fn parse_crates2(text: &str) -> anyhow::Result<std::collections::HashMap<String, InstallOptions>> {
+    #[derive(serde::Deserialize)]
+    struct Crates2 {
+        #[serde(default)]
+        installs: std::collections::HashMap<String, InstallOptions>,
+    }
+    let crates2: Crates2 = serde_json::from_str(text).context("parsing .crates2.json")?;
+    Ok(crates2
+        .installs
+        .into_iter()
+        .filter_map(|(key, opts)| Some((key.split(' ').next()?.to_owned(), opts)))
+        .collect())
+}
+
+/// Where `cargo install` keeps `.crates2.json`: `CARGO_INSTALL_ROOT`, else an
+/// absolute `install.root` from `$CARGO_HOME/config.toml` (or `config`), else
+/// `$CARGO_HOME`, which defaults to `~/.cargo`.
+///
+/// This covers the setups kd creates. It deliberately does not reproduce
+/// cargo's full lookup (a relative `install.root`, or one from a project's
+/// `.cargo/config.toml` in the current directory); there the file may not be
+/// found, and `update` warns that it could not check install options.
+fn install_root(sh: &Shell) -> Option<std::path::PathBuf> {
+    let non_empty = |name: &str| sh.var_os(name).filter(|v| !v.is_empty());
+    if let Some(root) = non_empty("CARGO_INSTALL_ROOT") {
+        return Some(root.into());
+    }
+    let cargo_home: std::path::PathBuf = match non_empty("CARGO_HOME") {
+        Some(home) => home.into(),
+        None => std::path::PathBuf::from(non_empty("HOME")?).join(".cargo"),
+    };
+    let configured = ["config.toml", "config"]
+        .iter()
+        .find_map(|f| std::fs::read_to_string(cargo_home.join(f)).ok())
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|table| {
+            let root = table.get("install")?.get("root")?.as_str()?;
+            let root = std::path::PathBuf::from(root);
+            root.is_absolute().then_some(root)
+        });
+    Some(configured.unwrap_or(cargo_home))
+}
+
+/// Install options for the installed packages, or `None` with a reason when
+/// `.crates2.json` cannot be found or read.
+fn installed_options(
+    sh: &Shell,
+) -> Result<std::collections::HashMap<String, InstallOptions>, String> {
+    let path = install_root(sh)
+        .ok_or_else(|| "neither CARGO_INSTALL_ROOT, CARGO_HOME nor HOME is set".to_owned())?
+        .join(".crates2.json");
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    parse_crates2(&text).map_err(|e| format!("{}: {e:#}", path.display()))
+}
+
+/// Update every unpinned tool from a scode repository by rerunning
+/// `cargo install` for it (see [`update_args`] and the module docs for why not
+/// cargo-update). Tools installed with non-default options are skipped (see
+/// [`InstallOptions::non_default`]). One tool failing does not stop the
+/// others; the command fails at the end if any did.
 fn scode_update(sh: &Shell, dry_run: bool) -> anyhow::Result<()> {
-    let listing = cmd!(sh, "cargo install --list")
-        .quiet()
-        .read()
-        .context("running `cargo install --list`")?;
-    let selection = select(&parse_install_list(&listing));
+    let mut selection = select(&installed_tools(sh)?);
     for (name, source) in &selection.pinned {
         println!("skipping {name}: pinned to a tag or commit ({source})");
     }
+    match installed_options(sh) {
+        Ok(options) => selection.update.retain(|(name, _)| {
+            match options.get(name).and_then(InstallOptions::non_default) {
+                Some(differences) => {
+                    println!(
+                        "skipping {name}: installed with {differences}, which updating would replace with the defaults"
+                    );
+                    false
+                }
+                None => true,
+            }
+        }),
+        Err(reason) => eprintln!(
+            "warning: could not check how the tools were installed ({reason}); a tool installed with non-default features, profile or target would be rebuilt with the defaults"
+        ),
+    }
     if selection.update.is_empty() {
-        println!("no unpinned tools installed from github.com/scode; nothing to update");
+        println!("no tools from github.com/scode to update");
         return Ok(());
     }
-    let tools = &selection.update;
-    println!("tools from github.com/scode: {}", tools.join(", "));
+    let names: Vec<&str> = selection.update.iter().map(|(n, _)| n.as_str()).collect();
+    println!("tools from github.com/scode: {}", names.join(", "));
     if dry_run {
-        for tool in tools {
-            println!("dry run: would run `cargo {}`", lock_args(tool).join(" "));
+        for (name, source) in &selection.update {
+            println!(
+                "dry run: would run `cargo {}`",
+                update_args(name, source).join(" ")
+            );
         }
-        println!(
-            "dry run: would run `cargo {}`",
-            update_args(tools).join(" ")
-        );
         return Ok(());
     }
-    // Checked up front so a missing cargo-update gets a useful message
-    // instead of cargo's generic "no such command".
-    if !cargo_update_available(sh) {
-        bail!(
-            "`cargo install-update` is not available; install cargo-update (`brew install cargo-update` or `cargo install cargo-update`)"
-        );
+    // cargo's own output streams through (xshell echoes each command first).
+    // For a tool that is already current, cargo reports "Ignored package ...
+    // is already installed, use --force to override", which reads like a
+    // problem but is the no-update-needed case. Updating kd itself while
+    // this kd runs is fine: cargo installs by writing a new file and renaming
+    // it into place, and the running process keeps its old inode.
+    println!(
+        "(cargo reports a tool whose branch has not moved as \"already installed\"; that is expected)"
+    );
+    let mut failed = Vec::new();
+    for (name, source) in &selection.update {
+        let args = update_args(name, source);
+        if let Err(err) = with_git_cli(sh, cmd!(sh, "cargo {args...}")).run() {
+            eprintln!("error: updating {name} failed: {err}");
+            failed.push(name.as_str());
+        }
     }
-    for tool in tools {
-        let args = lock_args(tool);
-        cmd!(sh, "cargo {args...}")
-            .quiet()
-            .ignore_stdout()
-            .run()
-            .with_context(|| format!("marking {tool}'s updates as locked"))?;
+    if !failed.is_empty() {
+        bail!("updating failed for: {}", failed.join(", "));
     }
-    // Output streams through (xshell echoes the command first), so
-    // cargo-update's own progress and per-tool results are what the user
-    // sees. Updating kd itself while this kd runs is fine: cargo installs by
-    // writing a new file and renaming it into place, and the running process
-    // keeps its old inode.
-    let args = update_args(tools);
-    with_git_cli(sh, cmd!(sh, "cargo {args...}"))
-        .run()
-        .context("cargo install-update failed")?;
     Ok(())
 }
 
@@ -423,14 +605,15 @@ fn cargo_update_available(sh: &Shell) -> bool {
         .is_ok()
 }
 
-/// Install one tool from github.com/scode/NAME and mark its future
-/// cargo-update reinstalls as locked. Every existing install of NAME is
-/// decided by [`install_plan`] first; the only case that proceeds is "not
-/// installed", so this command never replaces anything.
+/// Install one tool from github.com/scode/NAME and, if cargo-update is
+/// installed, mark its cargo-update reinstalls as locked (see [`lock_args`]).
+/// Every existing install of NAME is decided by [`install_plan`] first; the
+/// only case that proceeds is "not installed", so this command never replaces
+/// anything.
 ///
 /// A failure of the lock step after a successful install is a warning, not
-/// an error: the tool is installed and usable, and `update` applies the
-/// same setting to every tool before it updates.
+/// an error: the tool is installed and usable, and the setting only matters
+/// to a `cargo install-update` the user runs themselves.
 fn scode_install(sh: &Shell, name: &str, dry_run: bool) -> anyhow::Result<()> {
     validate_name(name)?;
     match install_plan(&installed_tools(sh)?, name) {
@@ -457,7 +640,9 @@ fn scode_install(sh: &Shell, name: &str, dry_run: bool) -> anyhow::Result<()> {
         if can_lock {
             println!("dry run: then `cargo {}`", lock.join(" "));
         } else {
-            println!("dry run: cargo-update is not installed, so no lock setting would be written");
+            println!(
+                "dry run: cargo-update is not installed, so no cargo-update lock setting would be written"
+            );
         }
         return Ok(());
     }
@@ -466,11 +651,11 @@ fn scode_install(sh: &Shell, name: &str, dry_run: bool) -> anyhow::Result<()> {
         .with_context(|| format!("installing {name}"))?;
     if !can_lock {
         println!(
-            "note: cargo-update is not installed; `kd cargo scode update` needs it, and marks {name}'s updates as locked when it runs"
+            "note: cargo-update is not installed, so no lock setting for `cargo install-update` was written for {name}; `kd cargo scode update` does not need it"
         );
     } else if let Err(err) = cmd!(sh, "cargo {lock...}").quiet().ignore_stdout().run() {
         eprintln!(
-            "warning: {name} is installed, but marking its updates as locked failed ({err}); `kd cargo scode update` applies the setting before it updates"
+            "warning: {name} is installed, but marking its cargo-update reinstalls as locked failed ({err}); this only affects `cargo install-update`, not `kd cargo scode update`"
         );
     }
     Ok(())
@@ -557,19 +742,18 @@ local v0.1.0 (/home/me/src/local):
     /// cargo records (HTTPS with or without `.git`, SSH), owner case
     /// ignored; not other owners, not an owner that only starts with
     /// "scode", not registry or path installs. Tag and commit pins are
-    /// reported separately, because cargo-update would silently unpin them.
+    /// reported separately, because reinstalling from the branch would
+    /// silently unpin them.
     #[test]
     fn selects_scode_repositories_and_skips_pins() {
         let selection = select(&parse_install_list(LISTING));
-        assert_eq!(
-            selection.update,
-            vec!["kd".to_owned(), "voice".to_owned(), "viassh".to_owned()]
-        );
+        let update: Vec<&str> = selection.update.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(update, vec!["kd", "voice", "viassh"]);
         let pinned: Vec<&str> = selection.pinned.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(pinned, vec!["pinned", "revved"]);
     }
 
-    /// A branch is not a pin: cargo-update follows `?branch=` correctly.
+    /// A branch is not a pin: `update` reinstalls from the recorded branch.
     #[test]
     fn branch_is_not_a_pin() {
         assert!(!is_pinned("https://github.com/scode/x?branch=main#1"));
@@ -578,16 +762,58 @@ local v0.1.0 (/home/me/src/local):
         assert!(is_pinned("https://github.com/scode/x?branch=a&tag=b#1"));
     }
 
-    /// The update must not pass cargo-update's global `--locked`: for a tool
-    /// with `enforce_lock` set (every tool bootstrap installs, and every
-    /// tool after `lock_args` ran) cargo would get `--locked` twice and
-    /// refuse. Locking comes from the per-package setting instead, and `-g`
-    /// is what makes cargo-update look at git installs at all.
+    /// The update reruns `cargo install` with the source exactly as cargo
+    /// recorded it, so the recorded source does not change: the URL as given
+    /// (a `.git` suffix, owner case and SSH form included), the branch as
+    /// `--branch`, and neither the query nor the `#commit`. It builds
+    /// `--locked` and never passes `--force`, since cargo skipping an
+    /// unchanged tool is the update check.
     #[test]
-    fn update_is_locked_per_package_not_globally() {
-        let update = update_args(&["kd".to_owned(), "voice".to_owned()]);
-        assert_eq!(update, vec!["install-update", "-g", "kd", "voice"]);
-        assert!(!update.iter().any(|a| a == "--locked"));
+    fn update_reinstalls_from_the_recorded_source() {
+        assert_eq!(
+            update_args("kd", "https://github.com/scode/kd#59c1f5e4"),
+            vec![
+                "install",
+                "--locked",
+                "--git",
+                "https://github.com/scode/kd",
+                "kd"
+            ]
+        );
+        assert_eq!(
+            update_args(
+                "voice",
+                "https://github.com/Scode/voice.git?branch=main#def456"
+            ),
+            vec![
+                "install",
+                "--locked",
+                "--git",
+                "https://github.com/Scode/voice.git",
+                "--branch",
+                "main",
+                "voice"
+            ]
+        );
+        assert_eq!(
+            update_args("viassh", "ssh://git@github.com/scode/viassh#ccc333"),
+            vec![
+                "install",
+                "--locked",
+                "--git",
+                "ssh://git@github.com/scode/viassh",
+                "viassh"
+            ]
+        );
+        assert!(
+            !update_args("kd", "https://github.com/scode/kd#1").contains(&"--force".to_owned())
+        );
+    }
+
+    /// Reinstalls for cargo-update are locked per package, never with its
+    /// global `--locked`, which cargo would then get twice and refuse.
+    #[test]
+    fn lock_setting_is_per_package() {
         assert_eq!(
             lock_args("kd"),
             vec!["install-update-config", "--enforce-lock", "kd"]
@@ -721,6 +947,25 @@ local v0.1.0 (/home/me/src/local):
         git: bool,
         run: impl FnOnce(&Shell) -> anyhow::Result<()>,
     ) -> Vec<String> {
+        let (log, result) =
+            run_with_failing_stub_cargo(listing, fetch_with_cli, git, "", EMPTY_CRATES2, run);
+        result.unwrap();
+        log
+    }
+
+    /// [`run_with_stub_cargo`], except that the stub `cargo` fails any call
+    /// whose last argument is `fail` (a package name; `""` fails nothing),
+    /// `crates2` is the `.crates2.json` in the install root (the stub
+    /// directory, via `CARGO_INSTALL_ROOT`), and the command's result is
+    /// returned rather than unwrapped.
+    fn run_with_failing_stub_cargo(
+        listing: &str,
+        fetch_with_cli: &str,
+        git: bool,
+        fail: &str,
+        crates2: &str,
+        run: impl FnOnce(&Shell) -> anyhow::Result<()>,
+    ) -> (Vec<String>, anyhow::Result<()>) {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("log");
@@ -733,7 +978,7 @@ local v0.1.0 (/home/me/src/local):
         };
         exe(
             "cargo",
-            "#!/bin/sh\nprintf '%s|%s\\n' \"${CARGO_NET_GIT_FETCH_WITH_CLI-unset}\" \"$*\" >> \"$STUB_LOG\"\nif [ \"$1 $2\" = 'install --list' ]; then while IFS= read -r l; do printf '%s\\n' \"$l\"; done < \"$STUB_LISTING\"; fi\nexit 0\n",
+            "#!/bin/sh\nprintf '%s|%s\\n' \"${CARGO_NET_GIT_FETCH_WITH_CLI-unset}\" \"$*\" >> \"$STUB_LOG\"\nif [ \"$1 $2\" = 'install --list' ]; then while IFS= read -r l; do printf '%s\\n' \"$l\"; done < \"$STUB_LISTING\"; fi\nfor last; do :; done\nif [ -n \"$STUB_FAIL\" ] && [ \"$last\" = \"$STUB_FAIL\" ]; then exit 1; fi\nexit 0\n",
         );
         if git {
             exe("git", "#!/bin/sh\nexit 0\n");
@@ -742,29 +987,32 @@ local v0.1.0 (/home/me/src/local):
         sh.set_var("PATH", dir.path());
         sh.set_var("STUB_LOG", &log);
         sh.set_var("STUB_LISTING", &list);
+        sh.set_var("STUB_FAIL", fail);
+        std::fs::write(dir.path().join(".crates2.json"), crates2).unwrap();
+        sh.set_var("CARGO_INSTALL_ROOT", dir.path());
         sh.set_var(GIT_FETCH_WITH_CLI, fetch_with_cli);
-        run(&sh).unwrap();
-        std::fs::read_to_string(&log)
+        let result = run(&sh);
+        let log = std::fs::read_to_string(&log)
             .unwrap()
             .lines()
             .map(str::to_owned)
-            .collect()
+            .collect();
+        (log, result)
     }
 
+    const EMPTY_CRATES2: &str = r#"{"installs":{}}"#;
     const KD_LISTING: &str = "kd v0.1.0 (https://github.com/scode/kd#abc):\n    kd\n";
+    const KD_UPDATE: &str = "install --locked --git https://github.com/scode/kd kd";
     const TOOL_INSTALL: &str = "install --locked --git https://github.com/scode/tool tool";
 
-    /// Private scode repositories only install and update when cargo and
-    /// cargo-update fetch with the `git` command (whose credentials work),
+    /// Private scode repositories only install and update when cargo fetches
+    /// with the `git` command (whose credentials work),
     /// so with git on PATH and no explicit setting, both fetching commands
     /// must get the variable.
     #[test]
     fn fetching_commands_use_the_git_cli_when_git_exists() {
         let log = run_with_stub_cargo(KD_LISTING, "", true, |sh| scode_update(sh, false));
-        assert!(
-            log.contains(&"true|install-update -g kd".to_owned()),
-            "{log:?}"
-        );
+        assert!(log.contains(&format!("true|{KD_UPDATE}")), "{log:?}");
         let log = run_with_stub_cargo("", "", true, |sh| scode_install(sh, "tool", false));
         assert!(log.contains(&format!("true|{TOOL_INSTALL}")), "{log:?}");
     }
@@ -775,10 +1023,7 @@ local v0.1.0 (/home/me/src/local):
     #[test]
     fn without_git_cargo_keeps_its_builtin_fetching() {
         let log = run_with_stub_cargo(KD_LISTING, "", false, |sh| scode_update(sh, false));
-        assert!(
-            log.contains(&"unset|install-update -g kd".to_owned()),
-            "{log:?}"
-        );
+        assert!(log.contains(&format!("unset|{KD_UPDATE}")), "{log:?}");
         let log = run_with_stub_cargo("", "", false, |sh| scode_install(sh, "tool", false));
         assert!(log.contains(&format!("unset|{TOOL_INSTALL}")), "{log:?}");
     }
@@ -789,13 +1034,149 @@ local v0.1.0 (/home/me/src/local):
     fn explicit_setting_wins() {
         for git in [true, false] {
             let log = run_with_stub_cargo(KD_LISTING, "false", git, |sh| scode_update(sh, false));
-            assert!(
-                log.contains(&"false|install-update -g kd".to_owned()),
-                "{log:?}"
-            );
+            assert!(log.contains(&format!("false|{KD_UPDATE}")), "{log:?}");
             let log = run_with_stub_cargo("", "false", git, |sh| scode_install(sh, "tool", false));
             assert!(log.contains(&format!("false|{TOOL_INSTALL}")), "{log:?}");
         }
+    }
+
+    /// One tool failing to update must not stop the others, and the command
+    /// must still fail at the end, naming it.
+    #[test]
+    fn update_continues_past_a_failing_tool_and_then_fails() {
+        let listing = "kd v0.1.0 (https://github.com/scode/kd#abc):\n    kd\nvoice v0.2.0 (https://github.com/scode/voice#def):\n    voice\n";
+        let (log, result) =
+            run_with_failing_stub_cargo(listing, "", true, "kd", EMPTY_CRATES2, |sh| {
+                scode_update(sh, false)
+            });
+        assert!(log.iter().any(|l| l.ends_with("install --locked --git https://github.com/scode/voice voice")), "{log:?}");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("kd") && !err.contains("voice"), "{err}");
+    }
+
+    /// cargo records `--branch topic/x` as `?branch=topic%2Fx`; passing that
+    /// back literally names a branch that does not exist, so it is decoded.
+    #[test]
+    fn update_decodes_the_recorded_branch() {
+        let listing = parse_install_list(
+            "tool v0.1.0 (https://github.com/scode/tool?branch=topic%2Fslash#abc):\n    tool\n",
+        );
+        let (name, source) = &select(&listing).update[0];
+        assert_eq!(
+            update_args(name, source),
+            vec![
+                "install",
+                "--locked",
+                "--git",
+                "https://github.com/scode/tool",
+                "--branch",
+                "topic/slash",
+                "tool"
+            ]
+        );
+        assert_eq!(percent_decode("a%2Fb%2fc"), "a/b/c");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz"), "%zz");
+    }
+
+    /// Shape of real `.crates2.json` entries (bins and version_req omitted
+    /// where irrelevant). Any recorded option a plain `cargo install` would
+    /// not reproduce must be reported, and default installs must not be.
+    #[test]
+    fn detects_non_default_install_options() {
+        let entry = |name: &str, overrides: serde_json::Value| {
+            let mut e = serde_json::json!({
+                "features": [],
+                "all_features": false,
+                "no_default_features": false,
+                "profile": "release",
+                "target": "x86_64-unknown-linux-gnu",
+                "rustc": "rustc 1.98.1\nhost: x86_64-unknown-linux-gnu\n",
+            });
+            for (k, v) in overrides.as_object().unwrap() {
+                e[k] = v.clone();
+            }
+            (
+                format!("{name} 0.1.0 (git+https://github.com/scode/{name}#abc)"),
+                e,
+            )
+        };
+        let installs: serde_json::Map<String, serde_json::Value> = [
+            entry("plain", serde_json::json!({})),
+            entry(
+                "featured",
+                serde_json::json!({"features": ["extra"], "no_default_features": true}),
+            ),
+            entry("dev", serde_json::json!({"profile": "dev"})),
+            entry(
+                "cross",
+                serde_json::json!({"target": "aarch64-unknown-linux-gnu"}),
+            ),
+            entry("everything", serde_json::json!({"all_features": true})),
+        ]
+        .into_iter()
+        .collect();
+        let text = serde_json::json!({ "installs": installs }).to_string();
+        let options = parse_crates2(&text).unwrap();
+        assert_eq!(options["plain"].non_default(), None);
+        assert_eq!(
+            options["featured"].non_default().as_deref(),
+            Some("--features extra --no-default-features")
+        );
+        assert_eq!(
+            options["dev"].non_default().as_deref(),
+            Some("--profile dev")
+        );
+        assert_eq!(
+            options["cross"].non_default().as_deref(),
+            Some("--target aarch64-unknown-linux-gnu")
+        );
+        assert_eq!(
+            options["everything"].non_default().as_deref(),
+            Some("--all-features")
+        );
+    }
+
+    /// A tool installed with non-default options is skipped, since cargo would
+    /// rebuild it with the defaults even at an unchanged commit; the others
+    /// are still updated.
+    #[test]
+    fn update_skips_tools_installed_with_non_default_options() {
+        let listing = "kd v0.1.0 (https://github.com/scode/kd#abc):\n    kd\nvoice v0.2.0 (https://github.com/scode/voice#def):\n    voice\n";
+        let crates2 = r#"{"installs": {"voice 0.2.0 (git+https://github.com/scode/voice#def)": {"features": ["extra"], "profile": "release"}}}"#;
+        let (log, result) = run_with_failing_stub_cargo(listing, "", true, "", crates2, |sh| {
+            scode_update(sh, false)
+        });
+        result.unwrap();
+        assert!(log.iter().any(|l| l.ends_with(KD_UPDATE)), "{log:?}");
+        assert!(!log.iter().any(|l| l.contains("scode/voice")), "{log:?}");
+    }
+
+    /// `.crates2.json` lives in cargo's install root: `CARGO_INSTALL_ROOT`,
+    /// else an absolute `install.root` in `$CARGO_HOME/config.toml`, else
+    /// `$CARGO_HOME`. The test's Shell sets the variables, so the test
+    /// process's environment is untouched.
+    #[test]
+    fn install_root_follows_cargo_for_the_common_setups() {
+        let home = tempfile::tempdir().unwrap();
+        let sh = Shell::new().unwrap();
+        sh.set_var("CARGO_INSTALL_ROOT", "");
+        sh.set_var("CARGO_HOME", home.path());
+        assert_eq!(install_root(&sh), Some(home.path().to_owned()));
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[install]\nroot = \"/opt/tools\"\n",
+        )
+        .unwrap();
+        assert_eq!(install_root(&sh), Some("/opt/tools".into()));
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[install]\nroot = \"relative\"\n",
+        )
+        .unwrap();
+        assert_eq!(install_root(&sh), Some(home.path().to_owned()));
+        sh.set_var("CARGO_INSTALL_ROOT", "/elsewhere");
+        assert_eq!(install_root(&sh), Some("/elsewhere".into()));
     }
 
     /// Nothing that looks unlike a header may become a tool name.

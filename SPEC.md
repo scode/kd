@@ -25,9 +25,8 @@ without it, and it must work unattended on a fresh macOS or Linux machine that h
   cargo-update is built with `+stable` (installed if missing), because current cargo-update can need a newer rust than
   kd. With cargo-update available it writes kd's lock setting (`cargo install-update-config --enforce-lock kd`). Every
   failure in these steps is a warning with the command to retry, not an error: kd is already installed, and
-  `kd cargo
-  scode update` also writes the lock setting before it updates. A successful installer run therefore does
-  not guarantee cargo-update is present; the warning says so.
+  `kd cargo scode update` does not need cargo-update. A successful installer run therefore does not guarantee
+  cargo-update is present; the warning says so.
 - Ends with a banner when `kd` does not resolve to the installed binary (not on PATH, or shadowed by another `kd`
   earlier on PATH), and, when it installed rust itself, a note that the current shell needs rustup's env file sourced or
   a restart. The latter is printed even when a later step fails.
@@ -253,28 +252,36 @@ non-ImageMagick helpers still behave correctly. It does not prove that thumbnail
 Commands for tools installed with `cargo install --git` from repositories under github.com/scode, kd included.
 
 Private repositories, which require authentication, work: when `git` is on PATH, the commands that fetch from GitHub
-(`install` and `update`) run cargo and cargo-update with `CARGO_NET_GIT_FETCH_WITH_CLI=true`, so they fetch with the
-`git` command and whatever credentials it is configured with. cargo's built-in git support handles some credential
-setups but fails with others. Without `git` on PATH, cargo's built-in fetching is left in place, so public repositories
-still work on a machine without git. A non-empty `CARGO_NET_GIT_FETCH_WITH_CLI` in the environment, even `false`, is
-passed through unchanged; a `net.git-fetch-with-cli` setting in cargo's config is overridden when kd sets the variable.
+(`install` and `update`) run cargo with `CARGO_NET_GIT_FETCH_WITH_CLI=true`, so it fetches with the `git` command and
+whatever credentials it is configured with. cargo's built-in git support handles some credential setups but fails with
+others. Without `git` on PATH, cargo's built-in fetching is left in place, so public repositories still work on a
+machine without git. A non-empty `CARGO_NET_GIT_FETCH_WITH_CLI` in the environment, even `false`, is passed through
+unchanged; a `net.git-fetch-with-cli` setting in cargo's config is overridden when kd sets the variable.
 
 ### kd cargo scode update [--dry-run]
 
 - Updates every tool installed with `cargo install --git` from a repository under github.com/scode (owner matched
   exactly, ignoring case; recorded as `https://`, `http://` or `ssh://git@` URLs), kd itself included, to the latest
   commit of the branch it was installed from. Tools from crates.io, other owners, or local paths are left alone.
-- Tools pinned to a tag or commit (`?tag=` or `?rev=` in the recorded source) are skipped and reported: cargo-update
-  would move them to the default branch and silently drop the pin.
-- The tools are found in `cargo install --list`. Each is first marked with cargo-update's per-package lock setting
-  (`cargo install-update-config --enforce-lock <name>`, idempotent), then all are updated with
-  `cargo install-update -g <names>`, so only tools whose branch moved are rebuilt, with the dependency versions from
-  each repository's committed `Cargo.lock`. The global `--locked` flag is not used: combined with the per-package
-  setting it would pass `--locked` to cargo twice, which cargo rejects. The per-package setting stays in place
-  afterwards, so later plain `cargo install-update -a -g` runs are locked for these tools too.
-- cargo-update's output is shown as it runs. A missing cargo-update is an error that says how to install it. A
-  repository cargo-update cannot reach shows as "git error" in its table and is treated as not needing an update;
-  cargo-update still exits 0, and so does this command.
+- Tools pinned to a tag or commit (`?tag=` or `?rev=` in the recorded source) are skipped and reported: reinstalling
+  from the branch would silently drop the pin.
+- Tools installed with non-default options (features, `--all-features`, `--no-default-features`, a profile other than
+  release, or a target other than the host), as recorded in cargo's `.crates2.json`, are skipped and reported: cargo
+  would rebuild them with the defaults even when their branch has not moved. `.crates2.json` is looked up in
+  `CARGO_INSTALL_ROOT`, else an absolute `install.root` in `$CARGO_HOME/config.toml`, else `$CARGO_HOME` (default
+  `~/.cargo`). If it cannot be read there, the command warns and updates without this check.
+- The tools are found in `cargo install --list`. Each is updated with
+  `cargo install --locked --git <recorded URL> [--branch <recorded branch>] <name>`, using the URL exactly as recorded
+  (without its query and `#commit`), so the recorded source does not change. The branch is percent-decoded, since cargo
+  records e.g. `topic/x` as `topic%2Fx`. cargo rebuilds a tool whose branch moved, with the dependency versions from its
+  repository's committed `Cargo.lock`, and skips one that is current, reporting it as already installed. The command
+  prints a line saying that this is expected.
+- cargo-update is not used, and need not be installed. cargo-update's own update check ignores
+  `CARGO_NET_GIT_FETCH_WITH_CLI=true` (a fix is proposed upstream in
+  [cargo-update#345](https://github.com/nabijaczleweli/cargo-update/pull/345)), so it could not update tools from
+  private repositories.
+- cargo's output is shown as it runs. A tool that fails to update is reported and the others are still updated; the
+  command then exits with an error naming the tools that failed.
 - `--dry-run` lists the tools and the commands without running them.
 - No matching tools is not an error; the command says so and exits 0.
 
@@ -286,9 +293,9 @@ passed through unchanged; a `net.git-fetch-with-cli` setting in cargo's config i
   the default branch and `update` can update it later, built with the repository's committed `Cargo.lock`. The
   repository must hold a binary package named NAME.
 - If cargo-update is installed, the tool is then marked with its per-package lock setting
-  (`cargo install-update-config --enforce-lock NAME`) so later updates stay locked. Without cargo-update it says so;
-  `update` needs cargo-update anyway and applies the setting when it runs. If that step fails after a successful
-  install, it is a warning, not an error.
+  (`cargo install-update-config --enforce-lock NAME`), so a `cargo install-update` the user runs also builds it locked.
+  Without cargo-update it says so; `update` does not need it. If that step fails after a successful install, it is a
+  warning, not an error.
 - NAME must work as both a GitHub repository name and a cargo package name: an ASCII letter first, then letters, digits,
   `-` or `_`, at most 64 characters. Anything else is refused before cargo runs.
 - It never replaces an existing install of NAME. An unpinned install from github.com/scode/NAME is reported as already

@@ -12,7 +12,7 @@
 #
 # Installing from the repository rather than a local checkout matters: it
 # records https://github.com/scode/kd as kd's source, which is what lets
-# `kd cargo scode update` (and cargo-update) update it later.
+# `kd cargo scode update` and `cargo install-update -a -g` update it later.
 #
 # Uninstalling: `kd cargo scode uninstall kd` or plain `cargo uninstall kd`.
 set -euo pipefail
@@ -143,11 +143,11 @@ main() {
   # on the normal path.
   cargo ${toolchain[@]+"${toolchain[@]}"} install --locked --force --git https://github.com/scode/kd kd
 
-  # cargo-update provides `cargo install-update`, which `kd cargo scode
-  # update` drives; without it kd can be installed but never updated. An
-  # existing cargo-update, from cargo or Homebrew, is left alone. Every
-  # failure in this block is a warning, not an error: kd itself is installed
-  # and usable by now, only updating it needs cargo-update.
+  # cargo-update provides `cargo install-update`, so `cargo install-update
+  # -a -g` can keep kd and other git-installed tools current. (`kd cargo
+  # scode update` does not use it.) An existing cargo-update, from cargo or
+  # Homebrew, is left alone. Every failure in this block is a warning, not an
+  # error: kd itself is installed and usable by now.
   if ! cargo install-update --help >/dev/null 2>&1; then
     # cargo-update links OpenSSL on every Unix, macOS included (libssh2-sys,
     # pulled in by git2, requires openssl-sys everywhere). `vendored-openssl`
@@ -171,21 +171,21 @@ main() {
       echo "         full perl (e.g. apt install make perl). Install those, then run:" >&2
       echo "         ${cu_cmd[*]}" >&2
     else
-      echo "installing cargo-update (for \`kd cargo scode update\`)" >&2
+      echo "installing cargo-update (for \`cargo install-update -a -g\`)" >&2
       if ! "${cu_cmd[@]}"; then
         echo "" >&2
         echo "warning: kd is installed, but installing cargo-update failed, so" >&2
-        echo "         \`kd cargo scode update\` won't work until it is installed; retry with:" >&2
+        echo "         \`cargo install-update\` won't work until it is installed; retry with:" >&2
         echo "         ${cu_cmd[*]}" >&2
       fi
     fi
   fi
   # Mark kd's future cargo-update rebuilds as locked, as `kd cargo scode
-  # install` does. `kd cargo scode update` also writes this before every
-  # update, so a failure here only costs a warning.
+  # install` does. It only affects `cargo install-update`, so a failure here
+  # only costs a warning.
   if cargo install-update --help >/dev/null 2>&1; then
     cargo install-update-config --enforce-lock kd >/dev/null ||
-      echo "warning: could not mark kd's updates as locked; \`kd cargo scode update\` will do it" >&2
+      echo "warning: could not mark kd's cargo-update rebuilds as locked; retry with: cargo install-update-config --enforce-lock kd" >&2
   fi
 
   # cargo puts the binary in $CARGO_INSTALL_ROOT/bin if set, else
