@@ -176,23 +176,6 @@ fn select(installed: &[Installed]) -> Selection {
     selection
 }
 
-/// Arguments that mark one tool's cargo-update reinstalls as locked
-/// (`enforce_lock = true` in its per-package config), so that a
-/// `cargo install-update -a -g` the user runs themselves builds it with the
-/// dependency versions in its repository's committed `Cargo.lock`, as
-/// `kd cargo scode install` and `update` do. Idempotent.
-///
-/// cargo-update's global `--locked` is no substitute: combined with this
-/// per-package setting it makes cargo-update hand `--locked` to cargo twice,
-/// which cargo rejects ("cannot be used multiple times").
-fn lock_args(tool: &str) -> Vec<String> {
-    vec![
-        "install-update-config".to_owned(),
-        "--enforce-lock".to_owned(),
-        tool.to_owned(),
-    ]
-}
-
 /// `cargo install` arguments that update one tool: the URL exactly as cargo
 /// recorded it (so the recorded source stays the same) and its `?branch=`, if
 /// any, as `--branch`, percent-decoded, since cargo records a branch such as
@@ -257,8 +240,7 @@ fn percent_decode(s: &str) -> String {
 /// credentials the user's git is already configured with, instead of
 /// cargo's bundled libgit2, which supports some credential setups but fails
 /// with others (it failed with "failed to acquire username/password" for a
-/// private repository `git ls-remote` read fine). cargo-update is supposed to
-/// honour it too but, as released, does not; see the module docs.
+/// private repository `git ls-remote` read fine).
 const GIT_FETCH_WITH_CLI: &str = "CARGO_NET_GIT_FETCH_WITH_CLI";
 
 /// Whether an executable `git` is on the shell's PATH.
@@ -596,24 +578,9 @@ fn installed_tools(sh: &Shell) -> anyhow::Result<Vec<Installed>> {
     Ok(parse_install_list(&listing))
 }
 
-fn cargo_update_available(sh: &Shell) -> bool {
-    cmd!(sh, "cargo install-update --help")
-        .quiet()
-        .ignore_stdout()
-        .ignore_stderr()
-        .run()
-        .is_ok()
-}
-
-/// Install one tool from github.com/scode/NAME and, if cargo-update is
-/// installed, mark its cargo-update reinstalls as locked (see [`lock_args`]).
-/// Every existing install of NAME is decided by [`install_plan`] first; the
-/// only case that proceeds is "not installed", so this command never replaces
-/// anything.
-///
-/// A failure of the lock step after a successful install is a warning, not
-/// an error: the tool is installed and usable, and the setting only matters
-/// to a `cargo install-update` the user runs themselves.
+/// Install one tool from github.com/scode/NAME. Every existing install of
+/// NAME is decided by [`install_plan`] first; the only case that proceeds is
+/// "not installed", so this command never replaces anything.
 fn scode_install(sh: &Shell, name: &str, dry_run: bool) -> anyhow::Result<()> {
     validate_name(name)?;
     match install_plan(&installed_tools(sh)?, name) {
@@ -633,42 +600,19 @@ fn scode_install(sh: &Shell, name: &str, dry_run: bool) -> anyhow::Result<()> {
         ),
     }
     let install = install_args(name);
-    let lock = lock_args(name);
-    let can_lock = cargo_update_available(sh);
     if dry_run {
         println!("dry run: would run `cargo {}`", install.join(" "));
-        if can_lock {
-            println!("dry run: then `cargo {}`", lock.join(" "));
-        } else {
-            println!(
-                "dry run: cargo-update is not installed, so no cargo-update lock setting would be written"
-            );
-        }
         return Ok(());
     }
     with_git_cli(sh, cmd!(sh, "cargo {install...}"))
         .run()
         .with_context(|| format!("installing {name}"))?;
-    if !can_lock {
-        println!(
-            "note: cargo-update is not installed, so no lock setting for `cargo install-update` was written for {name}; `kd cargo scode update` does not need it"
-        );
-    } else if let Err(err) = cmd!(sh, "cargo {lock...}").quiet().ignore_stdout().run() {
-        eprintln!(
-            "warning: {name} is installed, but marking its cargo-update reinstalls as locked failed ({err}); this only affects `cargo install-update`, not `kd cargo scode update`"
-        );
-    }
     Ok(())
 }
 
 /// Uninstall one tool, but only one that came from a github.com/scode
 /// repository: the command's name promises that scope, and a same-named
 /// crates.io or other-owner install is not this command's to remove.
-///
-/// The tool's cargo-update settings are deliberately left in place, even
-/// though cargo-update could delete them (`install-update-config --reset`
-/// drops an entry that ends up at its defaults): they are harmless, and
-/// they keep a later reinstall locked.
 fn scode_uninstall(sh: &Shell, name: &str, dry_run: bool) -> anyhow::Result<()> {
     validate_name(name)?;
     match uninstall_plan(&installed_tools(sh)?, name) {
@@ -807,16 +751,6 @@ local v0.1.0 (/home/me/src/local):
         );
         assert!(
             !update_args("kd", "https://github.com/scode/kd#1").contains(&"--force".to_owned())
-        );
-    }
-
-    /// Reinstalls for cargo-update are locked per package, never with its
-    /// global `--locked`, which cargo would then get twice and refuse.
-    #[test]
-    fn lock_setting_is_per_package() {
-        assert_eq!(
-            lock_args("kd"),
-            vec!["install-update-config", "--enforce-lock", "kd"]
         );
     }
 

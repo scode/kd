@@ -14,12 +14,10 @@ If cargo isn't usable (missing, or a toolchain-less rustup shim), it first insta
 [rustup](https://rustup.rs) one-liner, accepting rustup's defaults; if rust is older than 1.85 and rustup is present, it
 installs current stable just for the build. Then it runs
 `cargo install --locked --force --git https://github.com/scode/kd kd`, which records the same source
-`kd cargo scode install kd` would, so `kd cargo scode update` can keep kd current from its default branch later. It then
-tries to install cargo-update if `cargo install-update` isn't available yet, for `cargo install-update -a -g`; that
-build also needs `make` and a full Perl, and if it can't be done the installer warns with the command to run instead of
-failing. Rerunning the one-liner rebuilds kd from the current default branch. It needs a C toolchain (Xcode Command Line
-Tools on macOS; `cc`, e.g. from `build-essential`, on Linux) and says so if one is missing. Read
-[`install.sh`](install.sh) before piping it if you (sensibly) don't run shell scripts off the internet blind.
+`kd cargo scode install kd` would, so `kd cargo scode update` can keep kd current from its default branch later.
+Rerunning the one-liner rebuilds kd from the current default branch. It needs a C toolchain (Xcode Command Line Tools on
+macOS; `cc`, e.g. from `build-essential`, on Linux) and says so if one is missing. Read [`install.sh`](install.sh)
+before piping it if you (sensibly) don't run shell scripts off the internet blind.
 
 Earlier versions of this installer cloned kd into `~/git/kd` and installed from that checkout. Rerunning the one-liner
 replaces such an install; the old checkout is no longer used and can be deleted.
@@ -181,11 +179,9 @@ default CLIs fail on that box; `codex -c 'model_provider="openai"'` and
 `claude --settings '{"env":{"ANTHROPIC_BASE_URL":"","ANTHROPIC_AUTH_TOKEN":""}}'` bypass them. Router accounts and
 history live in Docker volumes and are not backed up.
 
-Bootstrap installs `kd` itself from this repository's default branch with `cargo install --locked --git`, plus
-cargo-update, configured to keep kd's updates locked to the committed `Cargo.lock` as well. On a bootstrapped box,
-`cargo install-update -a -g` updates kd to the latest `main` (the `-g` matters: without it, cargo-update skips tools
-installed from git), and `kd cargo scode update` updates just kd and any other tool installed from a github.com/scode
-repository.
+Bootstrap installs `kd` itself from this repository's default branch with `cargo install --locked --git`. On a
+bootstrapped box, `kd cargo scode update` updates kd, and any other tool installed from a github.com/scode repository,
+to the latest commit of its branch.
 
 Bootstrap copies the controller's global Git `user.name` and `user.email` to the target user's global config. Both must
 be configured before running it. Other Git settings and repository-specific identities are not copied.

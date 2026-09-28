@@ -58,8 +58,8 @@ pub fn script(
     // availability check into a login or a billable sandbox operation.
     check("tensorlake CLI", "tl --version >/dev/null 2>&1");
     // Installed from the repository, not a same-named crates.io or Homebrew
-    // package: only a git install is what `cargo install-update -a -g`
-    // updates from the default branch. `cargo install --list` prints
+    // package: only a git install is what `kd cargo scode update` updates
+    // from the default branch. `cargo install --list` prints
     // `name vX.Y.Z (https://github.com/owner/name#commit):` for those.
     for repo in CARGO_GIT_PACKAGES {
         let name = repo.rsplit('/').next().unwrap_or(repo);
@@ -70,22 +70,7 @@ pub fn script(
                 shell_quote(&format!("^{name} v[^ ]* (https://github.com/{repo}#"))
             ),
         );
-        // cargo-update keeps per-package settings in `.install_config.toml`
-        // in its install directory (`$CARGO_INSTALL_ROOT`, else
-        // `$CARGO_HOME`, else `~/.cargo`); `--enforce-lock` sets
-        // `enforce_lock = true` in the package's table. Without it, updates
-        // would build unlocked even though the first install was locked.
-        check(
-            &format!("{name} updates locked"),
-            &format!(
-                "python3 -c 'import os, tomllib; c = tomllib.load(open(os.path.join(os.environ.get(\"CARGO_INSTALL_ROOT\") or os.environ.get(\"CARGO_HOME\") or os.path.expanduser(\"~/.cargo\"), \".install_config.toml\"), \"rb\")); assert c[\"{name}\"][\"enforce_lock\"] is True'"
-            ),
-        );
     }
-    check(
-        "cargo install-update",
-        "cargo install-update --help >/dev/null 2>&1",
-    );
     // Check names must not spell out what the pgrep pattern matches: the
     // whole script is in the login shell's argv, so a name like "hermes
     // gateway stopped" would match `[h]ermes.*gateway` and fail every time.
@@ -583,54 +568,6 @@ exit {status}
         ));
         assert!(!run("kd v0.1.0:\n    kd"));
         assert!(!run("kd v0.1.0 (https://github.com/someone/kd#1234):"));
-        assert!(s.contains("'cargo install-update'"));
-    }
-
-    /// Updates must stay locked: the check passes only when cargo-update's
-    /// config sets `enforce_lock = true` for the package, and honours
-    /// `CARGO_HOME`. Run with a fixture home instead of the real one. The
-    /// check needs Python 3.11+ (`tomllib`), which every supported target
-    /// has; a controller whose `python3` is older skips this test with a
-    /// note rather than failing it.
-    #[test]
-    fn locked_update_check_reads_cargo_update_config() {
-        let has_tomllib = Command::new("python3")
-            .args(["-c", "import tomllib"])
-            .status()
-            .is_ok_and(|s| s.success());
-        if !has_tomllib {
-            eprintln!("skipping: python3 without tomllib (needs 3.11+)");
-            return;
-        }
-        let command = script("devbox", 1, false, false, false)
-            .lines()
-            .find_map(|l| l.strip_prefix("check 'kd updates locked' "))
-            .unwrap()
-            .to_owned();
-        let inner = Command::new("bash")
-            .args(["-c", &format!("printf '%s' {command}")])
-            .output()
-            .unwrap();
-        let inner = String::from_utf8(inner.stdout).unwrap();
-        let run = |config: Option<&str>| {
-            let home = tempfile::tempdir().unwrap();
-            let cargo = home.path().join("cargo");
-            fs::create_dir_all(&cargo).unwrap();
-            if let Some(config) = config {
-                fs::write(cargo.join(".install_config.toml"), config).unwrap();
-            }
-            Command::new("bash")
-                .args(["-c", &inner])
-                .env("CARGO_HOME", &cargo)
-                .env_remove("CARGO_INSTALL_ROOT")
-                .status()
-                .unwrap()
-                .success()
-        };
-        assert!(run(Some("[kd]\nenforce_lock = true\n")));
-        assert!(!run(Some("[kd]\nenforce_lock = false\n")));
-        assert!(!run(Some("[other]\nenforce_lock = true\n")));
-        assert!(!run(None));
     }
 
     /// Expected values are rendered in, which is why the script is a

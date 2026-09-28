@@ -18,15 +18,6 @@ without it, and it must work unattended on a fresh macOS or Linux machine that h
   `kd cargo scode install kd`, so `kd cargo scode update` maintains it. Unlike that command it passes `--force`: it is
   the kd installer, so replacing an existing kd (typically one from the older checkout-based installer) is intended, and
   every rerun rebuilds kd from the default branch.
-- Then, unless `cargo install-update` already works (a cargo-update from cargo or Homebrew is left alone), it tries to
-  install cargo-update with `cargo install --locked --features vendored-openssl cargo-update`. cargo-update needs
-  OpenSSL on every Unix, macOS included; the vendored build compiles it from source, so no OpenSSL headers or
-  `pkg-config` are needed, but `make` and a full Perl are, and their absence is reported before building. With rustup,
-  cargo-update is built with `+stable` (installed if missing), because current cargo-update can need a newer rust than
-  kd. With cargo-update available it writes kd's lock setting (`cargo install-update-config --enforce-lock kd`). Every
-  failure in these steps is a warning with the command to retry, not an error: kd is already installed, and
-  `kd cargo scode update` does not need cargo-update. A successful installer run therefore does not guarantee
-  cargo-update is present; the warning says so.
 - Ends with a banner when `kd` does not resolve to the installed binary (not on PATH, or shadowed by another `kd`
   earlier on PATH), and, when it installed rust itself, a note that the current shell needs rustup's env file sourced or
   a restart. The latter is printed even when a later step fails.
@@ -276,10 +267,9 @@ unchanged; a `net.git-fetch-with-cli` setting in cargo's config is overridden wh
   records e.g. `topic/x` as `topic%2Fx`. cargo rebuilds a tool whose branch moved, with the dependency versions from its
   repository's committed `Cargo.lock`, and skips one that is current, reporting it as already installed. The command
   prints a line saying that this is expected.
-- cargo-update is not used, and need not be installed. cargo-update's own update check ignores
-  `CARGO_NET_GIT_FETCH_WITH_CLI=true` (a fix is proposed upstream in
-  [cargo-update#345](https://github.com/nabijaczleweli/cargo-update/pull/345)), so it could not update tools from
-  private repositories.
+- cargo-update is not used. Its own update check ignores `CARGO_NET_GIT_FETCH_WITH_CLI=true` (a fix is proposed upstream
+  in [cargo-update#345](https://github.com/nabijaczleweli/cargo-update/pull/345)), so it could not update tools from
+  private repositories, and plain `cargo install` does the job without it.
 - cargo's output is shown as it runs. A tool that fails to update is reported and the others are still updated; the
   command then exits with an error naming the tools that failed.
 - `--dry-run` lists the tools and the commands without running them.
@@ -292,10 +282,6 @@ unchanged; a `net.git-fetch-with-cli` setting in cargo's config is overridden wh
   https://github.com/scode/NAME NAME`: no `.git`, no branch, tag or commit, so it tracks
   the default branch and `update` can update it later, built with the repository's committed `Cargo.lock`. The
   repository must hold a binary package named NAME.
-- If cargo-update is installed, the tool is then marked with its per-package lock setting
-  (`cargo install-update-config --enforce-lock NAME`), so a `cargo install-update` the user runs also builds it locked.
-  Without cargo-update it says so; `update` does not need it. If that step fails after a successful install, it is a
-  warning, not an error.
 - NAME must work as both a GitHub repository name and a cargo package name: an ASCII letter first, then letters, digits,
   `-` or `_`, at most 64 characters. Anything else is refused before cargo runs.
 - It never replaces an existing install of NAME. An unpinned install from github.com/scode/NAME is reported as already
@@ -303,15 +289,13 @@ unchanged; a `net.git-fetch-with-cli` setting in cargo's config is overridden wh
   `update` skips pins. An install from anywhere else (crates.io, another owner, a different scode repository, a path) is
   refused with a pointer to `cargo uninstall`: cargo itself would silently replace a same-named package from another
   source.
-- `--dry-run` shows the commands without running them, including whether the lock step would run.
+- `--dry-run` shows the command without running it.
 
 ### kd cargo scode uninstall NAME [--dry-run]
 
 - Runs `cargo uninstall NAME`, but only for a tool installed from a github.com/scode repository (in any URL form
   `update` recognises). A tool that is not installed, or installed from crates.io, another owner or a path, is refused
   with the reason.
-- The tool's cargo-update settings are deliberately left in place, even though `cargo install-update-config --reset`
-  could remove them: they are harmless, and they keep a later reinstall locked.
 - `--dry-run` shows the command without running it.
 
 ## kd cli-proxy-api manage-priorities
@@ -468,11 +452,9 @@ Terms used below:
   no Hermes components are installed or probed. `--hostname` is required from scratch; a restore defaults to the profile
   hostname, with an explicit override allowed. Archive selection always uses the source profile hostname.
 - `kd` itself is installed for the user with `cargo install --locked --git https://github.com/scode/kd`, tracking the
-  repository's default branch rather than a release and building the dependency versions in its committed `Cargo.lock`,
-  and cargo-update is installed so `cargo install-update` is available, configured with `--enforce-lock` for kd so its
-  updates stay locked too. `cargo install-update -a -g` then updates kd to the latest commit on that branch; plain `-a`
-  skips packages installed from git. Rust tools installed this way are a compiled-in list, like the other package
-  choices.
+  repository's default branch rather than a release and building the dependency versions in its committed `Cargo.lock`.
+  `kd cargo scode update` then updates kd to the latest commit on that branch. Rust tools installed this way are a
+  compiled-in list, like the other package choices.
 - Tensorlake's standalone CLI (`tl`) is installed with its official shell installer and available on the login shell's
   PATH. Bootstrap does not log in to Tensorlake or copy its credentials; the probe checks `tl --version` without
   requiring cloud access.
@@ -554,14 +536,13 @@ Terms used below:
   state the previous attempt accumulated. Outside a rehearsal, its gateway and loopback-only dashboard are enabled and
   started.
 - Ends with a probe report printed as is: hostname, timezone, `gh auth status`, repo count against the manifest,
-  `ssh localhost`, Docker as the user, Tensorlake CLI availability, kd installed from its GitHub repository with locked
-  updates, `cargo install-update` availability, Claude's onboarding flag, one real request through Codex, Claude and
-  Muse (Codex and Claude past the routers; OpenCode is installed but not probed), router health, loopback-only router
-  listeners, CLIProxyAPI's client-key check, and the Codex and Claude router wiring. It does not check router accounts.
-  Restores additionally check Hermes gateway state and, outside rehearsals, dashboard reachability. Tailscale is checked
-  only with `--enroll-tailscale`. Probe failures are reported, never fatal: bootstrap exits 0 once the probe has run.
-  After the probe, each agent phase's final message is printed whole, which is where the agent lists anything it had to
-  work around, even when the run succeeded.
+  `ssh localhost`, Docker as the user, Tensorlake CLI availability, kd installed from its GitHub repository, Claude's
+  onboarding flag, one real request through Codex, Claude and Muse (Codex and Claude past the routers; OpenCode is
+  installed but not probed), router health, loopback-only router listeners, CLIProxyAPI's client-key check, and the
+  Codex and Claude router wiring. It does not check router accounts. Restores additionally check Hermes gateway state
+  and, outside rehearsals, dashboard reachability. Tailscale is checked only with `--enroll-tailscale`. Probe failures
+  are reported, never fatal: bootstrap exits 0 once the probe has run. After the probe, each agent phase's final message
+  is printed whole, which is where the agent lists anything it had to work around, even when the run succeeded.
 - After a rehearsal the worker is left running for inspection with a reminder that it holds real credentials; `kd` does
   not destroy it.
 - Manually starting restored services after a rehearsal leaves the rehearsal's safety conditions. If the source is still
