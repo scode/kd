@@ -159,6 +159,15 @@ mod tests {
         );
     }
 
+    /// The command name and `--include-mine` flag are part of the user
+    /// contract (SPEC.md); clap derives both from Rust names, so pin them.
+    #[test]
+    fn gh_pr_list_parses() {
+        assert!(parses(&["kd", "gh", "pr", "list"]));
+        assert!(parses(&["kd", "gh", "pr", "list", "--include-mine"]));
+        assert!(!parses(&["kd", "gh", "pr", "list", "--mine"]));
+    }
+
     /// The command name is part of the user contract (SPEC.md); clap
     /// derives it from the variant name, so pin it here.
     #[test]

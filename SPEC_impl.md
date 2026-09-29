@@ -3,6 +3,54 @@
 This file records implementation choices that are deliberate and easy to "fix" into something worse. `SPEC.md` is the
 user-facing contract; this is the how and the why behind it. Both are binding on agents working in this repo.
 
+## kd gh pr list
+
+GitHub fails silently in several ways here, and each defense below exists because the failure was seen against the live
+API. They are easy to "simplify" back into the bug.
+
+Activity is fetched unfiltered, in batches of 10 PRs, separately from the search, and each timeline is checked against
+its `totalCount`. When one GraphQL query loads too many timelines, GitHub silently drops event-type entries (merges,
+closes, force-pushes, and so on) while leaving comments and commits in place, and returns no error. This was observed
+with 20 or more PRs per `nodes(ids:)` request and with 40 or more per search page carrying timelines; the threshold
+depends on how busy the timelines are, so a fixed smaller batch alone does not guarantee completeness. Filtering with
+`itemTypes` looks cheaper but defeats detection: `filteredCount` (and `pageCount`) drop along with the missing entries,
+while `totalCount` holds. So any tail shorter than `min(totalCount, 100)` is refetched alone, and one still short after
+that is reported as `?` rather than guessed. `totalCount` is not a perfect reference: it leaves out some entry types (a
+rust-lang PR returned 84 timeline entries against a `totalCount` of 46, most of the difference subscription events), so
+more entries than `totalCount` is normal and accepted, and a degraded response that happens to stay at or above the
+undercount would get through. Whether a tail is partial comes from `pageInfo.hasPreviousPage` instead, which is exact.
+
+Reviews come from the `reviews` connection, dated by `submittedAt`, not from the timeline's `PullRequestReview` entries.
+The timeline leaves many reviews out (on a rust-lang PR, 5 of 8, all of them review-thread replies), and it dates a
+review by when it was started rather than submitted, so a review drafted over days read as days old on submission.
+
+The first column is an age rather than a "new since you last acted" flag. An earlier version had the flag; it was
+replaced because the flag raises the question of how to mark something read, and the only answers are stored state or
+acting on the PR. An age needs neither, and the reader can compare it against their own memory. Do not reintroduce a
+read/unread notion without the user asking for it.
+
+The PR search uses the REST search API, not GraphQL search, even though everything else is GraphQL. GitHub's search
+times out under load and returns partial results; REST marks those with `incomplete_results`, GraphQL search has no such
+field and presents the partial result as complete. That was seen in practice as a PR missing from one run and back on
+the next. REST results are sorted by creation time so that a PR updated mid-pagination cannot move to an already-read
+page. Open and recently closed PRs are one query, `(is:open OR closed:>=DATE)`, which needs `advanced_search=true`; two
+separate searches could each miss a PR that changed state between them.
+
+The own-repo exclusion is the search qualifier `-user:LOGIN` rather than a client-side filter, so an account with many
+PRs on its own repos does not page through them all to discard them.
+
+The `closed:>=` qualifier takes only a date, and GitHub does not document which timezone it reads the date in. The
+search therefore asks for one extra day and the exact 7-day cutoff is applied client-side to `closed_at`. Narrowing the
+search date to the cutoff day would risk missing PRs closed in the first hours of the window.
+
+GitHub's API also fails loudly now and then: during development one GraphQL request took about 10 seconds and came back
+as an HTML error page instead of JSON. `gh` exits non-zero on that, so the command fails with an error and a rerun
+succeeds. That is transient GitHub behavior, not a bug to chase in this code, and nothing retries it.
+
+A GraphQL response with `errors` makes `gh api graphql` exit non-zero even when the errors are only per-node
+`NOT_FOUND`s (a PR that became inaccessible after the search). The transport therefore hands on any JSON body regardless
+of exit status, and `query_data` tolerates `NOT_FOUND` while failing on any other error.
+
 ## kd cli-proxy-api manage-priorities
 
 Why strict priority by weekly reset, rather than weights: using the soonest-expiring quota first never wastes more than

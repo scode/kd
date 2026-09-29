@@ -55,6 +55,12 @@ kd gh repo apply-preferred-settings --all --yes
 kd gh repo main-protect
 kd gh repo main-protect scode/foo
 
+# List my PRs outside my own account's repos that are open or closed in
+# the last week, most recent activity by others first.
+kd gh pr list
+# Same, including PRs to repos I own.
+kd gh pr list --include-mine
+
 # Create a disposable Ubicloud worker VM and enroll it into the tailnet.
 # Defaults to a timestamped name; a custom name gets the ubiworker- prefix
 # added automatically if it's missing.
@@ -232,6 +238,16 @@ visibility changes.
 ensures a ruleset named `main-protect` exists on the default branch, enforces linear history, blocks force-pushes, and
 then lets you interactively choose required status checks from checks it finds on the default branch and a recent merged
 PR returned by `gh pr list`. Existing required checks that are not rediscovered are preserved unless you select `none`.
+
+`kd gh pr list` also uses `gh`. It lists the PRs you authored that are open, or were closed or merged in the last 7
+days, leaving out PRs to repositories your own account owns unless you pass `--include-mine` (organization repos are
+always included). The first column is how long ago someone other than you last did something significant on the PR
+(`25m`, `1d7h21m`), and the list is sorted by it, most recent first. `-` means nobody else has, and `?` means GitHub
+would not return enough of the PR's history to tell. Comments, reviews (including review-thread replies), pushes,
+merges, closes, label changes and similar count as significant; being mentioned does not, and neither does anything you
+do yourself. Bots count like anyone else, so a bot that comments on every push keeps the age short. In a terminal, the
+`owner/repo#N` column is a clickable link (if your terminal supports OSC 8 hyperlinks) and titles are cut to fit the
+width; piped output instead is unpadded, with full titles and the URL at the end of each line.
 
 `kd ubiworker` shells out to the `ubi` CLI (must be on `PATH`) and calls the Tailscale API directly. It needs:
 
