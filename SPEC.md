@@ -81,6 +81,44 @@ non-ImageMagick helpers still behave correctly. It does not prove that thumbnail
   stops with an error, and the fix is simply to rerun the command later: already-correct repos cost only cheap reads on
   the rerun, so no progress is lost. This is an explicitly accepted limitation, not an oversight.
 
+## kd gh pr list
+
+- Lists PRs authored by the `gh`-authenticated account that are open, or were closed (merged or not) within the last 7
+  days, measured to the second from now. Open PRs are listed regardless of age.
+- Excludes PRs to repositories owned by that account unless `--include-mine` is given. Repositories of organizations the
+  account belongs to are not "owned" by it and are always included.
+- One line per PR on stdout: age of the newest significant activity by others, state (`open`, `draft`, `merged`,
+  `closed`), `owner/repo#N`, title. Control characters in titles are replaced with spaces. Nothing is printed to stdout
+  when no PR matches.
+  - When stdout is a terminal, the `owner/repo#N` slug is an OSC 8 hyperlink to the PR shown in bright blue, ages are
+    right-aligned, the state and slug columns are padded so titles line up, and titles are cut with `…` to fit the
+    terminal width (left whole if the width cannot be read). If the columns before the title are themselves wider than
+    the terminal, the title is dropped and the line wraps.
+  - Otherwise each line is plain text: the same columns unpadded and separated by two spaces, the full title, the PR URL
+    appended, and no escape sequences.
+- Significant activity is any submitted review (dated by submission, so review-thread replies count) and any timeline
+  entry of one of these kinds: comments, commits, force-pushes, close, merge, reopen, draft/ready changes, label
+  changes, review requests and dismissals, title renames, and base branch changes. Everything else (mentions,
+  subscriptions, cross-references, branch deletions, and so on) is ignored. "Others" is every account except the
+  authenticated one: deleted accounts and bots included. A commit whose author email is not linked to any GitHub account
+  counts as the authenticated account's own.
+- The age is whole days, hours, and minutes, largest first, with zero units left out: `0m`, `25m`, `2d`, `1d7h21m`.
+  Anything under a minute old, or timestamped in the future, reads `0m`. The column shows `-` when nobody else has any
+  significant activity on the PR, and `?` when that cannot be determined (see below).
+- PRs are sorted by the time of others' newest significant activity, most recent first; then PRs showing `?`, then PRs
+  showing `-`. Ties within each group go to the most recently updated PR.
+- Only the newest 100 timeline entries (of any kind) and the newest 100 reviews are examined per PR. The age is exact
+  whenever what was examined settles it; the column shows `?` when it cannot, which takes more than 100 entries in a
+  connection with nobody else among them. It also shows `?` when GitHub would not return complete activity for the PR
+  even when asked for that PR alone, or when the PR became inaccessible between the search and the activity fetch.
+- No state is stored. There is no notion of having read a PR; the age is recomputed from GitHub on every run.
+- The listing is complete or the command fails. Open and recently closed PRs come from a single search, so a PR changing
+  state mid-run cannot fall between two. A search GitHub flags as incomplete (its searches time out under load and
+  return partial results), or whose results do not add up to GitHub's own match count, is rerun from scratch up to 3
+  times, and fails with an error if it never comes back complete. A search matching more than GitHub's 1,000-result
+  search cap also fails, rather than list the first 1,000. The one gap is a PR GitHub's search index has not caught up
+  with yet (for example moments after it changed state), since the match count leaves it out too.
+
 ## kd ubiworker
 
 - Ownership of a VM is structural, not tracked in a side database: a VM is a "ubiworker" iff its name starts with
