@@ -10,6 +10,7 @@
 pub mod api;
 pub mod monitor;
 pub mod plan;
+pub mod service;
 
 use anyhow::Context;
 use clap::{Args, Subcommand};
@@ -26,6 +27,10 @@ pub enum Commands {
 pub enum MonitorCommands {
     /// Run the monitor loop in the foreground (what the systemd unit runs)
     Run(RunArgs),
+    /// Install and start a systemd user unit that keeps the monitor running
+    Enable,
+    /// Stop the monitor and remove its systemd user unit
+    Disable,
 }
 
 /// Flags for `monitor run`. The systemd unit passes none, so the defaults
@@ -70,6 +75,17 @@ impl Commands {
         match self {
             Commands::Monitor(MonitorCommands::Run(args)) => {
                 monitor::run(run_settings(args, home()?))
+            }
+            Commands::Monitor(MonitorCommands::Enable) => {
+                let exe = std::env::current_exe()
+                    .and_then(|p| p.canonicalize())
+                    .context("locating the running kd binary")?;
+                print!("{}", service::enable(&service::System, &home()?, &exe)?);
+                Ok(())
+            }
+            Commands::Monitor(MonitorCommands::Disable) => {
+                print!("{}", service::disable(&service::System, &home()?)?);
+                Ok(())
             }
         }
     }

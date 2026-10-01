@@ -43,9 +43,12 @@ fn main() -> anyhow::Result<()> {
     let level = resolve_log_level(cli.verbose, cli.quiet)?;
 
     // Log to stderr so stdout remains clean for machine-readable output.
+    // Color only on a terminal: under systemd (`monitor run`) stderr goes
+    // to the journal, where escape codes show up as literal noise.
     tracing_subscriber::fmt()
         .with_max_level(level)
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .init();
 
     cli.command.run()

@@ -401,6 +401,22 @@ part of kd that writes priorities.
   `--key-file` defaults to `~/.config/cliproxy/secrets.env` and accepts either that file's `CLIPROXY_MANAGEMENT_KEY=`
   line or a file holding only the key. `HOME` must be set.
 
+### kd cli-proxy-api monitor enable | disable
+
+- `enable` installs `~/.config/systemd/user/kd-cli-proxy-api-monitor.service`, which runs `monitor run` with no flags
+  from the absolute path of the `kd` binary that ran `enable`, so the daemon uses the default key file. It reloads the
+  user manager, enables the unit, and restarts it, so rerunning `enable` after upgrading kd makes the new binary take
+  effect. The unit restarts the monitor 60 seconds after any exit, indefinitely.
+- `enable` turns on linger for the user when it is off, so the monitor starts at boot and survives logout. `disable`
+  leaves linger alone.
+- `enable` refuses, changing nothing, when no systemd user manager is reachable: no `systemctl` (macOS, most containers;
+  run `monitor run` under another supervisor there), or no user session bus (a `su` or `sudo -u` shell; log in as the
+  user directly instead). The message quotes systemctl's own error.
+- `enable` also changes nothing when turning on linger fails; linger is handled before the unit is installed.
+- `disable` stops and disables the unit and removes its file. With no unit file installed it reports that and does
+  nothing else.
+- The monitor's output goes to the journal: `journalctl --user -u kd-cli-proxy-api-monitor -f`.
+
 ## kd devbox
 
 NOTE: This is a solo-developer convenience for bootstrapping disposable environments and moving a stateful instance. The

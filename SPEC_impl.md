@@ -100,6 +100,18 @@ exhausted. A window that has not started (`resets_at: null`, the state a stuck a
 nothing) counts as available now. Flags never change the plan: acting on them (a restart clears the stuck state)
 interrupts live streams, which is the operator's call.
 
+`monitor enable` points the unit at the canonicalized path of the running binary rather than at `kd` on some PATH,
+because a systemd user manager's PATH rarely includes `~/.cargo/bin`. `ExecStart` passes no flags so the daemon always
+uses the default key file and URL, the setup `burn` and `overview` assume, and so no user-supplied argument has to
+survive systemd's quoting rules. `RestartSec=60` exists because systemd's default 100 ms restart delay plus its
+start-rate limit (five starts in ten seconds) would mark a monitor that fails at startup permanently failed within a
+second. `Type=exec` makes `systemctl restart` fail when the binary cannot be executed, so `enable` reports a moved or
+deleted binary instead of claiming success. The binary path is quoted with `\`, `"` and `%` escaped; `$` is not, because
+systemd expands variables only in arguments, never in the program path. Linger is checked with `loginctl show-user`
+before `loginctl enable-linger`, so a user who already lingers never meets a polkit prompt, and both happen before the
+unit is written, so a linger failure leaves nothing installed. Every external command goes through an injected runner,
+so tests pin the exact `systemctl` and `loginctl` sequence without touching the host's systemd.
+
 The HTTP timeout is 75 seconds because CLIProxyAPI's `api-call` waits up to 60 on the upstream; timing out first would
 replace CLIProxyAPI's own error with a bare transport timeout. The HTTP agent ignores proxy environment variables (ureq
 honours them by default, with no loopback exemption, so a proxy would receive the key in clear text) and keeps non-2xx
