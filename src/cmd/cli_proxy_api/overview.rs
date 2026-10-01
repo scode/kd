@@ -60,6 +60,14 @@ const ROWS: usize = 4;
 /// Width of the left margin holding the scale labels and the axis.
 const MARGIN: usize = 9;
 
+/// Length of the current-usage gauges drawn right of each chart, in
+/// columns; each column resolves eight steps, so 20 columns show 160.
+const GAUGE_BAR: usize = 20;
+
+/// Columns the gauges take, reserved when sizing the chart: a gap, the
+/// window label, the bar, and the spelled-out percentage.
+const GAUGE_WIDTH: usize = 2 + 2 + 1 + GAUGE_BAR + 1 + 4;
+
 /// Which time span to chart.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Span {
@@ -320,7 +328,7 @@ pub fn render(
         ));
     }
 
-    let columns = width.saturating_sub(MARGIN + 1).max(1);
+    let columns = width.saturating_sub(MARGIN + 1 + GAUGE_WIDTH).max(1);
     let (count, cell) = match span {
         // A week is 42 buckets; widen them when the terminal has room,
         // trim the oldest when it does not.
@@ -356,7 +364,13 @@ pub fn render(
             .map(|w| Some((w[1]? - w[0]?).max(0.0)))
             .collect();
         let color = if is_burned { MAGENTA } else { CYAN };
-        chart(&mut out, &used, &edges, span, cell, tz, style, color);
+        let gauges = [
+            gauge("7d", account["seven_day"]["utilization"].as_f64(), style),
+            gauge("5h", account["five_hour"]["utilization"].as_f64(), style),
+        ];
+        chart(
+            &mut out, &used, &edges, span, cell, &gauges, tz, style, color,
+        );
     }
     let disabled: Vec<&str> = accounts
         .iter()
@@ -490,8 +504,41 @@ fn account_header(
     }
 }
 
-/// A bar chart of per-bucket consumption with a scale on the left and day
-/// (and, for the recent view, hour) marks below. Unknown buckets, before the
+/// How much of a window is used right now, as a horizontal bar with the
+/// percentage spelled out: `7d ██████████████▍░░░░░ 72%`. The bar shows
+/// the level, which the time chart beside it (a rate) cannot. It turns
+/// yellow from 80% and red from 95%, where a window is close to cutting the
+/// account off. An unknown value (no usage lookup) shows as `?`.
+fn gauge(label: &str, used: Option<f64>, style: Style) -> String {
+    const PARTIAL: [char; 7] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉'];
+    let Some(used) = used else {
+        return format!("{label} {:>w$}", "?", w = GAUGE_BAR + 5);
+    };
+    let eighths = ((used.clamp(0.0, 100.0) / 100.0) * (GAUGE_BAR * 8) as f64).round() as usize;
+    let (full, rest) = (eighths / 8, eighths % 8);
+    let mut bar = "█".repeat(full);
+    if rest > 0 {
+        bar.push(PARTIAL[rest - 1]);
+    }
+    let empty = GAUGE_BAR - bar.chars().count();
+    let color = if used >= 95.0 {
+        RED
+    } else if used >= 80.0 {
+        YELLOW
+    } else {
+        CYAN
+    };
+    format!(
+        "{label} {}{} {:>4}",
+        style.paint(color, &bar),
+        "░".repeat(empty),
+        format!("{used:.0}%")
+    )
+}
+
+/// A bar chart of per-bucket consumption with a scale on the left, day
+/// (and, for the recent view, hour) marks below, and `side` (the current
+/// usage gauges) to the right of its top rows. Unknown buckets, before the
 /// history starts or while the monitor was down, show as a dot.
 #[allow(clippy::too_many_arguments)]
 fn chart(
@@ -500,6 +547,7 @@ fn chart(
     edges: &[Timestamp],
     span: Span,
     cell: usize,
+    side: &[String],
     tz: &TimeZone,
     style: Style,
     color: &str,
@@ -529,10 +577,18 @@ fn chart(
             };
             bars.extend(std::iter::repeat_n(glyph, cell));
         }
-        out.push_str(&format!(
-            "{label:>7} ┤{}\n",
-            style.paint(color, bars.trim_end())
-        ));
+        // Rows carrying a gauge keep their trailing blanks so the gauges
+        // line up; the rest are trimmed.
+        match side.get(row) {
+            Some(gauge) => out.push_str(&format!(
+                "{label:>7} ┤{}  {gauge}\n",
+                style.paint(color, &bars)
+            )),
+            None => out.push_str(&format!(
+                "{label:>7} ┤{}\n",
+                style.paint(color, bars.trim_end())
+            )),
+        }
     }
 
     // Axis with a tick at each labelled bucket, and the labels under it.
@@ -777,7 +833,7 @@ mod tests {
             Span::Week,
             now,
             &TimeZone::UTC,
-            60,
+            91,
             Style::Plain,
         );
         assert!(
@@ -804,8 +860,8 @@ mod tests {
         assert_eq!(
             chart,
             vec![
-                format!("   8.0% ┤{gap}██"),
-                format!("        ┤{gap}██"),
+                format!("   8.0% ┤{gap}██   7d ███▎░░░░░░░░░░░░░░░░  16%"),
+                format!("        ┤{gap}██   5h █░░░░░░░░░░░░░░░░░░░   5%"),
                 format!("        ┤{gap}██"),
                 format!("     0% ┤{dots}██"),
                 "    /4h └───┬───────────┬───────────┬──────────────".to_owned(),
@@ -836,7 +892,7 @@ mod tests {
             Span::Week,
             ts("2026-10-01T08:10:00Z"),
             &TimeZone::UTC,
-            60,
+            91,
             Style::Plain,
         );
         assert!(
@@ -852,6 +908,33 @@ mod tests {
             "an unverified plan is not shown as applied: {text}"
         );
         assert!(text.contains("   8.0% ┤"), "{text}");
+    }
+
+    /// The gauge resolves eighths of a column, spells the percentage out,
+    /// clamps what it draws to the bar while still printing the real value,
+    /// turns yellow and then red as a window nears its limit, and admits an
+    /// unknown value instead of drawing zero.
+    #[test]
+    fn gauges_show_the_current_level() {
+        assert_eq!(
+            gauge("7d", Some(16.0), Style::Plain),
+            "7d ███▎░░░░░░░░░░░░░░░░  16%"
+        );
+        assert_eq!(
+            gauge("5h", Some(0.0), Style::Plain),
+            format!("5h {}   0%", "░".repeat(20))
+        );
+        assert_eq!(
+            gauge("5h", Some(104.0), Style::Plain),
+            format!("5h {} 104%", "█".repeat(20))
+        );
+        assert_eq!(
+            gauge("7d", None, Style::Plain),
+            format!("7d {}?", " ".repeat(24))
+        );
+        assert!(gauge("7d", Some(50.0), Style::Color).contains(CYAN));
+        assert!(gauge("7d", Some(85.0), Style::Color).contains(YELLOW));
+        assert!(gauge("7d", Some(96.0), Style::Color).contains(RED));
     }
 
     /// Stale data and a failed or paused last pass are impossible to miss.

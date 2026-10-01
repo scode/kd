@@ -459,7 +459,8 @@ Whether that is worth it depends on the week ahead, which only the user knows.
   default the buckets are 4 hours on the local clock (starting at midnight, 04:00, and so on, also across daylight-
   saving changes), covering the last 7 days (fewer when the terminal is narrow, wider bars when it has room); `--recent`
   instead fills the width with 15-minute buckets. Local midnights, and every third hour in `--recent`, are marked under
-  the chart where the labels fit.
+  the chart where the labels fit. To the right of each chart, gauges show the account's current weekly and 5-hour usage
+  as bars with the percentage spelled out, yellow from 80% and red from 95%; the chart narrows to make room for them.
 - Consumption is derived from utilization snapshots. A weekly rollover or a pressed limit reset (utilization falling
   while the reset time stays) starts a new window rather than counting as negative use. A bucket's consumption is the
   difference of cumulative consumption at its two edges, each interpolated linearly between the last snapshot at or
