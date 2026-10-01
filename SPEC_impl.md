@@ -133,6 +133,22 @@ would end a burn of an account whose week had not started on the very next pass,
 burn is not cleared from the file when it expires; the monitor reports it as expired and ignores it, so the file never
 has two writers.
 
+`overview` reads only the log and the override file, never CLIProxyAPI, so it works while the monitor is paused or the
+proxy is down and never adds load or ban strikes. It builds a cumulative-consumption series per account before
+bucketing, because utilization resets to zero at each weekly rollover and at a pressed limit reset; differencing raw
+utilization would show those as negative use. A new window is recognised by its reset time moving by more than five
+minutes (reset times jitter by fractions of a second and the two sources round them differently), a pressed reset by
+utilization falling more than two points within one window. Smaller drops are rounding differences between the whole
+percents of the usage lookup and the two-decimal quota signals, and are absorbed by never letting the series decrease.
+Quota signals are re-logged unchanged on every pass while an account is idle, so readings are de-duplicated by the
+moment CLIProxyAPI observed them. A signal observed before a rollover can be logged after it, naming the old window;
+weekly reset times only move forward, so a reading naming an older window than the newest seen is skipped rather than
+counted as a second rollover, and a signal without a parsable reset time is dropped. Interpolation refuses to bridge
+readings more than 40 minutes apart, so an outage of the monitor shows as unknown buckets instead of smooth invented
+use. Bucket edges are stepped on the local clock, not in absolute hours, so they stay on midnight and every fourth hour
+after a daylight-saving change. Rendering is a pure function of the records, the override, the time, the time zone, the
+width, and the style, so the tests pin exact output.
+
 The HTTP timeout is 75 seconds because CLIProxyAPI's `api-call` waits up to 60 on the upstream; timing out first would
 replace CLIProxyAPI's own error with a bare transport timeout. The HTTP agent ignores proxy environment variables (ureq
 honours them by default, with no loopback exemption, so a proxy would receive the key in clear text) and keeps non-2xx

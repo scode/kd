@@ -197,6 +197,8 @@ mod tests {
         assert!(!parses(&["kd", "cli-proxy-api", "manage-priorities"]));
         assert!(parses(&["kd", "cli-proxy-api", "burn", "a@example.com"]));
         assert!(parses(&["kd", "cli-proxy-api", "burn", "--clear"]));
+        assert!(parses(&["kd", "cli-proxy-api", "overview"]));
+        assert!(parses(&["kd", "cli-proxy-api", "overview", "--recent"]));
         assert!(!parses(&["kd", "cli-proxy-api", "burn"]));
         assert!(!parses(&[
             "kd",

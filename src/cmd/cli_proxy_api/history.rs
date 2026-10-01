@@ -55,13 +55,41 @@ pub fn latest_record(path: &Path) -> anyhow::Result<Option<Value>> {
     }
 }
 
+/// Readable records whose `time` is at or after `since`, oldest first.
+/// The log is chronological and never trimmed, so it is scanned from the
+/// end and parsing stops at the first record older than `since`; a long
+/// history then costs reading the file, not parsing all of it.
+pub fn read_since(path: &Path, since: jiff::Timestamp) -> anyhow::Result<Vec<Value>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+    };
+    let mut out = Vec::new();
+    for record in text.lines().rev().filter_map(parse_record) {
+        let time = record["time"]
+            .as_str()
+            .and_then(|t| t.parse::<jiff::Timestamp>().ok());
+        if time.is_some_and(|t| t < since) {
+            break;
+        }
+        out.push(record);
+    }
+    out.reverse();
+    Ok(out)
+}
+
+/// One line as a current-version record, or `None`.
+fn parse_record(line: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .filter(|record| record["v"].as_u64() == Some(LOG_SCHEMA_VERSION))
+}
+
 /// The parsing half of [`read_records`], split out so tests can use
 /// literal text.
 pub fn parse_records(text: &str) -> Vec<Value> {
-    text.lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|record| record["v"].as_u64() == Some(LOG_SCHEMA_VERSION))
-        .collect()
+    text.lines().filter_map(parse_record).collect()
 }
 
 #[cfg(test)]
@@ -92,6 +120,24 @@ not json
         let dir = tempfile::tempdir().unwrap();
         assert!(read_records(&dir.path().join("none")).unwrap().is_empty());
         assert_eq!(latest_record(&dir.path().join("none")).unwrap(), None);
+    }
+
+    /// Only records from `since` on are returned, in file order.
+    #[test]
+    fn read_since_stops_at_older_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        std::fs::write(
+            &path,
+            "{\"v\":1,\"time\":\"2026-10-01T00:00:00Z\"}\n\
+             {\"v\":1,\"time\":\"2026-10-02T00:00:00Z\"}\n\
+             garbage\n\
+             {\"v\":1,\"time\":\"2026-10-03T00:00:00Z\"}\n",
+        )
+        .unwrap();
+        let got = read_since(&path, "2026-10-02T00:00:00Z".parse().unwrap()).unwrap();
+        let times: Vec<&str> = got.iter().map(|r| r["time"].as_str().unwrap()).collect();
+        assert_eq!(times, vec!["2026-10-02T00:00:00Z", "2026-10-03T00:00:00Z"]);
     }
 
     /// The latest record comes from the tail alone, skipping a torn final

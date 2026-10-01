@@ -11,6 +11,7 @@ pub mod api;
 pub mod burn;
 pub mod history;
 pub mod monitor;
+pub mod overview;
 pub mod plan;
 pub mod service;
 
@@ -25,6 +26,16 @@ pub enum Commands {
     Monitor(MonitorCommands),
     /// Drain one Claude account first, ahead of reset order, until its weekly reset
     Burn(BurnArgs),
+    /// Show the pool's state and each account's weekly-quota use over time
+    Overview(OverviewArgs),
+}
+
+/// Flags for `overview`.
+#[derive(Args, Debug)]
+pub struct OverviewArgs {
+    /// Chart as many 15-minute buckets as fit instead of a week of 4-hour ones
+    #[arg(long)]
+    pub recent: bool,
 }
 
 /// Flags for `burn`: an email to burn, or `--clear`.
@@ -118,6 +129,47 @@ impl Commands {
                     None => burn::clear(&config)?,
                 };
                 print!("{report}");
+                Ok(())
+            }
+            Commands::Overview(args) => {
+                use std::io::IsTerminal;
+                let home = home()?;
+                // Eight days covers the week view plus a margin for the
+                // readings just before its first edge; the recent view needs
+                // less at any terminal width.
+                let now = jiff::Timestamp::now();
+                let since = now - jiff::SignedDuration::from_hours(8 * 24);
+                let records = history::read_since(&monitor::log_file(&home), since)?;
+                let burn = burn::read(&burn::config_file(&home));
+                let span = if args.recent {
+                    overview::Span::Recent
+                } else {
+                    overview::Span::Week
+                };
+                // Pipes get plain text at a fixed width; terminals get color
+                // and their real width, unless NO_COLOR asks otherwise.
+                let terminal = std::io::stdout().is_terminal();
+                let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
+                let style = if terminal && !no_color {
+                    overview::Style::Color
+                } else {
+                    overview::Style::Plain
+                };
+                let width = terminal_size::terminal_size()
+                    .filter(|_| terminal)
+                    .map_or(100, |(w, _)| usize::from(w.0));
+                print!(
+                    "{}",
+                    overview::render(
+                        &records,
+                        &burn,
+                        span,
+                        now,
+                        &jiff::tz::TimeZone::system(),
+                        width,
+                        style
+                    )
+                );
                 Ok(())
             }
         }
