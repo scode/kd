@@ -174,6 +174,8 @@ mod tests {
     #[test]
     fn cli_proxy_api_monitor_parses() {
         assert!(parses(&["kd", "cli-proxy-api", "monitor", "run"]));
+        assert!(parses(&["kd", "cli-proxy-api", "monitor", "enable"]));
+        assert!(parses(&["kd", "cli-proxy-api", "monitor", "disable"]));
         assert!(parses(&[
             "kd",
             "cli-proxy-api",

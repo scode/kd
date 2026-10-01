@@ -117,7 +117,10 @@ kd cargo scode install kd
 kd cargo scode uninstall kd
 
 # Keep CLIProxyAPI's Claude accounts ordered so the quota that resets soonest
-# is used first, logging usage every 15 minutes (runs until killed).
+# is used first, logging usage every 15 minutes: install it as a systemd user
+# service (survives logout and reboot), or run it in the foreground.
+kd cli-proxy-api monitor enable
+kd cli-proxy-api monitor disable
 kd cli-proxy-api monitor run
 ```
 
@@ -203,8 +206,11 @@ re-checks every 15 minutes and shortly after each known window reset. Every wake
 `~/.local/state/kd/cli-proxy-api-monitor.jsonl`, which is also where to look for accounts CLIProxyAPI keeps in cooldown
 after Anthropic says their quota is back (`cooldown_outlives_reset`). If the management key is rejected, the monitor
 stops calling CLIProxyAPI until the key file changes, because CLIProxyAPI bans an address from its management API for 30
-minutes after five failed keys. From another machine, forward the port with SSH and pass `--key-file` with a file
-holding only the management key.
+minutes after five failed keys. `monitor enable` runs it as a systemd user service with linger, so it keeps running
+after logout; rerun `enable` after upgrading kd to restart it on the new binary, and read its output with
+`journalctl --user -u kd-cli-proxy-api-monitor -f`. Run `monitor disable` before uninstalling kd, or the unit keeps
+trying to start a binary that is gone. From another machine, run `monitor run` by hand: forward the port with SSH and
+pass `--key-file` with a file holding only the management key.
 
 Timezone setup keeps `/etc/localtime` and any existing `/etc/timezone` consistent with `America/Los_Angeles`. The probe
 checks them independently, along with systemd's timezone and any inherited `TZ` override; application and container
