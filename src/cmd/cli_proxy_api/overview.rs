@@ -61,7 +61,7 @@ const ROWS: usize = 4;
 const MARGIN: usize = 9;
 
 /// Length of the current-usage gauges drawn right of each chart, in
-/// columns; each column resolves eight steps, so 20 columns show 160.
+/// columns, so one column is 5%.
 const GAUGE_BAR: usize = 20;
 
 /// Columns the gauges take, reserved when sizing the chart: a gap, the
@@ -96,7 +96,9 @@ pub enum Style {
 const BOLD: &str = "\x1b[1m";
 const RED: &str = "\x1b[31m";
 const YELLOW: &str = "\x1b[33m";
-const CYAN: &str = "\x1b[36m";
+/// The main accent: bold blue, which common dark themes render as a light
+/// blue that stays readable on both light and dark backgrounds.
+const BLUE: &str = "\x1b[1;34m";
 const MAGENTA: &str = "\x1b[35m";
 const RESET: &str = "\x1b[0m";
 
@@ -363,7 +365,7 @@ pub fn render(
             .windows(2)
             .map(|w| Some((w[1]? - w[0]?).max(0.0)))
             .collect();
-        let color = if is_burned { MAGENTA } else { CYAN };
+        let color = if is_burned { MAGENTA } else { BLUE };
         let gauges = [
             gauge("7d", account["seven_day"]["utilization"].as_f64(), style),
             gauge("5h", account["five_hour"]["utilization"].as_f64(), style),
@@ -505,35 +507,32 @@ fn account_header(
 }
 
 /// How much of a window is used right now, as a horizontal bar with the
-/// percentage spelled out: `7d ██████████████▍░░░░░ 72%`. The bar shows
-/// the level, which the time chart beside it (a rate) cannot. It turns
-/// yellow from 80% and red from 95%, where a window is close to cutting the
-/// account off. An unknown value (no usage lookup) shows as `?`.
+/// percentage spelled out: `7d ▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░  72%`. The bar shows
+/// the level, which the time chart beside it (a rate) cannot. Filled and
+/// empty cells are shaded blocks colored together with the number, so the
+/// bar and its value read as one unit; a cell is 5%, and the number
+/// carries the precision. The color turns yellow
+/// from 80% and red from 95%, where a window is close to cutting the account
+/// off. An unknown value (no usage lookup) shows as `?`.
 fn gauge(label: &str, used: Option<f64>, style: Style) -> String {
-    const PARTIAL: [char; 7] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉'];
     let Some(used) = used else {
         return format!("{label} {:>w$}", "?", w = GAUGE_BAR + 5);
     };
-    let eighths = ((used.clamp(0.0, 100.0) / 100.0) * (GAUGE_BAR * 8) as f64).round() as usize;
-    let (full, rest) = (eighths / 8, eighths % 8);
-    let mut bar = "█".repeat(full);
-    if rest > 0 {
-        bar.push(PARTIAL[rest - 1]);
-    }
-    let empty = GAUGE_BAR - bar.chars().count();
+    let filled = ((used.clamp(0.0, 100.0) / 100.0) * GAUGE_BAR as f64).round() as usize;
     let color = if used >= 95.0 {
         RED
     } else if used >= 80.0 {
         YELLOW
     } else {
-        CYAN
+        BLUE
     };
-    format!(
-        "{label} {}{} {:>4}",
-        style.paint(color, &bar),
-        "░".repeat(empty),
+    let text = format!(
+        "{}{} {:>4}",
+        "▓".repeat(filled),
+        "░".repeat(GAUGE_BAR - filled),
         format!("{used:.0}%")
-    )
+    );
+    format!("{label} {}", style.paint(color, &text))
 }
 
 /// A bar chart of per-bucket consumption with a scale on the left, day
@@ -860,8 +859,8 @@ mod tests {
         assert_eq!(
             chart,
             vec![
-                format!("   8.0% ┤{gap}██   7d ███▎░░░░░░░░░░░░░░░░  16%"),
-                format!("        ┤{gap}██   5h █░░░░░░░░░░░░░░░░░░░   5%"),
+                format!("   8.0% ┤{gap}██   7d ▓▓▓░░░░░░░░░░░░░░░░░  16%"),
+                format!("        ┤{gap}██   5h ▓░░░░░░░░░░░░░░░░░░░   5%"),
                 format!("        ┤{gap}██"),
                 format!("     0% ┤{dots}██"),
                 "    /4h └───┬───────────┬───────────┬──────────────".to_owned(),
@@ -910,7 +909,7 @@ mod tests {
         assert!(text.contains("   8.0% ┤"), "{text}");
     }
 
-    /// The gauge resolves eighths of a column, spells the percentage out,
+    /// The gauge rounds to 5% cells, spells the exact percentage out,
     /// clamps what it draws to the bar while still printing the real value,
     /// turns yellow and then red as a window nears its limit, and admits an
     /// unknown value instead of drawing zero.
@@ -918,7 +917,7 @@ mod tests {
     fn gauges_show_the_current_level() {
         assert_eq!(
             gauge("7d", Some(16.0), Style::Plain),
-            "7d ███▎░░░░░░░░░░░░░░░░  16%"
+            "7d ▓▓▓░░░░░░░░░░░░░░░░░  16%"
         );
         assert_eq!(
             gauge("5h", Some(0.0), Style::Plain),
@@ -926,13 +925,17 @@ mod tests {
         );
         assert_eq!(
             gauge("5h", Some(104.0), Style::Plain),
-            format!("5h {} 104%", "█".repeat(20))
+            format!("5h {} 104%", "▓".repeat(20))
         );
         assert_eq!(
             gauge("7d", None, Style::Plain),
             format!("7d {}?", " ".repeat(24))
         );
-        assert!(gauge("7d", Some(50.0), Style::Color).contains(CYAN));
+        assert_eq!(
+            gauge("7d", Some(50.0), Style::Color),
+            format!("7d {BLUE}{}{}  50%{RESET}", "▓".repeat(10), "░".repeat(10)),
+            "bar and number share one color span"
+        );
         assert!(gauge("7d", Some(85.0), Style::Color).contains(YELLOW));
         assert!(gauge("7d", Some(96.0), Style::Color).contains(RED));
     }
