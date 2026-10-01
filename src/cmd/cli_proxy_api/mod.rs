@@ -8,6 +8,8 @@
 //! part of kd that writes them.
 
 pub mod api;
+pub mod burn;
+pub mod history;
 pub mod monitor;
 pub mod plan;
 pub mod service;
@@ -21,6 +23,20 @@ pub enum Commands {
     /// Keep Claude accounts ordered by weekly reset and record usage history
     #[command(subcommand)]
     Monitor(MonitorCommands),
+    /// Drain one Claude account first, ahead of reset order, until its weekly reset
+    Burn(BurnArgs),
+}
+
+/// Flags for `burn`: an email to burn, or `--clear`.
+#[derive(Args, Debug)]
+pub struct BurnArgs {
+    /// Email of the Claude account to put on top
+    #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+    pub email: Option<String>,
+
+    /// Remove the override and return to reset order
+    #[arg(long)]
+    pub clear: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -58,6 +74,7 @@ fn run_settings(args: RunArgs, home: PathBuf) -> monitor::Settings {
             .key_file
             .unwrap_or_else(|| monitor::default_key_file(&home)),
         log_file: monitor::log_file(&home),
+        config_file: burn::config_file(&home),
     }
 }
 
@@ -85,6 +102,22 @@ impl Commands {
             }
             Commands::Monitor(MonitorCommands::Disable) => {
                 print!("{}", service::disable(&service::System, &home()?)?);
+                Ok(())
+            }
+            Commands::Burn(args) => {
+                let home = home()?;
+                let config = burn::config_file(&home);
+                let report = match args.email {
+                    Some(email) => burn::set(
+                        &config,
+                        &monitor::log_file(&home),
+                        &email,
+                        jiff::Timestamp::now(),
+                        &jiff::tz::TimeZone::system(),
+                    )?,
+                    None => burn::clear(&config)?,
+                };
+                print!("{report}");
                 Ok(())
             }
         }

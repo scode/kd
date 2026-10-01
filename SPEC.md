@@ -349,13 +349,18 @@ part of kd that writes priorities.
   and a wake paused after a rejected key (below): both only log.
 - Wakes every 15 minutes, and also 60 seconds after the earliest known reset of any managed account's 5-hour or weekly
   window when that comes sooner. The extra wake is best effort: a reset Anthropic has not rolled over by then is picked
-  up by the next wake.
+  up by the next wake. A change to the `burn` override file also wakes it, within a second or so. Passes start at least
+  10 seconds apart whatever woke them, and the end of a burn is a wake time too.
 - Goal: quota that is about to expire is spent before quota that is not at risk. The Claude account whose weekly quota
   window resets soonest gets the highest priority, the next one the next highest, and so on. Accounts whose weekly
   resets round to the same minute share a priority (Anthropic reports one nominal reset with sub-second jitter on either
   side of the minute). An account whose weekly window has not started (Anthropic reports no reset time) goes last. Plan
   sizes and 5-hour windows do not affect the order: CLIProxyAPI already skips an account that hits a limit and moves on
   to the next priority.
+- An active `burn` override puts the named account alone in the highest priority (every enabled Claude account with that
+  email, in the unusual case of several), above every other account whatever their resets; the rest keep the order above
+  beneath it. An override naming no enabled Claude account changes nothing and is reported as such. An override file
+  that cannot be read is reported, and the pass plans without it.
 - Managed accounts are the enabled Claude accounts. Disabled accounts and other providers keep their priority and get no
   usage lookup. A pass that finds no managed account fails rather than reporting the pool as in order.
 - Every pass observes from scratch: it lists the accounts, asks Anthropic (through CLIProxyAPI, so tokens stay on the
@@ -382,11 +387,11 @@ part of kd that writes priorities.
   and the next wake time; under systemd this is the journal.
 - Each pass appends one JSON line to `~/.local/state/kd/cli-proxy-api-monitor.jsonl`, including failed and paused
   passes, so the log is also the usage history `overview` charts. Every line carries a schema version `v`; readers skip
-  lines with a version they do not know. A line holds the observations, the plan, the writes, the flags, any error, and
-  CLIProxyAPI's raw quota signals for each account. The log is created mode `0600` in a `0700` directory. It holds
-  account names and emails, CLIProxyAPI's status messages, and the first 200 characters of error responses, never keys
-  or tokens. It is appended to forever; rotate or trim it yourself if that matters. The path is fixed and does not
-  follow `XDG_STATE_HOME`.
+  lines with a version they do not know. A line holds the observations, the plan, the writes, the flags, any error, the
+  `burn` override as seen (with whether it was active and matched an account), and CLIProxyAPI's raw quota signals for
+  each account. The log is created mode `0600` in a `0700` directory. It holds account names and emails, CLIProxyAPI's
+  status messages, and the first 200 characters of error responses, never keys or tokens. It is appended to forever;
+  rotate or trim it yourself if that matters. The path is fixed and does not follow `XDG_STATE_HOME`.
 - Flags point out states worth a look without changing the plan. Only quota cooldowns count for them; CLIProxyAPI's
   cooldowns of single models after errors do not. `cooldown_outlives_reset`: a quota cooldown runs more than 15 minutes
   past the later of Anthropic's two reset times, where a window that has not started counts as available now; this is
@@ -416,6 +421,29 @@ part of kd that writes priorities.
 - `disable` stops and disables the unit and removes its file. With no unit file installed it reports that and does
   nothing else.
 - The monitor's output goes to the journal: `journalctl --user -u kd-cli-proxy-api-monitor -f`.
+
+### kd cli-proxy-api burn EMAIL | --clear
+
+NOTE: This is the manual escape hatch for draining one account out of order, typically to use up its week before
+pressing a banked limit reset on it, which restores the weekly limit without moving the account's weekly schedule.
+Whether that is worth it depends on the week ahead, which only the user knows.
+
+- `burn EMAIL` makes the monitor give the Claude account with that email (any letter case) the highest priority until
+  that account's next weekly reset, or for a week from now if its weekly window has not started. At most one account is
+  burned at a time; a new `burn` replaces the previous one and says so. Once it ends, the account falls back into reset
+  order on its own.
+- `burn --clear` removes the override. Clearing when none is set is not an error.
+- The override is stored in `~/.config/kd/cli-proxy-api-monitor.toml`, which the monitor reads on every wake and
+  watches, so a change takes effect within seconds. Hand edits are honoured the same way (`until` is a quoted RFC 3339
+  time); a file that does not parse, including one with an unknown key, is reported by the monitor and ignored.
+- `burn EMAIL` reads the monitor's latest log record and does not contact CLIProxyAPI. It refuses, changing nothing,
+  when the log has no record, when the latest record is more than 30 minutes old (the monitor appears not to be running,
+  and the expiry would come from stale data), when the latest pass failed before seeing the accounts (it says why), when
+  the email names no account in it, names an account that is disabled or not a Claude account, or names one whose usage
+  lookup failed in that record. The reported end time is in local time.
+- Burning only changes priorities; how established sessions follow them is up to CLIProxyAPI's routing. With session
+  affinity on, a session already bound to another account may stay there, so the switch can lag until sessions turn
+  over.
 
 ## kd devbox
 
