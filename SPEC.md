@@ -483,6 +483,10 @@ Whether that is worth it depends on the week ahead, which only the user knows.
 - Both the usage lookups (whole percents) and CLIProxyAPI's quota signals (two decimals, refreshed only when the account
   serves traffic) feed the chart.
 - Only the last eight days of the log are read.
+- `--privacy` names accounts "Account 1", "Account 2", and so on, numbered in the order the output shows them, instead
+  of by email, for screenshots and shared screens. It covers every place an account appears, including auth file names
+  in quoted error messages, matching addresses whole and ignoring case. Any other address is shown as `<email>`, and the
+  home directory as `~`.
 - Output is colored only on a terminal and when `NO_COLOR` is unset or empty; otherwise it is plain text at 100 columns.
 
 ## kd devbox

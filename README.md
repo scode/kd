@@ -133,6 +133,7 @@ kd cli-proxy-api burn --clear
 # 15-minute bars.
 kd cli-proxy-api overview
 kd cli-proxy-api overview --recent
+kd cli-proxy-api overview --privacy   # "Account 1" instead of emails
 ```
 
 ## Development environments and stateful instances

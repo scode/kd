@@ -36,6 +36,10 @@ pub struct OverviewArgs {
     /// Chart as many 15-minute buckets as fit instead of each account's week in 4-hour ones
     #[arg(long)]
     pub recent: bool,
+
+    /// Name accounts "Account 1", "Account 2", ... instead of by email (for screenshots)
+    #[arg(long)]
+    pub privacy: bool,
 }
 
 /// Flags for `burn`: an email to burn, or `--clear`.
@@ -158,18 +162,21 @@ impl Commands {
                 let width = terminal_size::terminal_size()
                     .filter(|_| terminal)
                     .map_or(100, |(w, _)| usize::from(w.0));
-                print!(
-                    "{}",
-                    overview::render(
-                        &records,
-                        &burn,
-                        span,
-                        now,
-                        &jiff::tz::TimeZone::system(),
-                        width,
-                        style
-                    )
+                let text = overview::render(
+                    &records,
+                    &burn,
+                    span,
+                    now,
+                    &jiff::tz::TimeZone::system(),
+                    width,
+                    style,
                 );
+                let text = if args.privacy {
+                    overview::anonymize(&text, &records, Some(&home))
+                } else {
+                    text
+                };
+                print!("{text}");
                 Ok(())
             }
         }

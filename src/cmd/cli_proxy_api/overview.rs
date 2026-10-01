@@ -435,8 +435,7 @@ pub fn render(
     // A paused or failed pass logs no accounts, which is exactly when the
     // charts are still wanted; take the accounts from the newest pass that
     // saw them and say how old that is.
-    let has_accounts = |r: &&Value| r["accounts"].as_array().is_some_and(|a| !a.is_empty());
-    let Some(seen) = records.iter().rev().find(has_accounts) else {
+    let Some(seen) = seen_record(records) else {
         out.push_str("no monitor pass in the last week has listed the accounts\n");
         return out;
     };
@@ -453,16 +452,13 @@ pub fn render(
 
     let columns = width.saturating_sub(MARGIN + 1 + GAUGE_WIDTH).max(1);
 
-    let accounts = seen["accounts"]
-        .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or_default();
+    let (charted, disabled) = shown_accounts(seen);
     let burned = burn
         .as_ref()
         .ok()
         .and_then(Option::as_ref)
         .filter(|b| b.is_active(now));
-    for account in accounts.iter().filter(|a| a["managed"] == true) {
+    for account in charted {
         let Some(key) = account_key(account) else {
             continue;
         };
@@ -502,18 +498,160 @@ pub fn render(
         };
         chart(&mut out, &plot, &gauges, tz, style, color);
     }
-    let disabled: Vec<&str> = accounts
-        .iter()
-        .filter(|a| {
-            a["managed"] != true
-                && a["provider"]
-                    .as_str()
-                    .is_some_and(|p| p.eq_ignore_ascii_case("claude"))
-        })
-        .filter_map(account_key)
-        .collect();
+    let disabled: Vec<&str> = disabled.into_iter().filter_map(account_key).collect();
     if !disabled.is_empty() {
         out.push_str(&format!("\ndisabled: {}\n", disabled.join(", ")));
+    }
+    out
+}
+
+/// The newest record whose pass saw the accounts. A paused or failed pass
+/// logs no accounts, which is exactly when the charts are still wanted.
+fn seen_record(records: &[Value]) -> Option<&Value> {
+    records
+        .iter()
+        .rev()
+        .find(|r| r["accounts"].as_array().is_some_and(|a| !a.is_empty()))
+}
+
+/// The accounts `overview` shows from a record, in the order it shows
+/// them: the managed (enabled Claude) accounts, each with a section, then
+/// the disabled Claude accounts, listed by name. Accounts of other
+/// providers are not shown. Both the renderer and [`anonymize`] use this,
+/// so the privacy numbering always follows what is on screen.
+fn shown_accounts(record: &Value) -> (Vec<&Value>, Vec<&Value>) {
+    let accounts = record["accounts"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let is_claude = |a: &&Value| {
+        a["provider"]
+            .as_str()
+            .is_some_and(|p| p.eq_ignore_ascii_case("claude"))
+    };
+    let charted = accounts.iter().filter(|a| a["managed"] == true).collect();
+    let disabled = accounts
+        .iter()
+        .filter(|a| a["managed"] != true)
+        .filter(is_claude)
+        .collect();
+    (charted, disabled)
+}
+
+/// Rewrite rendered `overview` text so it names no account: for
+/// `--privacy`, when the output is meant for a screenshot or a shared
+/// screen. Shown accounts become "Account 1", "Account 2", ..., numbered in
+/// the order the output shows them.
+///
+/// It works on the finished text rather than inside the renderer so that
+/// every path that can print an account, including CLIProxyAPI's own error
+/// messages quoted in the status lines, is covered without each having to
+/// remember. Every email-shaped token is looked up whole, ignoring case,
+/// against the shown accounts' emails and auth file names (which embed the
+/// email and so are email-shaped themselves) and becomes that account's
+/// label, or `<email>` when it names no shown account. Matching whole
+/// tokens means a longer address that merely contains a known one is never
+/// half replaced. The few auth file names without an `@` are replaced as
+/// plain text. `home`, when given, becomes `~`, since a home directory path
+/// (in a config file error, say) usually carries the user name.
+pub fn anonymize(text: &str, records: &[Value], home: Option<&std::path::Path>) -> String {
+    let (charted, disabled) = seen_record(records).map(shown_accounts).unwrap_or_default();
+    let mut labels: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut plain: Vec<(String, String)> = Vec::new();
+    for (i, account) in charted.iter().chain(disabled.iter()).enumerate() {
+        let label = format!("Account {}", i + 1);
+        for field in ["name", "email"] {
+            let Some(value) = account[field].as_str().filter(|v| !v.is_empty()) else {
+                continue;
+            };
+            if value.contains('@') {
+                labels.insert(value.to_lowercase(), label.clone());
+            } else {
+                plain.push((value.to_owned(), label.clone()));
+            }
+        }
+    }
+    let mut out = text.to_owned();
+    if let Some(home) = home.and_then(|h| h.to_str()).filter(|h| h.len() > 1) {
+        out = out.replace(home, "~");
+    }
+    plain.sort_by_key(|(value, _)| std::cmp::Reverse(value.len()));
+    for (value, label) in &plain {
+        out = out.replace(value.as_str(), label);
+    }
+    replace_emails(&out, &|email| {
+        labels
+            .get(&email.to_lowercase())
+            .cloned()
+            .unwrap_or_else(|| "<email>".to_owned())
+    })
+}
+
+/// Replace each email-shaped token with `label(token)`, leaving ANSI escape
+/// sequences alone (their letters must not be read as part of an address
+/// next to them).
+fn replace_emails(text: &str, label: &dyn Fn(&str) -> String) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut plain = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            out.push_str(&replace_plain(&plain, label));
+            plain.clear();
+            out.push(c);
+            // CSI: ESC [ parameters, ending at the first letter.
+            if chars.peek() == Some(&'[') {
+                out.push(chars.next().unwrap());
+                for c in chars.by_ref() {
+                    out.push(c);
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            plain.push(c);
+        }
+    }
+    out.push_str(&replace_plain(&plain, label));
+    out
+}
+
+/// [`replace_emails`] for text without escape sequences. A token is a run
+/// of address characters (any letter or digit, plus `._%+-`) before an `@`
+/// and a run of domain characters (letters, digits, `.` and `-`) with at
+/// least one dot after it; a trailing dot, as at the end of a sentence, is
+/// not part of it.
+fn replace_plain(text: &str, label: &dyn Fn(&str) -> String) -> String {
+    let local = |c: char| c.is_alphanumeric() || "._%+-".contains(c);
+    let domain = |c: char| c.is_alphanumeric() || ".-".contains(c);
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '@' {
+            let start = (0..i).rev().take_while(|&j| local(chars[j])).last();
+            let mut end = (i + 1..chars.len())
+                .take_while(|&j| domain(chars[j]))
+                .last();
+            while let Some(e) = end.filter(|&e| e > i && chars[e] == '.') {
+                end = Some(e - 1).filter(|&e| e > i);
+            }
+            if let (Some(start), Some(end)) = (start, end)
+                && chars[i + 1..=end].contains(&'.')
+            {
+                // `out` already holds the local part; take it back.
+                for _ in start..i {
+                    out.pop();
+                }
+                let token: String = chars[start..=end].iter().collect();
+                out.push_str(&label(&token));
+                i = end + 1;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
     }
     out
 }
@@ -1286,6 +1424,85 @@ mod tests {
         );
         let line = text.lines().find(|l| l.contains("now")).unwrap();
         assert!(line.contains("│ rollover Sun 04 16:30 · now"), "{line}");
+    }
+
+    /// `--privacy` output names no account: shown accounts are numbered in
+    /// display order (accounts of other providers, which are not shown, take
+    /// no number), auth file names quoted in errors become their account's
+    /// label, a burn of a shown account uses its label, an unknown address
+    /// (even one containing a known address) becomes `<email>`, case does
+    /// not matter, the home directory becomes `~`, and color escapes survive.
+    #[test]
+    fn anonymize_replaces_every_account_reference() {
+        let mut records = log();
+        let last = records.last_mut().unwrap();
+        last["accounts"][0]["name"] = json!("claude-1a2b-a@example.com.json");
+        last["accounts"]
+            .as_array_mut()
+            .unwrap()
+            .insert(1, json!({"name": "codex-x@example.com.json", "email": "x@example.com", "provider": "codex", "managed": false}));
+        last["error"] = json!(
+            "usage lookup failed for claude-1a2b-A@Example.com.json; also xa@example.com and /home/someone/.config"
+        );
+        let burn = Ok(Some(Burn {
+            email: "a@example.com".to_owned(),
+            until: ts(WEEK1),
+        }));
+        let text = render(
+            &records,
+            &burn,
+            Span::Week,
+            ts("2026-10-01T08:10:00Z"),
+            &TimeZone::UTC,
+            91,
+            Style::Color,
+        );
+        let private = anonymize(&text, &records, Some(std::path::Path::new("/home/someone")));
+        assert!(!private.contains('@'), "{private}");
+        assert!(!private.contains("someone"), "{private}");
+        assert!(
+            private.contains(&format!("{BOLD}Account 1{RESET}  priority")),
+            "{private}"
+        );
+        assert!(
+            private.contains(&format!("{BOLD}Account 2{RESET}  priority")),
+            "{private}"
+        );
+        assert!(private.contains("disabled: Account 3\n"), "{private}");
+        assert!(
+            private.contains("usage lookup failed for Account 1; also <email> and ~/.config"),
+            "{private}"
+        );
+        assert!(private.contains("burn: Account 1 until"), "{private}");
+
+        let plain = render(
+            &records,
+            &Ok(None),
+            Span::Week,
+            ts("2026-10-01T08:10:00Z"),
+            &TimeZone::UTC,
+            91,
+            Style::Plain,
+        );
+        assert!(!anonymize(&plain, &records, None).contains('@'));
+        assert_eq!(
+            anonymize("x@y.io", &[], None),
+            "<email>",
+            "with no record listing accounts, every address is scrubbed"
+        );
+    }
+
+    /// The token rules: escapes stay intact, non-ASCII addresses are caught
+    /// whole, a sentence's final dot survives, and things that are not
+    /// addresses (no dot in the domain) are left alone.
+    #[test]
+    fn email_tokens_are_found_whole() {
+        let scrub = |t: &str| replace_emails(t, &|_| "<email>".to_owned());
+        assert_eq!(
+            scrub("\x1b[1mx@y.io\x1b[0m and a@b, not-an-email@localhost"),
+            "\x1b[1m<email>\x1b[0m and a@b, not-an-email@localhost"
+        );
+        assert_eq!(scrub("jörg@exämple.com."), "<email>.");
     }
 
     /// When the latest pass saw no accounts (paused, proxy down), the charts
