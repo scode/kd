@@ -78,9 +78,19 @@ const MARGIN: usize = 9;
 /// columns, so one column is 5%.
 const GAUGE_BAR: usize = 20;
 
-/// Columns the gauges take, reserved when sizing the chart: a gap, the
-/// window label, the bar, and the spelled-out percentage.
+/// Columns the gauges take when they are drawn (see [`FULL_WEEK_BUCKETS`]):
+/// a gap, the window label, the bar, and the spelled-out percentage.
 const GAUGE_WIDTH: usize = 2 + 2 + 1 + GAUGE_BAR + 1 + 4;
+
+/// Chart columns the default view needs to show a whole week with its
+/// margins: 7 days plus twice 21 hours is 210 hours, which the 4-hour grid
+/// turns into 53 or 54 buckets depending on where the reset falls (a
+/// daylight-saving change in the range does not push it past 54). Gauges
+/// are only drawn when this many columns remain beside them, in both views,
+/// so they appear and disappear at the same terminal width whichever view
+/// is shown: they repeat numbers the account's header line already shows,
+/// so on a narrow terminal the chart gets the room instead.
+const FULL_WEEK_BUCKETS: usize = 54;
 
 /// Which time span to chart.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -112,8 +122,9 @@ pub enum Style {
 const BOLD: &str = "\x1b[1m";
 const RED: &str = "\x1b[31m";
 const YELLOW: &str = "\x1b[33m";
-/// The main accent: bold blue, which common dark themes render as a light
-/// blue that stays readable on both light and dark backgrounds.
+/// The main accent: bold blue, chosen to match a status-line style the
+/// tool's users already know. Terminals that show bold as bright render it
+/// as a light blue; on others it is plain blue.
 const BLUE: &str = "\x1b[1;34m";
 const MAGENTA: &str = "\x1b[35m";
 /// Rollover markers: a soft blue-violet that sets the week's boundaries
@@ -450,7 +461,14 @@ pub fn render(
         ));
     }
 
-    let columns = width.saturating_sub(MARGIN + 1 + GAUGE_WIDTH).max(1);
+    let beside_gauges = width.saturating_sub(MARGIN + 1 + GAUGE_WIDTH);
+    let show_gauges = beside_gauges >= FULL_WEEK_BUCKETS;
+    let columns = if show_gauges {
+        beside_gauges
+    } else {
+        width.saturating_sub(MARGIN + 1)
+    }
+    .max(1);
 
     let (charted, disabled) = shown_accounts(seen);
     let burned = burn
@@ -472,7 +490,15 @@ pub fn render(
         }
         let (edges, markers) = chart_range(span, account, now, columns, tz);
         // Widen the buckets when the terminal has room for it.
-        let cell = (columns / (edges.len() - 1)).clamp(1, 3);
+        // Every account gets the same bucket width, sized for the longest
+        // possible week range, so neighbouring charts share one time scale
+        // and end near the gauges; widening each account's buckets to fill
+        // its own (53 or 54 bucket) range would not.
+        let cell = match span {
+            Span::Week => columns / FULL_WEEK_BUCKETS.max(edges.len() - 1),
+            Span::Recent => columns / (edges.len() - 1),
+        }
+        .clamp(1, 3);
         let values: Vec<Option<f64>> = edges.iter().map(|e| value_at(&series, *e, now)).collect();
         let used: Vec<Bucket> = edges
             .windows(2)
@@ -484,10 +510,18 @@ pub fn render(
             })
             .collect();
         let color = if is_burned { MAGENTA } else { BLUE };
-        let gauges = [
-            gauge("7d", account["seven_day"]["utilization"].as_f64(), style),
-            gauge("5h", account["five_hour"]["utilization"].as_f64(), style),
-        ];
+        let window_gauge = |label: &str, window: &Value| {
+            let reset = window["resets_at"].as_str().and_then(|t| t.parse().ok());
+            gauge(label, window["utilization"].as_f64(), reset, now, style)
+        };
+        let gauges: Vec<String> = if show_gauges {
+            vec![
+                window_gauge("7d", &account["seven_day"]),
+                window_gauge("5h", &account["five_hour"]),
+            ]
+        } else {
+            Vec::new()
+        };
         let plot = Plot {
             used: &used,
             edges: &edges,
@@ -495,6 +529,10 @@ pub fn render(
             span,
             cell,
             now,
+            gauge_column: match span {
+                Span::Week => (FULL_WEEK_BUCKETS * cell).min(columns),
+                Span::Recent => columns,
+            },
         };
         chart(&mut out, &plot, &gauges, tz, style, color);
     }
@@ -776,15 +814,26 @@ fn account_header(
 /// percentage spelled out: `7d ▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░  72%`. The bar shows
 /// the level, which the time chart beside it (a rate) cannot. Filled and
 /// empty cells are shaded blocks colored together with the number, so the
-/// bar and its value read as one unit; a cell is 5%, and the number
-/// carries the precision. The color turns yellow
-/// from 80% and red from 95%, where a window is close to cutting the account
-/// off. An unknown value (no usage lookup) shows as `?`.
-fn gauge(label: &str, used: Option<f64>, style: Style) -> String {
-    let Some(used) = used else {
+/// bar and its value read as one unit; a cell is 5%, rounded down so that
+/// only an exhausted window draws a full bar, and the number carries the
+/// precision. The color turns yellow from 80% and red from 95%, where a
+/// window is close to cutting the account off.
+///
+/// The value shows as `?` when it is unknown (no usage lookup, or no such
+/// window in it) or out of date: when `reset` has already passed, the
+/// window has started over since the reading was taken, as happens while
+/// the monitor is paused and the accounts come from an older pass.
+fn gauge(
+    label: &str,
+    used: Option<f64>,
+    reset: Option<Timestamp>,
+    now: Timestamp,
+    style: Style,
+) -> String {
+    let Some(used) = used.filter(|_| reset.is_none_or(|r| r > now)) else {
         return format!("{label} {:>w$}", "?", w = GAUGE_BAR + 5);
     };
-    let filled = ((used.clamp(0.0, 100.0) / 100.0) * GAUGE_BAR as f64).round() as usize;
+    let filled = ((used.clamp(0.0, 100.0) / 100.0) * GAUGE_BAR as f64).floor() as usize;
     let color = if used >= 95.0 {
         RED
     } else if used >= 80.0 {
@@ -810,6 +859,10 @@ struct Plot<'a> {
     span: Span,
     cell: usize,
     now: Timestamp,
+    /// Column the gauges start at (after a two-column gap). It is the
+    /// whole chart budget rather than this chart's own width, which varies
+    /// by account, so the gauges line up from one account to the next.
+    gauge_column: usize,
 }
 
 impl Plot<'_> {
@@ -918,10 +971,14 @@ fn chart(
                 cells[*column] = (marker.glyph, Some(marker.color));
             }
         }
-        // Rows carrying a gauge keep their trailing blanks so the gauges
-        // line up; the rest are trimmed.
+        // Rows carrying a gauge are padded to the gauge column so the
+        // gauges line up; the rest are trimmed.
         let gauge = side.get(row);
-        if gauge.is_none() {
+        if gauge.is_some() {
+            if cells.len() < plot.gauge_column {
+                cells.resize(plot.gauge_column, (' ', None));
+            }
+        } else {
             while cells.last().is_some_and(|(c, _)| *c == ' ') {
                 cells.pop();
             }
@@ -1246,7 +1303,7 @@ mod tests {
             Span::Week,
             now,
             &TimeZone::UTC,
-            91,
+            94,
             Style::Plain,
         );
         assert!(
@@ -1268,14 +1325,14 @@ mod tests {
             .skip(1)
             .take(7)
             .collect();
-        // The chart spans the account's week (rollovers on Sun 27 and Sun 04
-        // at 16:00) with margins, trimmed at the left to the width; now
+        // The chart spans the account's whole week (rollovers on Sun 27 and
+        // Sun 04 at 16:00) with its margins, gauges beside it; now
         // (Thu 01 08:10) falls in the bucket after the two used ones, which
         // has seen nothing yet, so only the thin now line shows there.
         let row = |label: &str, fill: &str| {
             format!(
-                "{label:>7} ┤{f3}│{f19}██│{blank19}│",
-                f3 = fill.repeat(3),
+                "{label:>7} ┤{f6}│{f19}██│{blank19}│",
+                f6 = fill.repeat(6),
                 f19 = fill.repeat(19),
                 blank19 = " ".repeat(19)
             )
@@ -1287,9 +1344,9 @@ mod tests {
                 format!("{}       5h ▓░░░░░░░░░░░░░░░░░░░   5%", row("", " ")),
                 row("", " "),
                 row("0%", "·"),
-                "    /4h └───┼─┬───────────┬───────┼───┬───────────┬───┼─────".to_owned(),
-                "              Mon 28      Wed 30      Fri 02      Sun 04".to_owned(),
-                "            │ rollover Sun 16:00  │ now               │ rollover Sun 04 16:00"
+                "    /4h └──┬───┼───────┬───────────┬─┼─────────┬─────────┼─────".to_owned(),
+                "           Sun 27      Tue 29      Thu 01      Sat 03".to_owned(),
+                "               │ rollover Sun 16:00  │ now               │ rollover Sun 04 16:00"
                     .to_owned(),
             ],
             "{text}"
@@ -1540,35 +1597,117 @@ mod tests {
         assert!(text.contains("   8.0% ┤"), "{text}");
     }
 
-    /// The gauge rounds to 5% cells, spells the exact percentage out,
-    /// clamps what it draws to the bar while still printing the real value,
-    /// turns yellow and then red as a window nears its limit, and admits an
-    /// unknown value instead of drawing zero.
+    /// The gauge fills whole 5% cells, rounding down so only an exhausted
+    /// window is full, spells the exact percentage out, clamps what it draws
+    /// to the bar while still printing the real value, turns yellow and then
+    /// red as a window nears its limit, and shows `?` for an unknown value
+    /// or one whose window has reset since; a window that has not started
+    /// is current.
     #[test]
     fn gauges_show_the_current_level() {
+        let now = ts("2026-10-01T08:00:00Z");
+        let later = Some(ts("2026-10-02T00:00:00Z"));
+        let g = |used: Option<f64>, style| gauge("7d", used, later, now, style);
+        assert_eq!(g(Some(16.0), Style::Plain), "7d ▓▓▓░░░░░░░░░░░░░░░░░  16%");
         assert_eq!(
-            gauge("7d", Some(16.0), Style::Plain),
-            "7d ▓▓▓░░░░░░░░░░░░░░░░░  16%"
+            g(Some(0.0), Style::Plain),
+            format!("7d {}   0%", "░".repeat(20))
         );
         assert_eq!(
-            gauge("5h", Some(0.0), Style::Plain),
-            format!("5h {}   0%", "░".repeat(20))
+            g(Some(99.0), Style::Plain),
+            format!("7d {}░  99%", "▓".repeat(19)),
+            "only an exhausted window draws a full bar"
         );
         assert_eq!(
-            gauge("5h", Some(104.0), Style::Plain),
-            format!("5h {} 104%", "▓".repeat(20))
+            g(Some(104.0), Style::Plain),
+            format!("7d {} 104%", "▓".repeat(20))
+        );
+        assert_eq!(g(None, Style::Plain), format!("7d {}?", " ".repeat(24)));
+        assert_eq!(
+            gauge(
+                "7d",
+                Some(58.0),
+                Some(ts("2026-10-01T07:00:00Z")),
+                now,
+                Style::Plain
+            ),
+            format!("7d {}?", " ".repeat(24)),
+            "a reading from before the window reset is out of date"
         );
         assert_eq!(
-            gauge("7d", None, Style::Plain),
-            format!("7d {}?", " ".repeat(24))
+            gauge("5h", Some(0.0), None, now, Style::Plain),
+            format!("5h {}   0%", "░".repeat(20)),
+            "a window that has not started is current"
         );
         assert_eq!(
-            gauge("7d", Some(50.0), Style::Color),
+            g(Some(50.0), Style::Color),
             format!("7d {BLUE}{}{}  50%{RESET}", "▓".repeat(10), "░".repeat(10)),
             "bar and number share one color span"
         );
-        assert!(gauge("7d", Some(85.0), Style::Color).contains(YELLOW));
-        assert!(gauge("7d", Some(96.0), Style::Color).contains(RED));
+        assert!(g(Some(85.0), Style::Color).contains(YELLOW));
+        assert!(g(Some(96.0), Style::Color).contains(RED));
+    }
+
+    /// Gauges are drawn only when the chart beside them still gets a whole
+    /// week (54 buckets): from 94 columns, not at 93, in both views. Without
+    /// them the chart gets the whole width. Where drawn, they start in the
+    /// same column for every account, and charts share one bucket width.
+    #[test]
+    fn gauges_give_way_on_narrow_terminals_and_line_up() {
+        let mut records = log();
+        let last = records.last_mut().unwrap();
+        let mut other = last["accounts"][0].clone();
+        other["email"] = json!("b@example.com");
+        other["seven_day"]["resets_at"] = json!("2026-10-05T02:00:00Z");
+        last["accounts"].as_array_mut().unwrap().push(other);
+        let now = ts("2026-10-01T08:10:00Z");
+        let at = |span, width| {
+            render(
+                &records,
+                &Ok(None),
+                span,
+                now,
+                &TimeZone::UTC,
+                width,
+                Style::Plain,
+            )
+        };
+        let has_gauges = |text: &str| {
+            text.lines()
+                .any(|l| l.contains("  7d ") && l.contains('%') && l.contains('┤'))
+        };
+        for span in [Span::Week, Span::Recent] {
+            assert!(has_gauges(&at(span, 94)), "{span:?} at 94");
+            assert!(!has_gauges(&at(span, 93)), "{span:?} at 93");
+        }
+        // At 93 columns the week chart has 83 columns, enough for the whole
+        // range: both rollovers are on it.
+        let narrow = at(Span::Week, 93);
+        for axis in narrow.lines().filter(|l| l.contains('└')) {
+            assert_eq!(
+                axis.matches('┼').count(),
+                3,
+                "both rollovers and now: {narrow}"
+            );
+        }
+
+        let wide = at(Span::Week, 200);
+        let gauge_columns: Vec<usize> = wide
+            .lines()
+            .filter_map(|l| {
+                l.find("  7d ")
+                    .filter(|_| l.contains('┤'))
+                    .map(|b| l[..b].chars().count())
+            })
+            .collect();
+        assert_eq!(gauge_columns.len(), 2, "{wide}");
+        assert_eq!(gauge_columns[0], gauge_columns[1], "{wide}");
+        let axis_widths: Vec<usize> = wide
+            .lines()
+            .filter(|l| l.contains('└'))
+            .map(|l| l.chars().count())
+            .collect();
+        assert!(axis_widths.iter().all(|w| *w <= gauge_columns[0]), "{wide}");
     }
 
     /// Stale data and a failed or paused last pass are impossible to miss.

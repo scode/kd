@@ -471,7 +471,10 @@ Whether that is worth it depends on the week ahead, which only the user knows.
   bucket in progress is drawn white: a thick white bar is use in progress, the thin line alone means none yet. Buckets
   after now are blank. `--recent` has no markers.
 - To the right of each chart, gauges show the account's current weekly and 5-hour usage as bars with the percentage
-  spelled out, yellow from 80% and red from 95%; the chart narrows to make room for them.
+  spelled out, yellow from 80% and red from 95%; only an exhausted window draws a full bar. A reading whose window has
+  reset since it was taken shows as `?`. The gauges start in the same column for every account, and are left out when
+  the terminal is too narrow for them beside a whole week with its margins (below 94 columns), in both views; the
+  account's header line carries the same numbers. In the default view all accounts share one bucket width.
 - Consumption is derived from utilization snapshots. A weekly rollover or a pressed limit reset (utilization falling
   while the reset time stays) starts a new window rather than counting as negative use. A bucket's consumption is the
   difference of cumulative consumption at its two edges, each interpolated linearly between the last snapshot at or
