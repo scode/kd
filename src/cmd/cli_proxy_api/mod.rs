@@ -1,31 +1,38 @@
 //! `kd cli-proxy-api`: operate a CLIProxyAPI instance through its management
-//! API. Specified in SPEC.md (`## kd cli-proxy-api manage-priorities`) and
-//! SPEC_impl.md.
+//! API. Specified in SPEC.md (`## kd cli-proxy-api`) and SPEC_impl.md.
 //!
 //! CLIProxyAPI is the Claude subscription router `kd devbox bootstrap`
 //! installs. Its built-in routing strategies spread load but know nothing
-//! about when each account's quota expires; this command supplies that
-//! knowledge from outside, by rewriting account priorities.
+//! about when each account's quota expires; the monitor supplies that
+//! knowledge from outside, by rewriting account priorities, and is the only
+//! part of kd that writes them.
 
 pub mod api;
-pub mod manage_priorities;
+pub mod monitor;
 pub mod plan;
 
 use anyhow::Context;
 use clap::{Args, Subcommand};
-use std::ffi::OsString;
 use std::path::PathBuf;
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Order Claude accounts by weekly quota reset so expiring quota is used first
-    ManagePriorities(ManagePrioritiesArgs),
+    /// Keep Claude accounts ordered by weekly reset and record usage history
+    #[command(subcommand)]
+    Monitor(MonitorCommands),
 }
 
-/// Flags for `manage-priorities`. A bare invocation is a dry run against
-/// the local proxy, using the key file bootstrap writes.
+#[derive(Subcommand, Debug)]
+pub enum MonitorCommands {
+    /// Run the monitor loop in the foreground (what the systemd unit runs)
+    Run(RunArgs),
+}
+
+/// Flags for `monitor run`. The systemd unit passes none, so the defaults
+/// are what the daemon uses; the flags exist for running it by hand, for
+/// example against a proxy reached through an SSH tunnel.
 #[derive(Args, Debug)]
-pub struct ManagePrioritiesArgs {
+pub struct RunArgs {
     /// CLIProxyAPI root URL; plain http only to loopback (use an SSH tunnel)
     #[arg(long, default_value = "http://127.0.0.1:8317")]
     pub url: String,
@@ -35,56 +42,34 @@ pub struct ManagePrioritiesArgs {
     /// ~/.config/cliproxy/secrets.env]
     #[arg(long)]
     pub key_file: Option<PathBuf>,
-
-    /// Append the run record here [default:
-    /// $XDG_STATE_HOME/kd/cli-proxy-api-priorities.jsonl]
-    #[arg(long)]
-    pub log_file: Option<PathBuf>,
-
-    /// Write the planned priorities; without this nothing is changed
-    #[arg(long)]
-    pub apply: bool,
 }
 
-/// Resolve flags to concrete paths. `HOME` is only needed for a default
-/// path, so a service environment without it still works when both paths
-/// are given. Environment values are passed in so tests do not touch the
-/// process environment.
-fn settings(
-    args: ManagePrioritiesArgs,
-    home: Option<PathBuf>,
-    xdg_state_home: Option<OsString>,
-) -> anyhow::Result<manage_priorities::Settings> {
-    let home = || {
-        home.clone()
-            .context("HOME is not set; pass --key-file and --log-file")
-    };
-    let key_file = match args.key_file {
-        Some(path) => path,
-        None => manage_priorities::default_key_file(&home()?),
-    };
-    let log_file = match args.log_file {
-        Some(path) => path,
-        None => manage_priorities::default_log_file(xdg_state_home.as_deref(), &home()?),
-    };
-    Ok(manage_priorities::Settings {
+/// Resolve `monitor run` flags against the home directory. The log path is
+/// not a flag: the daemon and `overview` must always agree on it.
+fn run_settings(args: RunArgs, home: PathBuf) -> monitor::Settings {
+    monitor::Settings {
         url: args.url,
-        key_file,
-        log_file,
-        apply: args.apply,
-    })
+        key_file: args
+            .key_file
+            .unwrap_or_else(|| monitor::default_key_file(&home)),
+        log_file: monitor::log_file(&home),
+    }
+}
+
+/// The user's home directory. Every default path hangs off it; a systemd
+/// user unit always has `HOME`, so its absence is a broken environment.
+fn home() -> anyhow::Result<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+        .context("HOME is not set")
 }
 
 impl Commands {
     pub fn run(self) -> anyhow::Result<()> {
         match self {
-            Commands::ManagePriorities(args) => {
-                let settings = settings(
-                    args,
-                    std::env::var_os("HOME").map(PathBuf::from),
-                    std::env::var_os("XDG_STATE_HOME"),
-                )?;
-                manage_priorities::run(settings)
+            Commands::Monitor(MonitorCommands::Run(args)) => {
+                monitor::run(run_settings(args, home()?))
             }
         }
     }
@@ -94,30 +79,27 @@ impl Commands {
 mod tests {
     use super::*;
 
-    fn args(key_file: Option<&str>, log_file: Option<&str>) -> ManagePrioritiesArgs {
-        ManagePrioritiesArgs {
+    /// The key file defaults to where bootstrap writes it and can be
+    /// overridden; the log always lands at the fixed path under HOME.
+    #[test]
+    fn run_settings_resolve_against_home() {
+        let args = |key_file: Option<&str>| RunArgs {
             url: "http://127.0.0.1:8317".to_owned(),
             key_file: key_file.map(PathBuf::from),
-            log_file: log_file.map(PathBuf::from),
-            apply: false,
-        }
-    }
-
-    /// A timer or service unit may run without HOME; with both paths given
-    /// that must not matter, and without them the error says what to pass.
-    #[test]
-    fn home_is_only_needed_for_default_paths() {
-        let s = settings(args(Some("/k"), Some("/l")), None, None).unwrap();
-        assert_eq!(
-            (s.key_file, s.log_file),
-            (PathBuf::from("/k"), PathBuf::from("/l"))
-        );
-        let err = settings(args(Some("/k"), None), None, None).unwrap_err();
-        assert!(err.to_string().contains("pass --key-file and --log-file"));
-        let s = settings(args(None, None), Some(PathBuf::from("/home/me")), None).unwrap();
+        };
+        let home = PathBuf::from("/home/me");
+        let s = run_settings(args(None), home.clone());
         assert_eq!(
             s.key_file,
             PathBuf::from("/home/me/.config/cliproxy/secrets.env")
+        );
+        assert_eq!(
+            s.log_file,
+            PathBuf::from("/home/me/.local/state/kd/cli-proxy-api-monitor.jsonl")
+        );
+        assert_eq!(
+            run_settings(args(Some("/k")), home).key_file,
+            PathBuf::from("/k")
         );
     }
 }

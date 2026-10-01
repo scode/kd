@@ -116,10 +116,9 @@ kd cargo scode update --dry-run
 kd cargo scode install kd
 kd cargo scode uninstall kd
 
-# Show how CLIProxyAPI's Claude accounts would be reordered so the quota
-# that resets soonest is used first (dry run), then actually write it.
-kd cli-proxy-api manage-priorities
-kd cli-proxy-api manage-priorities --apply
+# Keep CLIProxyAPI's Claude accounts ordered so the quota that resets soonest
+# is used first, logging usage every 15 minutes (runs until killed).
+kd cli-proxy-api monitor run
 ```
 
 ## Development environments and stateful instances
@@ -197,15 +196,15 @@ be configured before running it. Other Git settings and repository-specific iden
 
 ## Command Notes
 
-`kd cli-proxy-api manage-priorities` talks to CLIProxyAPI's management API, by default at `http://127.0.0.1:8317` with
-the key from `~/.config/cliproxy/secrets.env` (where `kd devbox bootstrap` puts it). It gives the Claude account whose
-weekly quota resets soonest the highest priority, so quota about to expire is spent before quota that is not at risk. It
-changes nothing unless you pass `--apply`. Every run appends a JSON line to
-`$XDG_STATE_HOME/kd/cli-proxy-api-priorities.jsonl`, which is where to look for accounts CLIProxyAPI keeps in cooldown
-after Anthropic says their quota is back (`cooldown_outlives_reset`). From another machine, forward the port with SSH
-and pass `--key-file` with a file holding only the management key. If you run it on a timer, stop the timer when the key
-stops working: CLIProxyAPI bans an address from its management API for 30 minutes after five failed keys, which also
-locks out its web panel.
+`kd cli-proxy-api monitor run` talks to CLIProxyAPI's management API, by default at `http://127.0.0.1:8317` with the key
+from `~/.config/cliproxy/secrets.env` (where `kd devbox bootstrap` puts it). It gives the Claude account whose weekly
+quota resets soonest the highest priority, so quota about to expire is spent before quota that is not at risk, and
+re-checks every 15 minutes and shortly after each known window reset. Every wake appends a JSON line to
+`~/.local/state/kd/cli-proxy-api-monitor.jsonl`, which is also where to look for accounts CLIProxyAPI keeps in cooldown
+after Anthropic says their quota is back (`cooldown_outlives_reset`). If the management key is rejected, the monitor
+stops calling CLIProxyAPI until the key file changes, because CLIProxyAPI bans an address from its management API for 30
+minutes after five failed keys. From another machine, forward the port with SSH and pass `--key-file` with a file
+holding only the management key.
 
 Timezone setup keeps `/etc/localtime` and any existing `/etc/timezone` consistent with `America/Los_Angeles`. The probe
 checks them independently, along with systemd's timezone and any inherited `TZ` override; application and container
