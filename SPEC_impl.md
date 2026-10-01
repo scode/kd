@@ -112,6 +112,14 @@ before `loginctl enable-linger`, so a user who already lingers never meets a pol
 unit is written, so a linger failure leaves nothing installed. Every external command goes through an injected runner,
 so tests pin the exact `systemctl` and `loginctl` sequence without touching the host's systemd.
 
+`monitor restart` deliberately does less than `enable`: it never rewrites the unit, so a restart after an upgrade cannot
+repoint a working setup at whichever `kd` happened to run it. "Enabled" means systemd reports the unit enabled, not just
+that the file exists, so a monitor switched off by hand stays off. It runs `daemon-reload` before restarting so the unit
+file and what systemd runs agree; the "runs another binary" hint compares only the file's `ExecStart` line, in the exact
+form `enable` writes, so a drop-in override or a hand-reformatted line can make the hint wrong in either direction. Each
+restart forgets a rejected management key (the monitor keeps it in memory only) and spends one more strike toward
+CLIProxyAPI's ban if the key is still bad; restarts are rare enough that persisting the key was not worth it.
+
 The `burn` override is a file rather than state inside the daemon so that setting it needs no IPC and survives restarts.
 The monitor watches the file's directory with the `notify` crate rather than the file, because `burn` (and most editors)
 replace the file by renaming a new one over it, and a watch on the old inode never fires. Events for other names are

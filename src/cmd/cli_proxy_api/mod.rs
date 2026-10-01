@@ -62,6 +62,8 @@ pub enum MonitorCommands {
     Enable,
     /// Stop the monitor and remove its systemd user unit
     Disable,
+    /// Restart the enabled monitor, e.g. to pick up an upgraded kd binary
+    Restart,
 }
 
 /// Flags for `monitor run`. The systemd unit passes none, so the defaults
@@ -117,6 +119,16 @@ impl Commands {
             }
             Commands::Monitor(MonitorCommands::Disable) => {
                 print!("{}", service::disable(&service::System, &home()?)?);
+                Ok(())
+            }
+            Commands::Monitor(MonitorCommands::Restart) => {
+                // Only feeds the "unit runs another binary" note, so a
+                // binary that cannot be located does not stop the restart.
+                let exe = std::env::current_exe().and_then(|p| p.canonicalize()).ok();
+                print!(
+                    "{}",
+                    service::restart(&service::System, &home()?, exe.as_deref())?
+                );
                 Ok(())
             }
             Commands::Burn(args) => {
