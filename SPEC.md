@@ -468,8 +468,8 @@ Whether that is worth it depends on the week ahead, which only the user knows.
   tick on the axis and, on a line of their own below the dates, a label whose marker glyph sits in the same column. A
   label is shortened when it would run into the next marker. When now shares a column with a rollover, the rollover's
   line is drawn and the labels are joined. Markers are drawn only where the chart is empty, so no bar is hidden. The
-  bucket in progress is drawn white: a thick white bar is use in progress, the thin line alone means none yet. Buckets
-  after now are blank. `--recent` has no markers.
+  bucket in progress is drawn white: a thick white bar is use in progress, the thin line on the dotted baseline means
+  none yet. Buckets after now are blank. `--recent` has no markers.
 - To the right of each chart, gauges show the account's current weekly and 5-hour usage as bars with the percentage
   spelled out, yellow from 80% and red from 95%; only an exhausted window draws a full bar. A reading whose window has
   reset since it was taken shows as `?`. The gauges start in the same column for every account, and are left out when
@@ -480,9 +480,10 @@ Whether that is worth it depends on the week ahead, which only the user knows.
   difference of cumulative consumption at its two edges, each interpolated linearly between the last snapshot at or
   before the edge and the first after it, so a snapshot falling just inside or outside a bucket shifts it only
   proportionally. A bucket with an edge before the history starts, or inside a gap of more than 40 minutes between
-  snapshots (the monitor was down), is shown as unknown (`·`). After the last snapshot, while it is under 30 minutes
-  old, nothing new has been observed, so the bucket in progress shows the consumption seen so far. Consumption between
-  the last snapshot of a week and its reset is not observed.
+  snapshots (the monitor was down), has no data and is left blank, while observed buckets sit on a dotted baseline (`·`)
+  where too little was used to draw a bar. After the last snapshot, while it is under 30 minutes old, nothing new has
+  been observed, so the bucket in progress shows the consumption seen so far. Consumption between the last snapshot of a
+  week and its reset is not observed.
 - Both the usage lookups (whole percents) and CLIProxyAPI's quota signals (two decimals, refreshed only when the account
   serves traffic) feed the chart.
 - Only the last eight days of the log are read.

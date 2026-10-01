@@ -284,13 +284,15 @@ fn value_at(series: &[(Timestamp, f64)], t: Timestamp, now: Timestamp) -> Option
     let after = series.partition_point(|(at, _)| *at <= t);
     let (t0, v0) = *series.get(after.checked_sub(1)?)?;
     match series.get(after) {
+        // A reading taken exactly at `t` is known, whatever gap follows.
+        _ if t == t0 => Some(v0),
         Some(&(t1, _)) if t0.duration_until(t1) > MAX_GAP => None,
         Some(&(t1, v1)) => {
             let span = t0.duration_until(t1).as_secs_f64();
             let into = t0.duration_until(t).as_secs_f64();
             Some(v0 + (v1 - v0) * into / span)
         }
-        None if t == t0 || t0.duration_until(now) <= STALE_AFTER => Some(v0),
+        None if t0.duration_until(now) <= STALE_AFTER => Some(v0),
         None => None,
     }
 }
@@ -327,10 +329,11 @@ fn edges(span: Span, count: usize, now: Timestamp, tz: &TimeZone) -> Vec<Timesta
 /// What one bucket of the chart shows.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Bucket {
-    /// Weekly quota used during the bucket, in percent.
+    /// Weekly quota used during the bucket, in percent. A bucket whose use
+    /// is too small to draw shows the dotted baseline.
     Used(f64),
     /// In the past, but not observed: before the history starts, or while
-    /// the monitor was down. Drawn as a dot.
+    /// the monitor was down. Left blank, like the future: there is no data.
     Unknown,
     /// Starts after now; left blank.
     Future,
@@ -504,7 +507,8 @@ pub fn render(
             .windows(2)
             .zip(values.windows(2))
             .map(|(e, v)| match (v[0], v[1]) {
-                _ if e[0] >= now => Bucket::Future,
+                // A bucket starting exactly now is the one in progress.
+                _ if e[0] > now => Bucket::Future,
                 (Some(a), Some(b)) => Bucket::Used((b - a).max(0.0)),
                 _ => Bucket::Unknown,
             })
@@ -905,7 +909,9 @@ fn paint_row(cells: &[(char, Option<&str>)], style: Style) -> String {
 /// (and, for the recent view, hour) marks below, markers drawn as vertical
 /// lines through the empty parts of the chart and labelled under the axis,
 /// and `side` (the current usage gauges) to the right of its top rows.
-/// Unknown past buckets show as a dot; future buckets stay blank.
+/// Observed buckets sit on a dotted baseline, so idle time reads as "0%
+/// here" rather than as missing; buckets without data (before the history,
+/// while the monitor was down, or in the future) stay blank.
 fn chart(
     out: &mut String,
     plot: &Plot<'_>,
@@ -948,15 +954,17 @@ fn chart(
         let mut cells: Vec<(char, Option<&str>)> = Vec::with_capacity(width);
         for (i, bucket) in plot.used.iter().enumerate() {
             // The bucket in progress is drawn white, like the now marker in
-            // it: a thin white line alone means nothing used yet, a thick
-            // white bar means use in progress.
+            // it: a thin white line on the dotted baseline means nothing used
+            // yet, a thick white bar means use in progress.
             let color = if Some(i) == now_bucket { WHITE } else { color };
             let glyph = match bucket {
                 Bucket::Used(v) => {
                     let level = ((v / scale) * (ROWS * 8) as f64).round() as usize;
-                    LEVELS[level.saturating_sub((ROWS - 1 - row) * 8).min(8)]
+                    match level.saturating_sub((ROWS - 1 - row) * 8).min(8) {
+                        0 if row == ROWS - 1 => '·',
+                        filled => LEVELS[filled],
+                    }
                 }
-                Bucket::Unknown if row == ROWS - 1 => '·',
                 Bucket::Unknown | Bucket::Future => ' ',
             };
             cells.extend(std::iter::repeat_n((glyph, Some(color)), plot.cell));
@@ -1343,7 +1351,7 @@ mod tests {
                 format!("{}       7d ▓▓▓░░░░░░░░░░░░░░░░░  16%", row("8.0%", " ")),
                 format!("{}       5h ▓░░░░░░░░░░░░░░░░░░░   5%", row("", " ")),
                 row("", " "),
-                row("0%", "·"),
+                row("0%", " "),
                 "    /4h └──┬───┼───────┬───────────┬─┼─────────┬─────────┼─────".to_owned(),
                 "           Sun 27      Tue 29      Thu 01      Sat 03".to_owned(),
                 "               │ rollover Sun 16:00  │ now               │ rollover Sun 04 16:00"
@@ -1371,6 +1379,49 @@ mod tests {
         assert!(text.contains("  usage lookup failed (no priorities are written until fixed): usage endpoint returned HTTP 401: token revoked\n  no usage history yet\n"), "{text}");
         assert!(text.contains("disabled: off@example.com"));
         assert!(!text.contains('\x1b'), "plain output has no escapes");
+    }
+
+    /// Observed idle time sits on a dotted 0% baseline, while time without
+    /// data (before the history starts) is blank, so a gap between bursts
+    /// of use never reads as missing data and missing data never reads as
+    /// idle.
+    #[test]
+    fn idle_time_has_a_baseline_and_missing_data_does_not() {
+        let mut records = Vec::new();
+        let start = ts("2026-10-01T00:00:00Z");
+        for i in 0..=16 {
+            // Two hours of use, then idle, with the monitor down from 02:15
+            // to 03:30 (no readings in between, a gap over 40 minutes).
+            if (10..=13).contains(&i) {
+                continue;
+            }
+            let used = if i <= 8 { i as f64 } else { 8.0 };
+            records.push(json!({
+                "v": 1, "time": (start + SignedDuration::from_mins(15 * i)).to_string(),
+                "accounts": [{"email": "a@example.com", "managed": true, "provider": "claude",
+                    "seven_day": {"utilization": used, "resets_at": WEEK1}, "five_hour": null}],
+            }));
+        }
+        let text = render(
+            &records,
+            &Ok(None),
+            Span::Recent,
+            ts("2026-10-01T04:00:00Z"),
+            &TimeZone::UTC,
+            40,
+            Style::Plain,
+        );
+        let baseline = text.lines().find(|l| l.starts_with("     0% ┤")).unwrap();
+        let cells: String = baseline.chars().skip(9).collect();
+        // 30 buckets ending with the one in progress, which starts exactly
+        // now: 13 before the history (blank), 8 with use (bars), one idle
+        // bucket observed at both ends (dot), 5 inside the outage (blank),
+        // and 3 idle again (dots, including the one in progress).
+        assert_eq!(
+            cells,
+            format!("{}{}·{}···", " ".repeat(13), "█".repeat(8), " ".repeat(5)),
+            "{text}"
+        );
     }
 
     /// The bucket in progress is drawn white, so a thick white bar means use
