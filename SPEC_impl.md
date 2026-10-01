@@ -51,7 +51,7 @@ A GraphQL response with `errors` makes `gh api graphql` exit non-zero even when 
 `NOT_FOUND`s (a PR that became inaccessible after the search). The transport therefore hands on any JSON body regardless
 of exit status, and `query_data` tolerates `NOT_FOUND` while failing on any other error.
 
-## kd cli-proxy-api manage-priorities
+## kd cli-proxy-api
 
 Why strict priority by weekly reset, rather than weights: using the soonest-expiring quota first never wastes more than
 any other order, and CLIProxyAPI's cooldown-plus-failover already handles an account hitting its 5-hour or weekly limit.
@@ -64,12 +64,13 @@ API surface, all under `/v0/management` with `Authorization: Bearer <management 
 
 - `GET /auth-files` lists credentials with `name`, `auth_index`, `provider`, `priority`, `disabled`, `unavailable`,
   `cooldowns[{scope, model_key, reason, retry_at, http_status}]` (`null` in CLIProxyAPI's home mode),
-  `next_retry_after`, and `recent_requests`. Cooldowns have scope `credential` or `model`. Quota cooldowns carry reason
-  `quota` or `credential_quota` (a 429 always maps to one of those); other reasons come from errors, such as a 12-hour
-  per-model cooldown after an unsupported model, and are ignored by the flags. Per-model quota cooldowns are kept on
-  purpose, because #5770 was reported per model. The disk-only listing CLIProxyAPI serves when its auth manager is
-  unavailable has no `provider`, and kd treats it as a parse error rather than an empty pool. A missing `priority` is
-  CLIProxyAPI's 0; higher wins (`highestPriorityAuths`).
+  `next_retry_after`, `recent_requests`, and `quota` (`observed_at` plus `signals`, the `Anthropic-Ratelimit-Unified-*`
+  headers CLIProxyAPI last saw on a response for the account, with two-decimal utilization fractions). Cooldowns have
+  scope `credential` or `model`. Quota cooldowns carry reason `quota` or `credential_quota` (a 429 always maps to one of
+  those); other reasons come from errors, such as a 12-hour per-model cooldown after an unsupported model, and are
+  ignored by the flags. Per-model quota cooldowns are kept on purpose, because #5770 was reported per model. The
+  disk-only listing CLIProxyAPI serves when its auth manager is unavailable has no `provider`, and kd treats it as a
+  parse error rather than an empty pool. A missing `priority` is CLIProxyAPI's 0; higher wins (`highestPriorityAuths`).
 - `POST /api-call` with
   `{auth_index, method: GET, url: https://api.anthropic.com/api/oauth/usage, header:
   {Authorization: "Bearer $TOKEN$", anthropic-beta: oauth-2025-04-20}}`
@@ -90,7 +91,7 @@ The fail-safe rule (any failed lookup means no writes) trades stale priorities f
 the error names the failing accounts because one dead login freezes the pool until someone acts. Verification after
 writing is a cheap end-to-end check that the value the proxy reports is the one written; it cannot detect the
 persistence failure CLIProxyAPI swallows, which would surface as a reordered pool after a restart and be fixed by the
-next run. The `cooldown_outlives_reset` flag targets upstream issue #5770 (Claude accounts kept in a days-long cooldown
+next pass. The `cooldown_outlives_reset` flag targets upstream issue #5770 (Claude accounts kept in a days-long cooldown
 after quota recovery until a restart); it compares the latest quota-cooldown retry time with the moment Anthropic says
 the quota is back, plus 15 minutes of margin so a cooldown ending around the reset is not reported. "Back" is the reset
 of the last exhausted window (a spent 5-hour window is back at its 5-hour reset even while the week runs on, which is
@@ -106,10 +107,24 @@ bodies, because CLIProxyAPI explains its refusals there: a bad `auth_index`, an 
 the caller's address after repeated bad keys all look alike by status code. Base URLs are parsed as URIs and any
 userinfo is refused, because naive string splitting treats `http://localhost:8317@elsewhere/` as loopback.
 
-Testing: planning, flags, and parsing are pure functions tested with literal data shaped like live v7.3.17 responses.
-The orchestration runs against an in-memory fake for every failure path, and the real HTTP client runs against a
-loopback stub server that records method, path, auth header and body, pinning the wire format. Live testing against a
-real proxy uses dry runs only; `--apply` against a live proxy is an operator action.
+The monitor is a plain foreground loop rather than a timer-driven one-shot so that it can wake right after a window
+reset and, later, react to a changed config file without a scheduler in between. Its one piece of cross-wake state is
+the last key the management API rejected, held in memory only. The key file is re-read on every wake instead of being
+watched: a directory event would fire for unrelated files in `~/.config/cliproxy` and for a rewrite with the same bad
+key, and each resulting retry would count toward CLIProxyAPI's five-strike ban. The cost is up to one interval before a
+fixed key is used. Only a typed management-level 401 pauses the loop; an upstream 401 from Anthropic arrives inside a
+200 `api-call` response and means a dead account login, which the fail-safe rule already handles. A failed pass never
+exits the process, because under systemd an exit only restarts it and replays the same failing requests.
+
+`quota.signals` are logged verbatim and never parsed by the monitor, so a change in their shape cannot fail a pass or
+affect planning; `overview` does all interpretation. They are worth logging because the usage endpoint reports whole
+percents, which is too coarse for 15-minute buckets, while the signals carry two decimals. They only refresh while an
+account serves traffic, which is exactly when fine resolution matters.
+
+Testing: planning, flags, parsing, and the wake rule are pure functions tested with literal data shaped like live
+v7.3.17 responses. The orchestration runs against an in-memory fake for every failure path, including the 401 pause, and
+the real HTTP client runs against a loopback stub server that records method, path, auth header and body, pinning the
+wire format.
 
 ## kd devbox
 

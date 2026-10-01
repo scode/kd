@@ -168,23 +168,31 @@ mod tests {
         assert!(!parses(&["kd", "gh", "pr", "list", "--mine"]));
     }
 
-    /// The command name is part of the user contract (SPEC.md); clap
-    /// derives it from the variant name, so pin it here.
+    /// The command names are part of the user contract (SPEC.md); clap
+    /// derives them from variant names, so pin them here. The removed
+    /// `manage-priorities` must stay gone: the monitor is the only writer.
     #[test]
-    fn cli_proxy_api_manage_priorities_parses() {
-        assert!(parses(&["kd", "cli-proxy-api", "manage-priorities"]));
+    fn cli_proxy_api_monitor_parses() {
+        assert!(parses(&["kd", "cli-proxy-api", "monitor", "run"]));
         assert!(parses(&[
             "kd",
             "cli-proxy-api",
-            "manage-priorities",
-            "--apply",
+            "monitor",
+            "run",
             "--url",
             "http://127.0.0.1:18317",
             "--key-file",
             "/tmp/k",
-            "--log-file",
-            "/tmp/l",
         ]));
+        assert!(!parses(&[
+            "kd",
+            "cli-proxy-api",
+            "monitor",
+            "run",
+            "--log-file",
+            "/tmp/l"
+        ]));
+        assert!(!parses(&["kd", "cli-proxy-api", "manage-priorities"]));
     }
 
     #[test]

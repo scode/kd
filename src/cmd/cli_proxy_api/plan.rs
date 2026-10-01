@@ -12,6 +12,7 @@
 //! Plan sizes do not matter under this rule, which is why none are asked for.
 
 use jiff::Timestamp;
+use serde_json::Value;
 
 /// Distance between adjacent priority tiers when kd renumbers. CLIProxyAPI
 /// only compares priorities, so the spacing carries no meaning; it just
@@ -48,6 +49,14 @@ pub struct Account {
     /// the log to see whether a top-priority account is actually serving.
     pub recent_success: u64,
     pub recent_failed: u64,
+    /// CLIProxyAPI's `quota` object, verbatim: `observed_at` plus the
+    /// Anthropic rate-limit headers (`signals`) it last saw on a response for
+    /// this account. They carry the same 5-hour and weekly utilization as the
+    /// usage lookup, with two decimals instead of whole percents, but only
+    /// refresh while the account serves traffic. Planning never reads them;
+    /// they are logged for `overview`, which does all interpretation, so an
+    /// upstream change in their shape cannot break a monitor pass.
+    pub quota: Option<Value>,
 }
 
 /// One active cooldown from `GET /auth-files`.
@@ -355,6 +364,7 @@ mod tests {
             cooldowns: Vec::new(),
             recent_success: 0,
             recent_failed: 0,
+            quota: None,
         }
     }
 

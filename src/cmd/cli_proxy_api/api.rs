@@ -1,5 +1,5 @@
-//! CLIProxyAPI management API access: the three calls `manage-priorities`
-//! needs, and parsing of their responses.
+//! CLIProxyAPI management API access: the three calls `monitor run` needs,
+//! and parsing of their responses.
 //!
 //! Everything goes through the management API (`/v0/management`), the same
 //! interface CLIProxyAPI's own web panel uses. Nothing here reads
@@ -30,7 +30,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;
 
-/// One request should never hang a periodic run. The usage lookup is the
+/// One request should never hang a monitor pass. The usage lookup is the
 /// slowest call: it normally takes well under a second, but CLIProxyAPI
 /// waits up to 60 seconds on Anthropic, so kd waits a little longer and gets
 /// CLIProxyAPI's own error instead of timing out first.
@@ -127,6 +127,37 @@ impl Client {
     }
 }
 
+/// A non-2xx answer from the management API itself, as opposed to an
+/// upstream status wrapped inside an `api-call` response.
+///
+/// It is a type rather than just a message because the monitor must tell a
+/// rejected management key (401 here) apart from every other failure: a key
+/// rejection means "stop calling until the key changes", because CLIProxyAPI
+/// bans the caller's address after five of them. An upstream 401 from
+/// Anthropic (a dead account login) arrives as a 200 `api-call` response and
+/// never becomes a `StatusError`.
+#[derive(Debug)]
+pub struct StatusError {
+    pub status: u16,
+    message: String,
+}
+
+impl std::fmt::Display for StatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StatusError {}
+
+/// Whether `err` is, or wraps, the management API rejecting the key.
+pub fn is_key_rejection(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| {
+        e.downcast_ref::<StatusError>()
+            .is_some_and(|s| s.status == 401)
+    })
+}
+
 /// Read a response body and turn a non-2xx status into an error that names
 /// the operation, adds a hint for the statuses a user can act on, and
 /// quotes the start of CLIProxyAPI's explanation. Request headers are never
@@ -148,10 +179,10 @@ fn finish(
     Ok(body)
 }
 
-fn status_error(context: &str, status: u16, body: &str) -> anyhow::Error {
+pub(super) fn status_error(context: &str, status: u16, body: &str) -> anyhow::Error {
     let hint = match status {
         401 => {
-            " (the management key was rejected; check --key-file, and stop any periodic run until it is fixed: five failures ban the caller's address from the management API for 30 minutes)"
+            " (the management key was rejected; fix the key file: five failures ban the caller's address from the management API for 30 minutes, so the monitor stops calling until the key changes)"
         }
         403 => {
             " (CLIProxyAPI refused the caller: remote management is off for non-loopback clients, or this address is banned for 30 minutes after repeated bad keys)"
@@ -168,11 +199,12 @@ fn status_error(context: &str, status: u16, body: &str) -> anyhow::Error {
         .chars()
         .take(200)
         .collect();
-    if detail.is_empty() {
-        anyhow!("{context}: HTTP {status}{hint}")
+    let message = if detail.is_empty() {
+        format!("{context}: HTTP {status}{hint}")
     } else {
-        anyhow!("{context}: HTTP {status}{hint}: {detail}")
-    }
+        format!("{context}: HTTP {status}{hint}: {detail}")
+    };
+    anyhow::Error::new(StatusError { status, message })
 }
 
 /// Reject a base URL that would send the management key in the clear to
@@ -232,6 +264,9 @@ struct RawAccount {
     cooldowns: Option<Vec<RawCooldown>>,
     #[serde(default)]
     recent_requests: Option<Vec<RawBucket>>,
+    /// Kept as raw JSON: see [`Account::quota`].
+    #[serde(default)]
+    quota: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -263,7 +298,7 @@ struct RawAccounts {
 
 /// Parse a `GET /auth-files` body.
 ///
-/// Timestamps that fail to parse become `None` rather than failing the run:
+/// Timestamps that fail to parse become `None` rather than failing the pass:
 /// they only feed flags and the log, never the plan. Go's zero time
 /// (`0001-01-01T00:00:00Z`) parses fine and is always in the past, so it
 /// never counts as an active block.
@@ -299,6 +334,7 @@ pub fn parse_accounts(body: &str) -> anyhow::Result<Vec<Account>> {
                     .collect(),
                 recent_success: buckets.iter().map(|b| b.success).sum(),
                 recent_failed: buckets.iter().map(|b| b.failed).sum(),
+                quota: a.quota.filter(|q| !q.is_null()),
             }
         })
         .collect())
@@ -436,9 +472,11 @@ mod tests {
             Some("2026-10-13T07:00:00Z".parse().unwrap())
         );
         assert!(b.next_retry_after.is_some());
+        assert_eq!(a.quota, Some(json!({"signals": {}})), "quota is kept raw");
+        assert_eq!(b.quota, None);
     }
 
-    /// A malformed listing must fail the run rather than look like an empty
+    /// A malformed listing must fail the pass rather than look like an empty
     /// pool, which would silently plan nothing. That includes CLIProxyAPI's
     /// reduced disk-only listing, whose entries carry no provider.
     #[test]
@@ -467,6 +505,21 @@ mod tests {
         let err = status_error("x", 500, &"y".repeat(1000)).to_string();
         assert!(err.len() < 300, "body is truncated: {}", err.len());
         assert_eq!(status_error("x", 502, "  ").to_string(), "x: HTTP 502");
+    }
+
+    /// The monitor pauses only on a management-level 401, so the check must
+    /// see through added context and must not fire on other statuses or on
+    /// plain errors that merely mention 401 (an upstream usage failure).
+    #[test]
+    fn key_rejection_is_recognised_by_type() {
+        let rejected = status_error("listing auth files", 401, "{}");
+        assert!(rejected.to_string().contains("management key was rejected"));
+        assert!(is_key_rejection(&rejected));
+        assert!(is_key_rejection(&rejected.context("re-reading")));
+        assert!(!is_key_rejection(&status_error("x", 403, "")));
+        assert!(!is_key_rejection(&anyhow!(
+            "usage endpoint returned HTTP 401: token expired"
+        )));
     }
 
     fn call(status: u16, body: &str) -> String {
