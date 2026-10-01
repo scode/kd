@@ -54,6 +54,20 @@ const RESET_DROP: f64 = 2.0;
 /// does not draw sampling noise as full-height bars.
 const MIN_SCALE: f64 = 1.0;
 
+/// Margin shown before a weekly window's start and after its end, an eighth
+/// of a week, so both rollovers sit visibly inside the chart.
+const WINDOW_MARGIN: SignedDuration = SignedDuration::from_hours(21);
+
+/// The weekly window's length.
+const WEEK: SignedDuration = SignedDuration::from_hours(7 * 24);
+
+/// Rollover marker: the moment a weekly window resets.
+const ROLLOVER: char = '│';
+
+/// "Now" marker: thin, so a thick white bar in the same bucket reads as
+/// use in progress rather than as the marker.
+const NOW: char = '│';
+
 /// Chart height in rows; each row resolves eight levels.
 const ROWS: usize = 4;
 
@@ -71,7 +85,9 @@ const GAUGE_WIDTH: usize = 2 + 2 + 1 + GAUGE_BAR + 1 + 4;
 /// Which time span to chart.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Span {
-    /// The last 7 days in 4-hour buckets, trimmed to the terminal width.
+    /// Each account's current weekly window in 4-hour buckets, from the
+    /// rollover that started it to the one that ends it, with an eighth of
+    /// a week of margin on either side (1.25 weeks in all).
     Week,
     /// As many 15-minute buckets as fit the terminal width.
     Recent,
@@ -100,6 +116,11 @@ const YELLOW: &str = "\x1b[33m";
 /// blue that stays readable on both light and dark backgrounds.
 const BLUE: &str = "\x1b[1;34m";
 const MAGENTA: &str = "\x1b[35m";
+/// Rollover markers: a soft blue-violet that sets the week's boundaries
+/// apart from the bars without competing with the warning colors.
+const PERIWINKLE: &str = "\x1b[38;5;147m";
+/// The present: the now marker and the bars of the bucket in progress.
+const WHITE: &str = "\x1b[97m";
 const RESET: &str = "\x1b[0m";
 
 impl Style {
@@ -263,7 +284,8 @@ fn value_at(series: &[(Timestamp, f64)], t: Timestamp, now: Timestamp) -> Option
     }
 }
 
-/// Bucket edges for `count` buckets ending with the one containing `now`.
+/// Bucket edges for `count` buckets ending with the one containing `now`
+/// (or, for the window view, the window's far end).
 /// Buckets are aligned to whole multiples of their length in local clock
 /// time (4-hour buckets start at midnight, 04:00, ...), so the same bucket
 /// covers the same hours on every run. Edges are stepped on the local
@@ -289,6 +311,105 @@ fn edges(span: Span, count: usize, now: Timestamp, tz: &TimeZone) -> Vec<Timesta
                 .expect("bucket edges are within jiff's range")
         })
         .collect()
+}
+
+/// What one bucket of the chart shows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Bucket {
+    /// Weekly quota used during the bucket, in percent.
+    Used(f64),
+    /// In the past, but not observed: before the history starts, or while
+    /// the monitor was down. Drawn as a dot.
+    Unknown,
+    /// Starts after now; left blank.
+    Future,
+}
+
+/// A vertical line through the chart at one moment, with a label under
+/// the axis.
+struct Marker {
+    at: Timestamp,
+    glyph: char,
+    color: &'static str,
+    /// The label, longest form first; the first that fits is used.
+    labels: Vec<String>,
+}
+
+/// The time range one account's chart covers, and the markers in it. For
+/// the default view it is the account's current weekly window plus a margin
+/// on each side, with both rollovers marked, so a glance shows how far into
+/// its week the account is and how the week's use was spread. A window
+/// that has not started, or whose reset is already past (the accounts come
+/// from an older pass while the monitor is paused), has no current
+/// rollovers to show; the last week plus the margin ahead is shown instead.
+/// The recent view ends with the bucket in progress and has no markers.
+///
+/// When the terminal cannot fit the whole range, it is cut to `columns`
+/// buckets that still contain now: the end of the window if now is within
+/// reach of it, otherwise a stretch ending a quarter of the width after
+/// now, so the present and the use leading up to it stay visible.
+fn chart_range(
+    span: Span,
+    account: &Value,
+    now: Timestamp,
+    columns: usize,
+    tz: &TimeZone,
+) -> (Vec<Timestamp>, Vec<Marker>) {
+    if span == Span::Recent {
+        return (edges(span, columns, now, tz), Vec::new());
+    }
+    let reset: Option<Timestamp> = account["seven_day"]["resets_at"]
+        .as_str()
+        .and_then(|t| t.parse().ok())
+        .filter(|end| *end > now);
+    let (from, to, mut markers) = match reset {
+        Some(end) => {
+            let start = end - WEEK;
+            let rollover = |at: Timestamp| Marker {
+                at,
+                glyph: ROLLOVER,
+                color: PERIWINKLE,
+                labels: vec![
+                    format!("rollover {}", local(at, tz, "%a %d %H:%M")),
+                    format!("rollover {}", local(at, tz, "%a %H:%M")),
+                    local(at, tz, "%a %d %H:%M"),
+                    local(at, tz, "%a %H:%M"),
+                ],
+            };
+            (
+                start - WINDOW_MARGIN,
+                end + WINDOW_MARGIN,
+                vec![rollover(start), rollover(end)],
+            )
+        }
+        None => (now - WEEK, now + WINDOW_MARGIN * 2, Vec::new()),
+    };
+    markers.push(Marker {
+        at: now,
+        glyph: NOW,
+        color: WHITE,
+        labels: vec!["now".to_owned()],
+    });
+    let bucket = span.bucket();
+    let room = bucket * columns as i32;
+    let (from, to) = if from.duration_until(to) <= room {
+        (from, to)
+    } else if to - room <= now {
+        (to - room, to)
+    } else {
+        let end = (now + bucket * (columns as i32 / 4).max(1)).max(from + room);
+        (end - room, end)
+    };
+    // Enough buckets ending with the one containing `to` to reach back to
+    // `from`, then the ones that start too early dropped, so the margins
+    // come out as close to their nominal size as the bucket grid allows.
+    let count =
+        (from.duration_until(to).as_secs() as u64).div_ceil(bucket.as_secs() as u64) as usize + 1;
+    let mut edges = edges(span, count, to, tz);
+    while edges.len() > 2 && (edges[1] <= from || edges.len() - 1 > columns) {
+        edges.remove(0);
+    }
+    (edges, markers)
 }
 
 // ---------------------------------------------------------------------------
@@ -331,13 +452,6 @@ pub fn render(
     }
 
     let columns = width.saturating_sub(MARGIN + 1 + GAUGE_WIDTH).max(1);
-    let (count, cell) = match span {
-        // A week is 42 buckets; widen them when the terminal has room,
-        // trim the oldest when it does not.
-        Span::Week => (42.min(columns), (columns / 42).clamp(1, 3)),
-        Span::Recent => (columns, 1),
-    };
-    let edges = edges(span, count, now, tz);
 
     let accounts = seen["accounts"]
         .as_array()
@@ -360,19 +474,33 @@ pub fn render(
             out.push_str("  no usage history yet\n");
             continue;
         }
+        let (edges, markers) = chart_range(span, account, now, columns, tz);
+        // Widen the buckets when the terminal has room for it.
+        let cell = (columns / (edges.len() - 1)).clamp(1, 3);
         let values: Vec<Option<f64>> = edges.iter().map(|e| value_at(&series, *e, now)).collect();
-        let used: Vec<Option<f64>> = values
+        let used: Vec<Bucket> = edges
             .windows(2)
-            .map(|w| Some((w[1]? - w[0]?).max(0.0)))
+            .zip(values.windows(2))
+            .map(|(e, v)| match (v[0], v[1]) {
+                _ if e[0] >= now => Bucket::Future,
+                (Some(a), Some(b)) => Bucket::Used((b - a).max(0.0)),
+                _ => Bucket::Unknown,
+            })
             .collect();
         let color = if is_burned { MAGENTA } else { BLUE };
         let gauges = [
             gauge("7d", account["seven_day"]["utilization"].as_f64(), style),
             gauge("5h", account["five_hour"]["utilization"].as_f64(), style),
         ];
-        chart(
-            &mut out, &used, &edges, span, cell, &gauges, tz, style, color,
-        );
+        let plot = Plot {
+            used: &used,
+            edges: &edges,
+            markers: &markers,
+            span,
+            cell,
+            now,
+        };
+        chart(&mut out, &plot, &gauges, tz, style, color);
     }
     let disabled: Vec<&str> = accounts
         .iter()
@@ -535,31 +663,90 @@ fn gauge(label: &str, used: Option<f64>, style: Style) -> String {
     format!("{label} {}", style.paint(color, &text))
 }
 
-/// A bar chart of per-bucket consumption with a scale on the left, day
-/// (and, for the recent view, hour) marks below, and `side` (the current
-/// usage gauges) to the right of its top rows. Unknown buckets, before the
-/// history starts or while the monitor was down, show as a dot.
-#[allow(clippy::too_many_arguments)]
-fn chart(
-    out: &mut String,
-    used: &[Option<f64>],
-    edges: &[Timestamp],
+/// One account's chart data: per-bucket use, the bucket edges (one more
+/// than the buckets), markers, and the columns per bucket.
+struct Plot<'a> {
+    used: &'a [Bucket],
+    edges: &'a [Timestamp],
+    markers: &'a [Marker],
     span: Span,
     cell: usize,
+    now: Timestamp,
+}
+
+impl Plot<'_> {
+    /// The chart column a moment falls in, proportionally inside its
+    /// bucket, or `None` outside the chart.
+    fn column(&self, at: Timestamp) -> Option<usize> {
+        let i = self.edges.partition_point(|e| *e <= at).checked_sub(1)?;
+        let (start, end) = (*self.edges.get(i)?, *self.edges.get(i + 1)?);
+        let into = start.duration_until(at).as_secs_f64() / start.duration_until(end).as_secs_f64();
+        Some(i * self.cell + ((into * self.cell as f64) as usize).min(self.cell - 1))
+    }
+}
+
+/// A row of characters, each with an optional color, painted as runs.
+fn paint_row(cells: &[(char, Option<&str>)], style: Style) -> String {
+    let mut out = String::new();
+    let mut run = String::new();
+    let mut run_color: Option<&str> = None;
+    let flush = |run: &mut String, color: Option<&str>, out: &mut String| {
+        if !run.is_empty() {
+            match color {
+                Some(c) => out.push_str(&style.paint(c, run)),
+                None => out.push_str(run),
+            }
+            run.clear();
+        }
+    };
+    for &(c, color) in cells {
+        if color != run_color {
+            flush(&mut run, run_color, &mut out);
+            run_color = color;
+        }
+        run.push(c);
+    }
+    flush(&mut run, run_color, &mut out);
+    out
+}
+
+/// A bar chart of per-bucket consumption with a scale on the left, day
+/// (and, for the recent view, hour) marks below, markers drawn as vertical
+/// lines through the empty parts of the chart and labelled under the axis,
+/// and `side` (the current usage gauges) to the right of its top rows.
+/// Unknown past buckets show as a dot; future buckets stay blank.
+fn chart(
+    out: &mut String,
+    plot: &Plot<'_>,
     side: &[String],
     tz: &TimeZone,
     style: Style,
-    color: &str,
+    color: &'static str,
 ) {
     const LEVELS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let scale = used.iter().flatten().fold(MIN_SCALE, |m, v| m.max(*v));
-    let unit = match span {
+    let scale = plot
+        .used
+        .iter()
+        .filter_map(|b| match b {
+            Bucket::Used(v) => Some(*v),
+            _ => None,
+        })
+        .fold(MIN_SCALE, f64::max);
+    let unit = match plot.span {
         Span::Week => "4h",
         Span::Recent => "15m",
     };
-    let levels: Vec<Option<usize>> = used
+    let width = plot.used.len() * plot.cell;
+    // Only the default view marks the present; `--recent` always ends at
+    // now anyway.
+    let now_bucket = (plot.span == Span::Week)
+        .then(|| plot.column(plot.now))
+        .flatten()
+        .map(|column| column / plot.cell);
+    let marks: Vec<(usize, &Marker)> = plot
+        .markers
         .iter()
-        .map(|v| v.map(|v| ((v / scale) * (ROWS * 8) as f64).round() as usize))
+        .filter_map(|m| Some((plot.column(m.at)?, m)))
         .collect();
     for row in 0..ROWS {
         let label = match row {
@@ -567,35 +754,52 @@ fn chart(
             r if r == ROWS - 1 => "0%".to_owned(),
             _ => String::new(),
         };
-        let mut bars = String::new();
-        for level in &levels {
-            let glyph = match level {
-                Some(level) => LEVELS[level.saturating_sub((ROWS - 1 - row) * 8).min(8)],
-                None if row == ROWS - 1 => '·',
-                None => ' ',
+        let mut cells: Vec<(char, Option<&str>)> = Vec::with_capacity(width);
+        for (i, bucket) in plot.used.iter().enumerate() {
+            // The bucket in progress is drawn white, like the now marker in
+            // it: a thin white line alone means nothing used yet, a thick
+            // white bar means use in progress.
+            let color = if Some(i) == now_bucket { WHITE } else { color };
+            let glyph = match bucket {
+                Bucket::Used(v) => {
+                    let level = ((v / scale) * (ROWS * 8) as f64).round() as usize;
+                    LEVELS[level.saturating_sub((ROWS - 1 - row) * 8).min(8)]
+                }
+                Bucket::Unknown if row == ROWS - 1 => '·',
+                Bucket::Unknown | Bucket::Future => ' ',
             };
-            bars.extend(std::iter::repeat_n(glyph, cell));
+            cells.extend(std::iter::repeat_n((glyph, Some(color)), plot.cell));
+        }
+        // Markers go where the chart is empty; a bar keeps its cell so no
+        // usage is hidden, and the axis below still marks the column.
+        // When two markers share a column, the first (a rollover, listed
+        // before now) keeps it, matching the label line: once drawn, its
+        // glyph is no longer an empty cell.
+        for (column, marker) in &marks {
+            if matches!(cells[*column].0, ' ' | '·') {
+                cells[*column] = (marker.glyph, Some(marker.color));
+            }
         }
         // Rows carrying a gauge keep their trailing blanks so the gauges
         // line up; the rest are trimmed.
-        match side.get(row) {
-            Some(gauge) => out.push_str(&format!(
-                "{label:>7} ┤{}  {gauge}\n",
-                style.paint(color, &bars)
-            )),
-            None => out.push_str(&format!(
-                "{label:>7} ┤{}\n",
-                style.paint(color, bars.trim_end())
-            )),
+        let gauge = side.get(row);
+        if gauge.is_none() {
+            while cells.last().is_some_and(|(c, _)| *c == ' ') {
+                cells.pop();
+            }
+        }
+        let bars = paint_row(&cells, style);
+        match gauge {
+            Some(gauge) => out.push_str(&format!("{label:>7} ┤{bars}  {gauge}\n")),
+            None => out.push_str(&format!("{label:>7} ┤{bars}\n")),
         }
     }
 
     // Axis with a tick at each labelled bucket, and the labels under it.
-    let width = used.len() * cell;
-    let mut axis: Vec<char> = vec!['─'; width];
+    let mut axis: Vec<(char, Option<&str>)> = vec![('─', None); width];
     let mut labels: Vec<char> = vec![' '; width];
     let mut free_from = 0;
-    for (i, start) in edges[..used.len()].iter().enumerate() {
+    for (i, start) in plot.edges[..plot.used.len()].iter().enumerate() {
         let zoned = start.to_zoned(tz.clone());
         // Buckets are aligned to the local clock, so a day starts exactly at
         // a bucket that starts at midnight. The first bucket gets no label
@@ -603,27 +807,99 @@ fn chart(
         // read as a day boundary.
         let label = if zoned.hour() == 0 && zoned.minute() == 0 {
             Some(zoned.strftime("%a %d").to_string())
-        } else if span == Span::Recent && zoned.minute() == 0 && zoned.hour() % 3 == 0 {
+        } else if plot.span == Span::Recent && zoned.minute() == 0 && zoned.hour() % 3 == 0 {
             Some(zoned.strftime("%H:%M").to_string())
         } else {
             None
         };
-        let column = i * cell;
+        let column = i * plot.cell;
         if let Some(label) = label
             && column >= free_from
             && column + label.chars().count() <= width
         {
-            axis[column] = '┬';
+            axis[column] = ('┬', None);
             for (j, c) in label.chars().enumerate() {
                 labels[column + j] = c;
             }
             free_from = column + label.chars().count() + 1;
         }
     }
-    let axis: String = axis.into_iter().collect();
+    // Marker labels get a line of their own, so they never fight the day
+    // labels for space. Each marker's glyph sits exactly in its column,
+    // continuing the line drawn through the chart, so the label reads as
+    // the marker itself rather than as a legend. Markers that land in the
+    // same column (now within the bucket of a rollover) share one glyph,
+    // the first marker's, and their labels are joined. Each label uses its
+    // longest form that fits right of the glyph before the next marker,
+    // else left of the glyph after the previous label, else its shortest
+    // form cut to the room on the right. The last label may run past the
+    // chart, under the gauges.
+    let mut marks = marks;
+    marks.sort_by_key(|(column, _)| *column);
+    let mut merged: Vec<(usize, &Marker, Vec<String>)> = Vec::new();
+    for (column, marker) in marks {
+        match merged.last_mut() {
+            Some((last, _, labels)) if *last == column => {
+                let joined: Vec<String> = labels
+                    .iter()
+                    .map(|l| format!("{l} · {}", marker.labels[0]))
+                    .collect();
+                *labels = joined;
+            }
+            _ => merged.push((column, marker, marker.labels.clone())),
+        }
+    }
+    let mut marker_line: Vec<(char, Option<&str>)> = vec![(' ', None); width];
+    let mut free_from = 0;
+    for (k, (column, marker, labels)) in merged.iter().enumerate() {
+        let (column, color) = (*column, Some(marker.color));
+        axis[column] = ('┼', color);
+        let next = merged.get(k + 1).map_or(usize::MAX, |(c, _, _)| *c);
+        let right_room = next.saturating_sub(column + 3);
+        let fits_right = labels.iter().find(|l| l.chars().count() <= right_room);
+        let fits_left = labels
+            .iter()
+            .find(|l| column >= free_from + l.chars().count() + 2);
+        let (start, text): (usize, Vec<char>) = if let Some(l) = fits_right {
+            (column + 2, l.chars().collect())
+        } else if let Some(l) = fits_left {
+            (column - 1 - l.chars().count(), l.chars().collect())
+        } else {
+            let shortest = labels.last().map(String::as_str).unwrap_or_default();
+            let mut short: Vec<char> = shortest
+                .chars()
+                .take(right_room.saturating_sub(1))
+                .collect();
+            if !short.is_empty() {
+                short.push('…');
+            }
+            (column + 2, short)
+        };
+        let end = (start + text.len()).max(column + 1);
+        if marker_line.len() < end {
+            marker_line.resize(end, (' ', None));
+        }
+        marker_line[column] = (marker.glyph, color);
+        for (j, c) in text.iter().enumerate() {
+            marker_line[start + j] = (*c, color);
+        }
+        free_from = end + 1;
+    }
+    while marker_line.last().is_some_and(|(c, _)| *c == ' ') {
+        marker_line.pop();
+    }
     let labels: String = labels.into_iter().collect();
-    out.push_str(&format!("{:>7} └{axis}\n", format!("/{unit}")));
-    out.push_str(&format!("{:>8}{}\n", "", labels.trim_end()));
+    out.push_str(&format!(
+        "{:>7} └{}\n",
+        format!("/{unit}"),
+        paint_row(&axis, style)
+    ));
+    // Both lines are indented by the width of the chart's left margin plus
+    // its axis character, so their columns match the chart's.
+    out.push_str(&format!("{:>9}{}\n", "", labels.trim_end()));
+    if !marker_line.is_empty() {
+        out.push_str(&format!("{:>9}{}\n", "", paint_row(&marker_line, style)));
+    }
 }
 
 /// `t` formatted in the viewer's time zone, since resets and bucket labels
@@ -852,26 +1128,164 @@ mod tests {
             .lines()
             .skip_while(|l| !l.starts_with("a@example.com"))
             .skip(1)
-            .take(6)
+            .take(7)
             .collect();
-        let gap = " ".repeat(39);
-        let dots = "·".repeat(39);
+        // The chart spans the account's week (rollovers on Sun 27 and Sun 04
+        // at 16:00) with margins, trimmed at the left to the width; now
+        // (Thu 01 08:10) falls in the bucket after the two used ones, which
+        // has seen nothing yet, so only the thin now line shows there.
+        let row = |label: &str, fill: &str| {
+            format!(
+                "{label:>7} ┤{f3}│{f19}██│{blank19}│",
+                f3 = fill.repeat(3),
+                f19 = fill.repeat(19),
+                blank19 = " ".repeat(19)
+            )
+        };
         assert_eq!(
             chart,
             vec![
-                format!("   8.0% ┤{gap}██   7d ▓▓▓░░░░░░░░░░░░░░░░░  16%"),
-                format!("        ┤{gap}██   5h ▓░░░░░░░░░░░░░░░░░░░   5%"),
-                format!("        ┤{gap}██"),
-                format!("     0% ┤{dots}██"),
-                "    /4h └───┬───────────┬───────────┬──────────────".to_owned(),
-                "           Fri 25      Sun 27      Tue 29".to_owned(),
+                format!("{}       7d ▓▓▓░░░░░░░░░░░░░░░░░  16%", row("8.0%", " ")),
+                format!("{}       5h ▓░░░░░░░░░░░░░░░░░░░   5%", row("", " ")),
+                row("", " "),
+                row("0%", "·"),
+                "    /4h └───┼─┬───────────┬───────┼───┬───────────┬───┼─────".to_owned(),
+                "              Mon 28      Wed 30      Fri 02      Sun 04".to_owned(),
+                "            │ rollover Sun 16:00  │ now               │ rollover Sun 04 16:00"
+                    .to_owned(),
             ],
             "{text}"
+        );
+        // Every marker's glyph on the label line sits under its axis tick,
+        // which sits under the line through the chart.
+        let column = |line: &str, c: char| -> Vec<usize> {
+            line.chars()
+                .enumerate()
+                .filter(|(_, x)| *x == c)
+                .map(|(i, _)| i)
+                .collect()
+        };
+        assert_eq!(
+            column(chart[4], '┼'),
+            column(
+                &chart[6][..chart[6].find(" rollover Sun 04").unwrap() + 1],
+                '│'
+            )
         );
         assert!(text.contains("dead@example.com  priority 10\n"), "{text}");
         assert!(text.contains("  usage lookup failed (no priorities are written until fixed): usage endpoint returned HTTP 401: token revoked\n  no usage history yet\n"), "{text}");
         assert!(text.contains("disabled: off@example.com"));
         assert!(!text.contains('\x1b'), "plain output has no escapes");
+    }
+
+    /// The bucket in progress is drawn white, so a thick white bar means use
+    /// in progress and a thin white line alone means none yet; rollovers
+    /// are periwinkle.
+    #[test]
+    fn now_bucket_and_markers_are_colored() {
+        let render_at = |now: &str| {
+            render(
+                &log(),
+                &Ok(None),
+                Span::Week,
+                ts(now),
+                &TimeZone::UTC,
+                91,
+                Style::Color,
+            )
+        };
+        let busy = render_at("2026-10-01T07:50:00Z");
+        assert!(
+            busy.contains(&format!("{WHITE}█")),
+            "use in progress is a white bar: {busy}"
+        );
+        let idle = render_at("2026-10-01T08:10:00Z");
+        assert!(!idle.contains(&format!("{WHITE}█")), "{idle}");
+        assert!(
+            idle.contains(&format!("{WHITE}│")),
+            "only the thin now line: {idle}"
+        );
+        assert!(idle.contains(&format!("{PERIWINKLE}│")), "{idle}");
+    }
+
+    /// Without a current week there are no rollovers to mark: neither when
+    /// the week has not started nor when the recorded reset is already past
+    /// (accounts from an older pass). The chart then shows the last week and
+    /// the margin ahead, with now marked. The recent view has no markers.
+    #[test]
+    fn chart_range_without_a_current_week() {
+        let now = ts("2026-10-01T08:10:00Z");
+        for reset in [json!(null), json!("2026-09-30T16:00:00Z")] {
+            let account = json!({"seven_day": {"utilization": 0.0, "resets_at": reset}});
+            let (edges, markers) = chart_range(Span::Week, &account, now, 200, &TimeZone::UTC);
+            assert_eq!(markers.len(), 1, "{reset}");
+            assert_eq!(markers[0].labels, vec!["now"]);
+            assert!(edges[0] <= now - WEEK && *edges.last().unwrap() >= now + WINDOW_MARGIN * 2);
+        }
+        let account = json!({"seven_day": {"utilization": 0.0, "resets_at": null}});
+        let (edges, markers) = chart_range(Span::Recent, &account, now, 10, &TimeZone::UTC);
+        assert_eq!(edges.len(), 11);
+        assert!(*edges.last().unwrap() > now && markers.is_empty());
+    }
+
+    /// The window spans the week with margins of about 21 hours, as close
+    /// as the 4-hour grid allows. When the terminal is too narrow, the cut
+    /// keeps now on the chart: early in a week the end of the window goes,
+    /// not the present.
+    #[test]
+    fn chart_range_fits_the_week_and_keeps_now() {
+        let account =
+            json!({"seven_day": {"utilization": 1.0, "resets_at": "2026-10-04T16:00:00Z"}});
+        let start = ts("2026-09-27T16:00:00Z");
+        let end = ts("2026-10-04T16:00:00Z");
+        let now = ts("2026-09-28T02:00:00Z");
+        let (edges, _) = chart_range(Span::Week, &account, now, 200, &TimeZone::UTC);
+        let (first, last) = (edges[0], *edges.last().unwrap());
+        assert!(
+            first <= start - WINDOW_MARGIN
+                && first.duration_until(start - WINDOW_MARGIN) < Span::Week.bucket()
+        );
+        assert!(
+            last >= end + WINDOW_MARGIN
+                && (end + WINDOW_MARGIN).duration_until(last) < Span::Week.bucket()
+        );
+
+        let (edges, _) = chart_range(Span::Week, &account, now, 40, &TimeZone::UTC);
+        assert_eq!(edges.len(), 41);
+        assert!(
+            edges[0] < start && now < *edges.last().unwrap(),
+            "both the week's start and now are shown"
+        );
+        let late = ts("2026-10-04T10:00:00Z");
+        let (edges, _) = chart_range(Span::Week, &account, late, 40, &TimeZone::UTC);
+        assert!(
+            *edges.last().unwrap() >= end + WINDOW_MARGIN,
+            "late in the week the end stays"
+        );
+    }
+
+    /// When now falls in the same column as the closing rollover, the two
+    /// share it: the rollover's glyph stays, on the chart and on the
+    /// label line, and the labels are joined rather than one hiding the
+    /// other.
+    #[test]
+    fn markers_in_one_column_are_merged() {
+        // A reset inside a bucket (16:30), with now just before it in the
+        // same bucket and, at this width, the same column.
+        let mut records = log();
+        records.last_mut().unwrap()["accounts"][0]["seven_day"]["resets_at"] =
+            json!("2026-10-04T16:30:00Z");
+        let text = render(
+            &records,
+            &Ok(None),
+            Span::Week,
+            ts("2026-10-04T16:10:00Z"),
+            &TimeZone::UTC,
+            91,
+            Style::Plain,
+        );
+        let line = text.lines().find(|l| l.contains("now")).unwrap();
+        assert!(line.contains("│ rollover Sun 04 16:30 · now"), "{line}");
     }
 
     /// When the latest pass saw no accounts (paused, proxy down), the charts

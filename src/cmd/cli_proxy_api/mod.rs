@@ -33,7 +33,7 @@ pub enum Commands {
 /// Flags for `overview`.
 #[derive(Args, Debug)]
 pub struct OverviewArgs {
-    /// Chart as many 15-minute buckets as fit instead of a week of 4-hour ones
+    /// Chart as many 15-minute buckets as fit instead of each account's week in 4-hour ones
     #[arg(long)]
     pub recent: bool,
 }
