@@ -122,6 +122,11 @@ kd cargo scode uninstall kd
 kd cli-proxy-api monitor enable
 kd cli-proxy-api monitor disable
 kd cli-proxy-api monitor run
+
+# Drain one Claude account first until its weekly reset (for example before
+# pressing a banked limit reset on it), then return to reset order.
+kd cli-proxy-api burn someone@example.com
+kd cli-proxy-api burn --clear
 ```
 
 ## Development environments and stateful instances

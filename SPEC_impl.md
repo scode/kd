@@ -112,6 +112,27 @@ before `loginctl enable-linger`, so a user who already lingers never meets a pol
 unit is written, so a linger failure leaves nothing installed. Every external command goes through an injected runner,
 so tests pin the exact `systemctl` and `loginctl` sequence without touching the host's systemd.
 
+The `burn` override is a file rather than state inside the daemon so that setting it needs no IPC and survives restarts.
+The monitor watches the file's directory with the `notify` crate rather than the file, because `burn` (and most editors)
+replace the file by renaming a new one over it, and a watch on the old inode never fires. Events for other names are
+filtered out, and a short settle delay folds the burst from one write into one pass. Access events are filtered out too:
+notify's inotify backend reports every open of the file, the monitor opens it on every wake, and waking on that would
+make the loop wake itself back to back for as long as a burn file exists. Passes are also spaced at least 10 seconds
+apart, because other writers (an editor's autosave, a sync tool, repeated `burn` calls) can produce change events at any
+rate and every pass costs a usage lookup per account. If the watch cannot be set up, or stops working because the
+directory was deleted and recreated, the loop picks the change up at its next wake, since the file is re-read every
+time. The burned account gets a tier of its own, keyed separately from reset minutes, so it never ties with an account
+that happens to share its reset.
+
+`burn` reads the monitor's log rather than calling CLIProxyAPI. Every record already holds each account's email, enabled
+state, and weekly reset; reading it means `burn` needs no `--url` or key file that would have to match the daemon's,
+cannot add a strike toward the bad-key ban while the monitor is paused, and doubles as a liveness check (a record older
+than two intervals means the monitor is not running). It reads only the log's last megabyte, since the log is never
+trimmed and only its newest record matters. The expiry is fixed when the burn is set: deriving it in the monitor instead
+would end a burn of an account whose week had not started on the very next pass, because burning starts that week. A
+burn is not cleared from the file when it expires; the monitor reports it as expired and ignores it, so the file never
+has two writers.
+
 The HTTP timeout is 75 seconds because CLIProxyAPI's `api-call` waits up to 60 on the upstream; timing out first would
 replace CLIProxyAPI's own error with a bare transport timeout. The HTTP agent ignores proxy environment variables (ureq
 honours them by default, with no loopback exemption, so a proxy would receive the key in clear text) and keeps non-2xx

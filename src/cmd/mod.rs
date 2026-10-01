@@ -195,6 +195,16 @@ mod tests {
             "/tmp/l"
         ]));
         assert!(!parses(&["kd", "cli-proxy-api", "manage-priorities"]));
+        assert!(parses(&["kd", "cli-proxy-api", "burn", "a@example.com"]));
+        assert!(parses(&["kd", "cli-proxy-api", "burn", "--clear"]));
+        assert!(!parses(&["kd", "cli-proxy-api", "burn"]));
+        assert!(!parses(&[
+            "kd",
+            "cli-proxy-api",
+            "burn",
+            "a@example.com",
+            "--clear"
+        ]));
     }
 
     #[test]

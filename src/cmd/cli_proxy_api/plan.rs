@@ -150,11 +150,20 @@ impl Plan {
 /// Ties inside a tier are ordered by name only to make the output and log
 /// deterministic.
 ///
+/// `burn` names the email of an account the user wants drained first (see
+/// `kd cli-proxy-api burn`). A managed account with that email, compared
+/// without regard to case, gets a tier of its own above every other; the
+/// rest keep the reset order below it. An email matching no managed
+/// account changes nothing.
+///
 /// Callers must pass usage for every managed account. A managed account
 /// without usage is a programming error upstream and panics, rather than
 /// being guessed into some tier.
-pub fn plan(observed: &[Observed]) -> Plan {
-    let mut managed: Vec<(&Account, Option<i64>)> = observed
+pub fn plan(observed: &[Observed], burn: Option<&str>) -> Plan {
+    // A tier is identified by (not burned, reset minute): the burned
+    // account sorts first because `false < true`, and it cannot share a
+    // tier with an unburned account even when their resets coincide.
+    let mut managed: Vec<(&Account, (bool, Option<i64>))> = observed
         .iter()
         .filter(|o| is_managed(&o.account))
         .map(|o| {
@@ -162,22 +171,22 @@ pub fn plan(observed: &[Observed]) -> Plan {
                 .usage
                 .expect("managed account reached planning without usage");
             let minute = usage.seven_day.resets_at.map(nearest_minute);
-            (&o.account, minute)
+            (&o.account, (!is_burned(&o.account, burn), minute))
         })
         .collect();
     // `None` (no reset yet) must sort after every known reset.
-    managed.sort_by(|(a, a_min), (b, b_min)| {
-        (a_min.is_none(), a_min, &a.name).cmp(&(b_min.is_none(), b_min, &b.name))
+    managed.sort_by(|(a, (a_rest, a_min)), (b, (b_rest, b_min))| {
+        (a_rest, a_min.is_none(), a_min, &a.name).cmp(&(b_rest, b_min.is_none(), b_min, &b.name))
     });
 
-    let mut tiers: Vec<Option<i64>> = managed.iter().map(|(_, minute)| *minute).collect();
+    let mut tiers: Vec<(bool, Option<i64>)> = managed.iter().map(|(_, tier)| *tier).collect();
     tiers.dedup();
     let tier_count = tiers.len() as i64;
 
     let ranked: Vec<(&Account, i64)> = managed
         .into_iter()
-        .map(|(account, minute)| {
-            let rank = tiers.iter().position(|t| *t == minute).unwrap() as i64;
+        .map(|(account, tier)| {
+            let rank = tiers.iter().position(|t| *t == tier).unwrap() as i64;
             (account, PRIORITY_STEP * (tier_count - rank))
         })
         .collect();
@@ -201,6 +210,14 @@ pub fn plan(observed: &[Observed]) -> Plan {
         }
     }
     plan
+}
+
+/// Whether `account` is the one the burn override names.
+pub fn is_burned(account: &Account, burn: Option<&str>) -> bool {
+    match (burn, account.email.as_deref()) {
+        (Some(burn), Some(email)) => email.eq_ignore_ascii_case(burn),
+        _ => false,
+    }
 }
 
 /// The minute a reset time is bucketed into, rounded to the nearest minute.
@@ -368,6 +385,11 @@ mod tests {
         }
     }
 
+    /// Planning without a burn override, which is what most rules are about.
+    fn plan_no_burn(observed: &[Observed]) -> Plan {
+        plan(observed, None)
+    }
+
     fn usage(seven_day_reset: Option<&str>) -> Usage {
         Usage {
             five_hour: Window {
@@ -388,11 +410,64 @@ mod tests {
         }
     }
 
+    fn with_email(mut account: Account) -> Account {
+        account.email = Some(format!("{}@example.com", account.name));
+        account
+    }
+
+    /// The burn override puts the named account alone on top, whatever its
+    /// reset, and the rest keep reset order beneath it. The email match
+    /// ignores case, since people type addresses by hand.
+    #[test]
+    fn burned_account_goes_first_on_its_own() {
+        let pool = [
+            observed(with_email(account("late", 0)), Some("2026-09-30T00:00:00Z")),
+            observed(with_email(account("soon", 0)), Some("2026-09-26T00:00:00Z")),
+            observed(with_email(account("twin", 0)), Some("2026-09-30T00:00:00Z")),
+        ];
+        let plan = plan(&pool, Some("LATE@example.com"));
+        assert_eq!(
+            plan.targets,
+            vec![
+                ("late".to_owned(), 30),
+                ("soon".to_owned(), 20),
+                ("twin".to_owned(), 10)
+            ],
+            "late shares twin's reset but not its tier"
+        );
+        assert!(is_burned(&pool[0].account, Some("late@EXAMPLE.com")));
+        assert!(!is_burned(&account("noemail", 0), Some("late@example.com")));
+    }
+
+    /// A burn naming no managed account (disabled, removed, mistyped)
+    /// leaves the plan exactly as without one.
+    #[test]
+    fn burn_of_an_unmanaged_account_changes_nothing() {
+        let mut off = with_email(account("off", 0));
+        off.disabled = true;
+        let pool = [
+            observed(
+                with_email(account("late", 20)),
+                Some("2026-09-30T00:00:00Z"),
+            ),
+            observed(
+                with_email(account("soon", 10)),
+                Some("2026-09-26T00:00:00Z"),
+            ),
+            Observed {
+                account: off,
+                usage: None,
+            },
+        ];
+        assert_eq!(plan(&pool, Some("off@example.com")), plan(&pool, None));
+        assert_eq!(plan(&pool, Some("nobody@example.com")), plan(&pool, None));
+    }
+
     /// The whole point of the command: the soonest weekly reset gets the
     /// highest priority, and only accounts whose value differs are written.
     #[test]
     fn soonest_weekly_reset_gets_highest_priority() {
-        let plan = plan(&[
+        let plan = plan_no_burn(&[
             observed(account("late", 20), Some("2026-09-30T00:00:00Z")),
             observed(account("soon", 10), Some("2026-09-26T00:00:00Z")),
             observed(account("middle", 20), Some("2026-09-28T00:00:00Z")),
@@ -427,7 +502,7 @@ mod tests {
     /// the same bucket.
     #[test]
     fn reset_jitter_across_the_minute_boundary_still_ties() {
-        let plan = plan(&[
+        let plan = plan_no_burn(&[
             observed(account("a", 0), Some("2026-09-25T13:59:59.507Z")),
             observed(account("b", 0), Some("2026-09-25T14:00:00.054Z")),
             observed(account("c", 0), Some("2026-09-27T16:00:00Z")),
@@ -442,7 +517,7 @@ mod tests {
     /// weekly window has not started has no deadline and goes last.
     #[test]
     fn same_minute_resets_share_a_tier_and_unstarted_windows_go_last() {
-        let plan = plan(&[
+        let plan = plan_no_burn(&[
             observed(account("fresh", 0), None),
             observed(account("b", 0), Some("2026-09-26T10:00:25Z")),
             observed(account("a", 0), Some("2026-09-26T10:00:05Z")),
@@ -465,7 +540,7 @@ mod tests {
         disabled.disabled = true;
         let mut codex = account("codex", 7);
         codex.provider = "codex".to_owned();
-        let plan = plan(&[
+        let plan = plan_no_burn(&[
             Observed {
                 account: disabled,
                 usage: None,
@@ -486,7 +561,7 @@ mod tests {
     /// left at 0 below them) are kept as they are and become the targets.
     #[test]
     fn correct_order_is_kept_whatever_the_values() {
-        let plan = plan(&[
+        let plan = plan_no_burn(&[
             observed(account("soon", 7), Some("2026-09-26T00:00:00Z")),
             observed(account("late", 3), Some("2026-09-29T00:00:00Z")),
             observed(account("fresh", 0), None),
@@ -500,13 +575,13 @@ mod tests {
     /// and so is a split that should be a tie.
     #[test]
     fn wrong_ties_are_renumbered() {
-        let split_tie = plan(&[
+        let split_tie = plan_no_burn(&[
             observed(account("a", 10), Some("2026-09-26T00:00:00Z")),
             observed(account("b", 10), Some("2026-09-29T00:00:00Z")),
         ]);
         assert_eq!(split_tie.target("a"), Some(20));
         assert_eq!(split_tie.target("b"), Some(10));
-        let joined = plan(&[
+        let joined = plan_no_burn(&[
             observed(account("a", 20), Some("2026-09-26T00:00:00Z")),
             observed(account("b", 10), Some("2026-09-26T00:00:20Z")),
         ]);
@@ -520,7 +595,7 @@ mod tests {
     /// true.
     #[test]
     fn weekly_rotation_renumbers_the_pool() {
-        let plan = plan(&[
+        let plan = plan_no_burn(&[
             observed(account("a", 30), None),
             observed(account("b", 20), Some("2026-09-27T00:00:00Z")),
             observed(account("c", 10), Some("2026-09-29T00:00:00Z")),
@@ -539,7 +614,7 @@ mod tests {
     /// A settled pool must produce no writes, so frequent runs are free.
     #[test]
     fn already_ordered_pool_needs_no_changes() {
-        let plan = plan(&[
+        let plan = plan_no_burn(&[
             observed(account("soon", 20), Some("2026-09-26T00:00:00Z")),
             observed(account("late", 10), Some("2026-09-29T00:00:00Z")),
         ]);

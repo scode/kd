@@ -19,8 +19,13 @@
 //! key (see [`Monitor`]): CLIProxyAPI bans an address for 30 minutes after
 //! five bad keys, so a loop that kept retrying a stale key would keep the
 //! user locked out of the web panel indefinitely.
+//!
+//! The only other input is the `burn` override file (see [`super::burn`]),
+//! read on every wake. Its directory is watched, so a change wakes the loop
+//! at once instead of at the next interval.
 
 use super::api::{Client, is_key_rejection};
+use super::burn::{self, Burn};
 use super::plan::{self, Account, Change, Flag, Observed, Plan, Usage, Window};
 use anyhow::{Context, bail};
 use jiff::tz::TimeZone;
@@ -28,6 +33,8 @@ use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::Duration;
 use tracing::{info, warn};
 
 /// Schema version written as `"v"` on every log line. Bump it whenever a
@@ -93,6 +100,12 @@ pub struct Outcome {
     /// The pass made no API calls because the key file still holds a key
     /// the management API rejected earlier.
     pub paused: bool,
+    /// The burn override in the config file at the time of the pass, active
+    /// or expired; planning only honours it while active.
+    pub burn: Option<Burn>,
+    /// Why the config file could not be read. The pass then plans without
+    /// an override rather than guessing.
+    pub burn_error: Option<String>,
 }
 
 impl Outcome {
@@ -111,14 +124,15 @@ impl Outcome {
     }
 }
 
-/// Run one observe, plan, apply, and verify pass against `api`.
+/// Run one observe, plan, apply, and verify pass against `api`. `burn` is
+/// the email of the account to drain first, if an override is active.
 ///
 /// Changes are written one at a time; the first write error stops the rest
 /// (earlier writes stay, and the next pass finishes the job). After writing,
 /// the listing is read again and every planned priority is checked, so
 /// "applied" in the report means CLIProxyAPI reports the new value, not
 /// merely that the PATCH returned 200.
-pub fn execute(api: &dyn Management, now: Timestamp) -> Outcome {
+pub fn execute(api: &dyn Management, now: Timestamp, burn: Option<&str>) -> Outcome {
     let mut outcome = Outcome::default();
     let accounts = match api.list_accounts() {
         Ok(accounts) => accounts,
@@ -189,7 +203,7 @@ pub fn execute(api: &dyn Management, now: Timestamp) -> Outcome {
     }
 
     let observed: Vec<Observed> = outcome.rows.iter().map(|r| r.observed.clone()).collect();
-    let plan = plan::plan(&observed);
+    let plan = plan::plan(&observed, burn);
     if !plan.changes.is_empty() {
         for change in &plan.changes {
             if let Err(err) = api.set_priority(&change.name, change.to) {
@@ -232,11 +246,16 @@ fn verify(api: &dyn Management, plan: &Plan) -> anyhow::Result<()> {
 /// (or a stale one) cannot make the loop spin.
 pub fn next_wake(outcome: &Outcome, now: Timestamp) -> Timestamp {
     let regular = now + INTERVAL;
+    // A burn's end is normally that account's weekly reset, already a
+    // candidate; it is added separately for the case where it is not (the
+    // burn of a week that had not started ends a week after it was set).
+    let burn_end = outcome.burn.as_ref().map(|b| b.until);
     outcome
         .rows
         .iter()
         .filter_map(|r| r.observed.usage)
         .flat_map(|u| [u.five_hour.resets_at, u.seven_day.resets_at])
+        .chain([burn_end])
         .flatten()
         .filter_map(|reset| reset.checked_add(RESET_GRACE).ok())
         .filter(|wake| *wake > now)
@@ -263,10 +282,29 @@ pub struct Monitor {
 
 impl Monitor {
     /// One wake: read the key, then run a pass unless the key is the one
-    /// already rejected. `key` is the result of reading the key file now.
+    /// already rejected. `key` and `burn` are the results of reading the key
+    /// file and the override file now.
     pub fn wake(
         &mut self,
         key: anyhow::Result<String>,
+        burn: anyhow::Result<Option<Burn>>,
+        connect: &Connect<'_>,
+        now: Timestamp,
+    ) -> Outcome {
+        let (burn, burn_error) = match burn {
+            Ok(burn) => (burn, None),
+            Err(err) => (None, Some(format!("{err:#}"))),
+        };
+        let mut outcome = self.pass(key, burn.as_ref(), connect, now);
+        outcome.burn = burn;
+        outcome.burn_error = burn_error;
+        outcome
+    }
+
+    fn pass(
+        &mut self,
+        key: anyhow::Result<String>,
+        burn: Option<&Burn>,
         connect: &Connect<'_>,
         now: Timestamp,
     ) -> Outcome {
@@ -284,8 +322,9 @@ impl Monitor {
                 ..Outcome::default()
             };
         }
+        let active = burn.filter(|b| b.is_active(now)).map(|b| b.email.as_str());
         let outcome = match connect(&key) {
-            Ok(api) => execute(api.as_ref(), now),
+            Ok(api) => execute(api.as_ref(), now, active),
             Err(err) => Outcome::failed(format!("{err:#}")),
         };
         self.rejected_key = outcome.key_rejected.then_some(key);
@@ -299,6 +338,8 @@ pub struct Settings {
     pub url: String,
     pub key_file: PathBuf,
     pub log_file: PathBuf,
+    /// The `burn` override file, re-read on every wake and watched.
+    pub config_file: PathBuf,
 }
 
 /// Run the loop forever. Only a setup error the loop cannot recover from
@@ -318,15 +359,149 @@ pub fn run(settings: Settings) -> anyhow::Result<()> {
     let connect = move |key: &str| -> anyhow::Result<Box<dyn Management>> {
         Ok(Box::new(Client::new(&url, key.to_owned())?))
     };
+    let waker = Waker::new(&settings.config_file);
     let mut monitor = Monitor::default();
+    let mut last_pass: Option<Timestamp> = None;
     loop {
+        // Early wakes come from outside (repeated `burn` calls, an editor's
+        // autosave, a sync tool touching the file), so they are spaced out:
+        // every pass costs one usage lookup per account.
+        if let Some(last) = last_pass {
+            let earliest = last + MIN_GAP;
+            if let Ok(wait) = Duration::try_from(Timestamp::now().duration_until(earliest)) {
+                std::thread::sleep(wait);
+            }
+        }
         let now = Timestamp::now();
-        let outcome = monitor.wake(read_key_file(&settings.key_file), &connect, now);
+        last_pass = Some(now);
+        let outcome = monitor.wake(
+            read_key_file(&settings.key_file),
+            burn::read(&settings.config_file),
+            &connect,
+            now,
+        );
         let wake_at = next_wake(&outcome, now);
         report(&settings, &outcome, now, wake_at);
-        let wait = Timestamp::now().duration_until(wake_at);
-        if let Ok(wait) = std::time::Duration::try_from(wait) {
-            std::thread::sleep(wait);
+        if waker.wait_until(wake_at) {
+            info!("{} changed; waking early", settings.config_file.display());
+        }
+    }
+}
+
+/// Shortest time between the starts of two passes, whatever woke the loop.
+const MIN_GAP: SignedDuration = SignedDuration::from_secs(10);
+
+/// How long to keep collecting events after the first one. Writing the
+/// override file produces a burst (temporary file, rename), and one pass
+/// per burst is enough.
+const SETTLE: Duration = Duration::from_millis(200);
+
+/// Sleeps until the next wake, or until the override file changes.
+///
+/// The watch is on the file's directory, not the file: `burn` replaces the
+/// file by renaming a new one over it, and a watch on the old inode would
+/// never see that. Events for other names in the directory are ignored, and
+/// so are access events: notify's inotify backend reports every open of the
+/// file, including the monitor's own read on each wake, and waking on those
+/// would make the loop wake itself forever. If the watch cannot be set up,
+/// or stops working (the directory is deleted and recreated), the loop
+/// still works, only without the early wake: the file is re-read on every
+/// wake, so a change then takes effect at the next regular one.
+struct Waker {
+    events: Option<mpsc::Receiver<()>>,
+    // Dropping the watcher stops the events, so it lives as long as the
+    // receiver.
+    _watcher: Option<notify::RecommendedWatcher>,
+}
+
+impl Waker {
+    fn new(config_file: &Path) -> Self {
+        match Self::watch(config_file) {
+            Ok(waker) => waker,
+            Err(err) => {
+                warn!(
+                    "not watching {}: {err:#}; override changes take effect at the next wake",
+                    config_file.display()
+                );
+                Waker {
+                    events: None,
+                    _watcher: None,
+                }
+            }
+        }
+    }
+
+    fn watch(config_file: &Path) -> anyhow::Result<Self> {
+        use notify::Watcher;
+        use std::os::unix::fs::DirBuilderExt;
+        let dir = config_file.parent().context("config path has no parent")?;
+        // The directory must exist to be watched; `burn` would create it
+        // anyway.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
+        let name = config_file
+            .file_name()
+            .context("config path has no file name")?
+            .to_owned();
+        let (tx, rx) = mpsc::channel();
+        let mut watcher =
+            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                if let Ok(event) = event
+                    && is_change(&event.kind)
+                    && event.paths.iter().any(|p| p.file_name() == Some(&name))
+                {
+                    let _ = tx.send(());
+                }
+            })?;
+        watcher.watch(dir, notify::RecursiveMode::NonRecursive)?;
+        Ok(Waker {
+            events: Some(rx),
+            _watcher: Some(watcher),
+        })
+    }
+}
+
+/// Whether a watch event can mean the file's content changed. Access
+/// events (open, read, close without writing) cannot, and the monitor
+/// generates them itself.
+fn is_change(kind: &notify::EventKind) -> bool {
+    use notify::EventKind;
+    match kind {
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => true,
+        EventKind::Access(access) => {
+            matches!(
+                access,
+                notify::event::AccessKind::Close(notify::event::AccessMode::Write)
+            )
+        }
+        EventKind::Any | EventKind::Other => false,
+    }
+}
+
+impl Waker {
+    /// Block until `deadline` or an override change. Returns whether a
+    /// change ended the wait.
+    fn wait_until(&self, deadline: Timestamp) -> bool {
+        let remaining =
+            || Duration::try_from(Timestamp::now().duration_until(deadline)).unwrap_or_default();
+        let Some(events) = &self.events else {
+            std::thread::sleep(remaining());
+            return false;
+        };
+        match events.recv_timeout(remaining()) {
+            Ok(()) => {
+                std::thread::sleep(SETTLE);
+                while events.try_recv().is_ok() {}
+                true
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => false,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                std::thread::sleep(remaining());
+                false
+            }
         }
     }
 }
@@ -447,6 +622,25 @@ pub fn render(outcome: &Outcome, now: Timestamp, tz: &TimeZone) -> String {
             out.push_str(&format!("                 flags: {}\n", names.join(", ")));
         }
     }
+    if let Some(burn) = &outcome.burn {
+        let state = if !burn.is_active(now) {
+            "expired"
+        } else if burn_matched(outcome) != Some(false) {
+            "active"
+        } else {
+            "active, but matches no enabled Claude account"
+        };
+        out.push_str(&format!(
+            "burn: {} until {} ({state})\n",
+            burn.email,
+            burn.until
+                .to_zoned(tz.clone())
+                .strftime("%a %Y-%m-%d %H:%M %Z")
+        ));
+    }
+    if let Some(error) = &outcome.burn_error {
+        out.push_str(&format!("burn override ignored: {error}\n"));
+    }
     let summary = match &outcome.error {
         Some(error) if outcome.paused => format!("paused: {error}"),
         Some(error) => format!("error: {error}"),
@@ -473,6 +667,19 @@ fn window_text(window: Window, now: Timestamp, tz: &TimeZone) -> String {
         }
     };
     format!("{used} used, {resets}")
+}
+
+/// Whether the pass saw a managed account the burn override names.
+/// `None` when the pass saw no accounts at all (paused, or failed before
+/// listing them), so a reader cannot mistake "not looked" for "no match".
+fn burn_matched(outcome: &Outcome) -> Option<bool> {
+    if outcome.rows.is_empty() {
+        return None;
+    }
+    let email = outcome.burn.as_ref().map(|b| b.email.as_str());
+    Some(outcome.rows.iter().any(|r| {
+        plan::is_managed(&r.observed.account) && plan::is_burned(&r.observed.account, email)
+    }))
 }
 
 /// One JSON object per wake, schema version [`LOG_SCHEMA_VERSION`]. It
@@ -531,6 +738,13 @@ pub fn log_line(outcome: &Outcome, now: Timestamp, url: &str) -> Value {
         "applied_changes": outcome.applied.iter().map(change).collect::<Vec<_>>(),
         "error": outcome.error,
         "paused": outcome.paused,
+        "burn": outcome.burn.as_ref().map(|b| json!({
+            "email": b.email,
+            "until": b.until.to_string(),
+            "active": b.is_active(now),
+            "matched": burn_matched(outcome),
+        })),
+        "burn_error": outcome.burn_error,
     })
 }
 
@@ -672,14 +886,14 @@ mod tests {
     #[test]
     fn apply_writes_planned_changes_and_verifies() {
         let fake = fake_pool();
-        let outcome = execute(&fake, ts(NOW));
+        let outcome = execute(&fake, ts(NOW), None);
         assert!(outcome.error.is_none(), "{:?}", outcome.error);
         assert_eq!(
             *fake.writes.borrow(),
             vec![("soon".to_owned(), 20), ("late".to_owned(), 10)]
         );
         assert_eq!(outcome.applied.len(), 2);
-        let again = execute(&fake, ts(NOW));
+        let again = execute(&fake, ts(NOW), None);
         assert!(again.plan.unwrap().changes.is_empty());
         assert_eq!(
             fake.writes.borrow().len(),
@@ -697,7 +911,7 @@ mod tests {
             "idx-late".to_owned(),
             Err("usage endpoint returned HTTP 429".to_owned()),
         );
-        let outcome = execute(&fake, ts(NOW));
+        let outcome = execute(&fake, ts(NOW), None);
         assert!(fake.writes.borrow().is_empty());
         assert!(outcome.plan.is_none());
         assert_eq!(
@@ -741,7 +955,7 @@ mod tests {
             }
         }
         let api = Wrap(fake, Cell::new(0));
-        let outcome = execute(&api, ts(NOW));
+        let outcome = execute(&api, ts(NOW), None);
         assert!(outcome.key_rejected);
         assert_eq!(api.1.get(), 1, "no lookup after the rejection");
         assert!(api.0.writes.borrow().is_empty());
@@ -766,7 +980,7 @@ mod tests {
             accounts: RefCell::new(vec![off]),
             ..Fake::default()
         };
-        let outcome = execute(&fake, ts(NOW));
+        let outcome = execute(&fake, ts(NOW), None);
         assert!(
             outcome
                 .error
@@ -782,9 +996,9 @@ mod tests {
     fn pass_summaries() {
         let now = ts(NOW);
         let fake = fake_pool();
-        let done = execute(&fake, now);
+        let done = execute(&fake, now, None);
         assert!(render(&done, now, &TimeZone::UTC).ends_with("applied and verified 2 change(s)\n"));
-        let noop = execute(&fake, now);
+        let noop = execute(&fake, now, None);
         assert!(render(&noop, now, &TimeZone::UTC).ends_with("priorities already in order\n"));
         let failed = Outcome::failed("boom".to_owned());
         assert_eq!(render(&failed, now, &TimeZone::UTC), "error: boom\n");
@@ -804,7 +1018,7 @@ mod tests {
             fail_list: true,
             ..Fake::default()
         };
-        let outcome = execute(&fake, ts(NOW));
+        let outcome = execute(&fake, ts(NOW), None);
         assert!(outcome.rows.is_empty());
         assert_eq!(outcome.error.as_deref(), Some("HTTP 401"));
         assert!(!outcome.key_rejected);
@@ -818,7 +1032,7 @@ mod tests {
             ignore_writes: true,
             ..fake_pool()
         };
-        let outcome = execute(&fake, ts(NOW));
+        let outcome = execute(&fake, ts(NOW), None);
         let error = outcome.error.unwrap();
         assert!(error.contains("after writing"), "{error}");
     }
@@ -831,7 +1045,7 @@ mod tests {
         let fake = fake_pool();
         fake.accounts.borrow_mut()[1].quota = Some(json!({"signals": {"x": "0.5"}}));
         let now = ts(NOW);
-        let outcome = execute(&fake, now);
+        let outcome = execute(&fake, now, None);
         let text = render(&outcome, now, &TimeZone::UTC);
         assert!(text.contains("10 -> 20"), "{text}");
         assert!(text.contains("3 (unmanaged)"), "{text}");
@@ -912,6 +1126,145 @@ mod tests {
             ts("2026-09-25T08:00:30Z"),
             "a reset that just passed still gets its grace-period wake"
         );
+        let burning = Outcome {
+            burn: Some(Burn {
+                email: "a@example.com".to_owned(),
+                until: ts("2026-09-25T08:03:00Z"),
+            }),
+            ..Outcome::default()
+        };
+        assert_eq!(
+            next_wake(&burning, now),
+            ts("2026-09-25T08:04:00Z"),
+            "a burn's end is a wake of its own"
+        );
+    }
+
+    impl Monitor {
+        /// A wake with no override file, which is what the key tests need.
+        fn wake_no_burn(
+            &mut self,
+            key: anyhow::Result<String>,
+            connect: &Connect<'_>,
+            now: Timestamp,
+        ) -> Outcome {
+            self.wake(key, Ok(None), connect, now)
+        }
+    }
+
+    /// The override reaches planning only while active: an active burn puts
+    /// its account on top, an expired one is reported but ignored, and an
+    /// unreadable file is reported and planning proceeds without it. The log
+    /// line records which case applied.
+    #[test]
+    fn wake_applies_only_an_active_burn() {
+        let now = ts(NOW);
+        let connect =
+            |_: &str| -> anyhow::Result<Box<dyn Management>> { Ok(Box::new(fake_pool())) };
+        let mut monitor = Monitor::default();
+        let burn = |until: &str| Burn {
+            email: "LATE@example.com".to_owned(),
+            until: ts(until),
+        };
+
+        let active = monitor.wake(
+            Ok("k".to_owned()),
+            Ok(Some(burn("2026-09-26T00:00:00Z"))),
+            &connect,
+            now,
+        );
+        let plan = active.plan.as_ref().unwrap();
+        assert_eq!(plan.target("late"), Some(20), "burned account on top");
+        assert_eq!(plan.target("soon"), Some(10));
+        let text = render(&active, now, &TimeZone::UTC);
+        assert!(
+            text.contains("burn: LATE@example.com until Sat 2026-09-26 00:00 UTC (active)"),
+            "{text}"
+        );
+        let line = log_line(&active, now, "u");
+        assert_eq!(line["burn"]["active"], true);
+        assert_eq!(line["burn"]["matched"], true);
+
+        let expired = monitor.wake(
+            Ok("k".to_owned()),
+            Ok(Some(burn("2026-09-25T07:00:00Z"))),
+            &connect,
+            now,
+        );
+        assert_eq!(
+            expired.plan.as_ref().unwrap().target("soon"),
+            Some(20),
+            "reset order again"
+        );
+        assert!(render(&expired, now, &TimeZone::UTC).contains("(expired)"));
+        assert_eq!(log_line(&expired, now, "u")["burn"]["active"], false);
+
+        let paused = Outcome {
+            burn: Some(burn("2026-09-26T00:00:00Z")),
+            paused: true,
+            ..Outcome::failed("paused".to_owned())
+        };
+        assert_eq!(log_line(&paused, now, "u")["burn"]["matched"], Value::Null);
+        assert!(
+            render(&paused, now, &TimeZone::UTC).contains("(active)"),
+            "no false no-match claim"
+        );
+
+        let broken = monitor.wake(
+            Ok("k".to_owned()),
+            Err(anyhow::anyhow!("parsing config")),
+            &connect,
+            now,
+        );
+        assert!(
+            broken.error.is_none(),
+            "a bad override file does not fail the pass"
+        );
+        assert_eq!(broken.plan.as_ref().unwrap().target("soon"), Some(20));
+        assert_eq!(log_line(&broken, now, "u")["burn_error"], "parsing config");
+        assert!(
+            render(&broken, now, &TimeZone::UTC).contains("burn override ignored: parsing config")
+        );
+    }
+
+    /// The directory watch wakes the loop when the override file is
+    /// replaced the way `burn` writes it (a rename over the old file), and
+    /// ignores other files in the directory. Uses the real watcher, so it
+    /// waits on the filesystem with generous deadlines.
+    #[test]
+    fn waker_wakes_on_override_changes_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("kd").join("monitor.toml");
+        let waker = Waker::new(&config);
+        assert!(
+            config.parent().unwrap().is_dir(),
+            "watched directory is created"
+        );
+        let soon = || Timestamp::now() + SignedDuration::from_secs(5);
+        let briefly = || Timestamp::now() + SignedDuration::from_millis(500);
+
+        std::fs::write(config.parent().unwrap().join("other.toml"), "x").unwrap();
+        assert!(!waker.wait_until(briefly()));
+
+        let tmp = config.parent().unwrap().join(".tmp-new");
+        std::fs::write(&tmp, "[burn]\n").unwrap();
+        std::fs::rename(&tmp, &config).unwrap();
+        assert!(waker.wait_until(soon()), "a rename over the file wakes");
+
+        // The monitor reads the file on every wake; inotify reports that
+        // open, and waking on it would loop forever.
+        burn::read(&config).ok();
+        std::fs::read_to_string(&config).unwrap();
+        assert!(
+            !waker.wait_until(briefly()),
+            "reading the file does not wake"
+        );
+
+        std::fs::remove_file(&config).unwrap();
+        assert!(
+            waker.wait_until(soon()),
+            "removing the file (burn --clear) wakes"
+        );
     }
 
     /// Fake whose every call fails with a typed management 401, counting the
@@ -949,26 +1302,29 @@ mod tests {
         let now = ts(NOW);
         let mut monitor = Monitor::default();
 
-        let first = monitor.wake(Ok("stale".to_owned()), &connect, now);
+        let first = monitor.wake_no_burn(Ok("stale".to_owned()), &connect, now);
         assert!(first.key_rejected && !first.paused);
         assert!(first.error.unwrap().contains("management key was rejected"));
         assert_eq!(calls.get(), 1);
 
-        let second = monitor.wake(Ok("stale".to_owned()), &connect, now);
+        let second = monitor.wake_no_burn(Ok("stale".to_owned()), &connect, now);
         assert!(second.paused);
         assert_eq!(calls.get(), 1, "a paused wake sends nothing");
 
-        let unreadable = monitor.wake(Err(anyhow::anyhow!("reading key file")), &connect, now);
+        let unreadable =
+            monitor.wake_no_burn(Err(anyhow::anyhow!("reading key file")), &connect, now);
         assert!(!unreadable.paused);
         assert_eq!(unreadable.error.as_deref(), Some("reading key file"));
         assert!(
-            monitor.wake(Ok("stale".to_owned()), &connect, now).paused,
+            monitor
+                .wake_no_burn(Ok("stale".to_owned()), &connect, now)
+                .paused,
             "an unreadable key file in between does not lift the pause"
         );
 
-        let fixed = monitor.wake(Ok("good".to_owned()), &connect, now);
+        let fixed = monitor.wake_no_burn(Ok("good".to_owned()), &connect, now);
         assert!(fixed.error.is_none(), "{:?}", fixed.error);
-        let again = monitor.wake(Ok("stale".to_owned()), &connect, now);
+        let again = monitor.wake_no_burn(Ok("stale".to_owned()), &connect, now);
         assert!(
             again.key_rejected,
             "a key is retried once it has been replaced"
@@ -1129,7 +1485,7 @@ mod tests {
             _ => (500, "{}".to_owned()),
         });
         let client = Client::new(&base, "secret-key".to_owned()).unwrap();
-        let outcome = execute(&client, ts(NOW));
+        let outcome = execute(&client, ts(NOW), None);
         assert!(outcome.error.is_none(), "{:?}", outcome.error);
         assert!(outcome.plan.unwrap().changes.is_empty());
 
@@ -1160,7 +1516,7 @@ mod tests {
             _ => (500, "{}".to_owned()),
         });
         let client = Client::new(&base, "k".to_owned()).unwrap();
-        let outcome = execute(&client, ts(NOW));
+        let outcome = execute(&client, ts(NOW), None);
         let error = outcome.error.unwrap();
         assert!(error.contains("after writing"), "{error}");
         let patches: Vec<Value> = seen
@@ -1185,7 +1541,7 @@ mod tests {
     fn client_reports_rejected_key_without_leaking_it() {
         let (base, _) = stub_server(|_| (401, "{}".to_owned()));
         let client = Client::new(&base, "super-secret".to_owned()).unwrap();
-        let outcome = execute(&client, ts(NOW));
+        let outcome = execute(&client, ts(NOW), None);
         assert!(outcome.key_rejected);
         let error = outcome.error.unwrap();
         assert!(error.contains("management key was rejected"), "{error}");
