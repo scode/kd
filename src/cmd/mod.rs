@@ -176,6 +176,7 @@ mod tests {
         assert!(parses(&["kd", "cli-proxy-api", "monitor", "run"]));
         assert!(parses(&["kd", "cli-proxy-api", "monitor", "enable"]));
         assert!(parses(&["kd", "cli-proxy-api", "monitor", "disable"]));
+        assert!(parses(&["kd", "cli-proxy-api", "monitor", "restart"]));
         assert!(parses(&[
             "kd",
             "cli-proxy-api",

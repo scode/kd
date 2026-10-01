@@ -1,12 +1,13 @@
-//! `kd cli-proxy-api monitor enable|disable`: install or remove the systemd
-//! user unit that keeps `monitor run` running across logouts and reboots.
+//! `kd cli-proxy-api monitor enable|disable|restart`: install, remove, or
+//! restart the systemd user unit that keeps `monitor run` running across
+//! logouts and reboots.
 //!
 //! The unit runs the same `kd` binary that enabled it, by absolute path, with
 //! no flags, so the daemon always uses the default key file and the fixed log
-//! path `overview` reads. Enabling always rewrites the unit and restarts it,
-//! which is also how an upgraded `kd` binary takes effect. Linger is turned
-//! on so the user manager, and with it the monitor, starts at boot rather
-//! than at first login.
+//! path `overview` reads. Enabling always rewrites the unit and restarts it.
+//! After an in-place upgrade of `kd`, `restart` alone makes the running
+//! monitor pick up the new binary. Linger is turned on so the user manager,
+//! and with it the monitor, starts at boot rather than at first login.
 //!
 //! Every external command goes through [`Host`], so the sequence of
 //! `systemctl` and `loginctl` calls is tested without touching the host's
@@ -72,6 +73,16 @@ pub fn unit_path(home: &Path) -> PathBuf {
     home.join(".config").join("systemd").join("user").join(UNIT)
 }
 
+/// The `ExecStart=` line for `exe`. Kept separate so `restart` can tell
+/// which binary an installed unit runs without comparing the rest of the
+/// file, which changes across kd versions and may be edited by hand.
+fn exec_start(exe: &Path) -> String {
+    format!(
+        "ExecStart={} cli-proxy-api monitor run",
+        exec_quote(&exe.to_string_lossy())
+    )
+}
+
 /// The unit file text for `exe`.
 pub fn unit_text(exe: &Path) -> String {
     format!(
@@ -81,13 +92,13 @@ pub fn unit_text(exe: &Path) -> String {
          \n\
          [Service]\n\
          Type=exec\n\
-         ExecStart={} cli-proxy-api monitor run\n\
+         {}\n\
          Restart=always\n\
          RestartSec={RESTART_SEC}\n\
          \n\
          [Install]\n\
          WantedBy=default.target\n",
-        exec_quote(&exe.to_string_lossy())
+        exec_start(exe)
     )
 }
 
@@ -169,6 +180,67 @@ pub fn enable(host: &dyn Host, home: &Path, exe: &Path) -> anyhow::Result<String
         exe.display(),
         path.display()
     ))
+}
+
+/// Restart the enabled unit, so a monitor running an upgraded binary
+/// picks up the new code: `kd cargo scode update` replaces the binary at
+/// the same path, and a running process keeps the old one until restarted.
+///
+/// It refuses unless the unit is installed and enabled, rather than
+/// starting a monitor that was never set up or that the user switched off;
+/// the refusal names the unit path, since a wrong `HOME` (sudo, another
+/// user) looks the same as "not enabled". It reloads the user manager
+/// first, so a unit file edited since the last load is what restarts, and
+/// the binary check below describes what actually runs.
+///
+/// The unit is not rewritten. When its `ExecStart` runs a different binary
+/// than `exe` (it was enabled from another path), the report says so and
+/// points at `enable`, which repoints it; when the restart fails, the same
+/// hint is attached to the error, since a binary that no longer exists at
+/// the unit's path is the usual cause. `exe` is only used for that hint,
+/// so when the running binary cannot be located it is `None` and the hint
+/// is skipped rather than the restart.
+pub fn restart(host: &dyn Host, home: &Path, exe: Option<&Path>) -> anyhow::Result<String> {
+    let path = unit_path(home);
+    let not_enabled = || {
+        anyhow::anyhow!(
+            "the monitor is not enabled ({} is not an enabled unit); run `kd cli-proxy-api monitor enable`",
+            path.display()
+        )
+    };
+    let installed = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(not_enabled()),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+    };
+    require_user_manager(host)?;
+    must(host, "systemctl", &["--user", "daemon-reload"])?;
+    if !host
+        .run("systemctl", &["--user", "is-enabled", "--quiet", UNIT])
+        .is_ok_and(|r| r.ok)
+    {
+        return Err(not_enabled());
+    }
+    let hint = exe
+        .filter(|exe| !installed.lines().any(|line| line.trim() == exec_start(exe)))
+        .map(|exe| {
+            format!(
+                "the unit does not run {}; run `kd cli-proxy-api monitor enable` to switch it to this binary",
+                exe.display()
+            )
+        });
+    if let Err(err) = must(host, "systemctl", &["--user", "restart", UNIT]) {
+        return Err(match &hint {
+            Some(hint) => err.context(hint.clone()),
+            None => err,
+        });
+    }
+    let mut report = format!("restarted {UNIT}\n");
+    if let Some(hint) = hint {
+        report.push_str(&format!("note: {hint}\n"));
+    }
+    report.push_str(&format!("logs: journalctl --user -u {UNIT} -f\n"));
+    Ok(report)
 }
 
 /// Stop and disable the unit and remove its file. Linger is left alone:
@@ -356,6 +428,113 @@ mod tests {
         let err = enable(&host, home.path(), Path::new("/kd")).unwrap_err();
         assert!(err.to_string().contains("restart"), "{err}");
         assert!(err.to_string().contains("boom"), "{err}");
+    }
+
+    /// Restart only works on an installed, enabled unit and a reachable
+    /// user manager; it reloads first so an edited unit is what restarts,
+    /// never re-enables or touches the file, and points at `enable` only
+    /// when the unit's `ExecStart` runs another binary: a unit written by an
+    /// older kd, or edited elsewhere, gets no false note.
+    #[test]
+    fn restart_acts_only_on_an_enabled_unit() {
+        let home = tempfile::tempdir().unwrap();
+        let kd = Path::new("/kd");
+        let host = Fake::default();
+        let err = restart(&host, home.path(), Some(kd)).unwrap_err();
+        assert!(err.to_string().contains("not enabled"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("kd-cli-proxy-api-monitor.service is not an enabled unit"),
+            "names the path it looked at: {err}"
+        );
+        assert!(host.calls.borrow().is_empty());
+
+        enable(&lingering(), home.path(), kd).unwrap();
+        let disabled = Fake {
+            fail: vec!["systemctl --user is-enabled"],
+            ..Fake::default()
+        };
+        let err = restart(&disabled, home.path(), Some(kd)).unwrap_err();
+        assert!(err.to_string().contains("not enabled"), "{err}");
+        assert!(
+            !disabled
+                .calls
+                .borrow()
+                .iter()
+                .any(|c| c.contains("restart"))
+        );
+
+        let host = Fake::default();
+        let report = restart(&host, home.path(), Some(kd)).unwrap();
+        assert_eq!(
+            report,
+            "restarted kd-cli-proxy-api-monitor.service\nlogs: journalctl --user -u kd-cli-proxy-api-monitor.service -f\n"
+        );
+        assert_eq!(
+            *host.calls.borrow(),
+            vec![
+                "systemctl --user show --property=Version",
+                "systemctl --user daemon-reload",
+                "systemctl --user is-enabled --quiet kd-cli-proxy-api-monitor.service",
+                "systemctl --user restart kd-cli-proxy-api-monitor.service",
+            ]
+        );
+
+        let report = restart(&Fake::default(), home.path(), Some(Path::new("/other/kd"))).unwrap();
+        assert!(
+            report.contains("note: the unit does not run /other/kd"),
+            "{report}"
+        );
+        assert!(
+            !restart(&Fake::default(), home.path(), None)
+                .unwrap()
+                .contains("note")
+        );
+
+        let path = unit_path(home.path());
+        let edited = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("RestartSec=60", "RestartSec=30");
+        std::fs::write(&path, &edited).unwrap();
+        assert!(
+            !restart(&Fake::default(), home.path(), Some(kd))
+                .unwrap()
+                .contains("note")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            edited,
+            "restart never rewrites the unit"
+        );
+    }
+
+    /// A failed restart is an error, not "restarted"; when the unit runs
+    /// another binary (typically one that no longer exists), the error
+    /// carries the hint to repoint it with `enable`. An unreachable user
+    /// manager is refused like for `enable`.
+    #[test]
+    fn restart_reports_failures() {
+        let home = tempfile::tempdir().unwrap();
+        enable(&lingering(), home.path(), Path::new("/gone/kd")).unwrap();
+        let failing = Fake {
+            fail: vec!["systemctl --user restart"],
+            ..Fake::default()
+        };
+        let err = format!(
+            "{:#}",
+            restart(&failing, home.path(), Some(Path::new("/kd"))).unwrap_err()
+        );
+        assert!(err.contains("restart") && err.contains("boom"), "{err}");
+        assert!(
+            err.contains("monitor enable"),
+            "the hint survives the failure: {err}"
+        );
+        let unreachable = Fake {
+            fail: vec!["systemctl --user show"],
+            ..Fake::default()
+        };
+        let err = restart(&unreachable, home.path(), None).unwrap_err();
+        assert!(err.to_string().contains("no systemd user manager"), "{err}");
     }
 
     /// Disable stops and removes the unit, and is a no-op when nothing is

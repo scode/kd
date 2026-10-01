@@ -121,6 +121,7 @@ kd cargo scode uninstall kd
 # service (survives logout and reboot), or run it in the foreground.
 kd cli-proxy-api monitor enable
 kd cli-proxy-api monitor disable
+kd cli-proxy-api monitor restart   # after upgrading kd
 kd cli-proxy-api monitor run
 
 # Drain one Claude account first until its weekly reset (for example before
@@ -219,7 +220,7 @@ re-checks every 15 minutes and shortly after each known window reset. Every wake
 after Anthropic says their quota is back (`cooldown_outlives_reset`). If the management key is rejected, the monitor
 stops calling CLIProxyAPI until the key file changes, because CLIProxyAPI bans an address from its management API for 30
 minutes after five failed keys. `monitor enable` runs it as a systemd user service with linger, so it keeps running
-after logout; rerun `enable` after upgrading kd to restart it on the new binary, and read its output with
+after logout; run `monitor restart` after upgrading kd to restart it on the new binary, and read its output with
 `journalctl --user -u kd-cli-proxy-api-monitor -f`. Run `monitor disable` before uninstalling kd, or the unit keeps
 trying to start a binary that is gone. From another machine, run `monitor run` by hand: forward the port with SSH and
 pass `--key-file` with a file holding only the management key.
