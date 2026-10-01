@@ -127,6 +127,11 @@ kd cli-proxy-api monitor run
 # pressing a banked limit reset on it), then return to reset order.
 kd cli-proxy-api burn someone@example.com
 kd cli-proxy-api burn --clear
+
+# Show the pool's state and each account's weekly-quota use over the last
+# week (4-hour bars), or the last hours in 15-minute bars.
+kd cli-proxy-api overview
+kd cli-proxy-api overview --recent
 ```
 
 ## Development environments and stateful instances

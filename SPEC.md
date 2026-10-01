@@ -445,6 +445,34 @@ Whether that is worth it depends on the week ahead, which only the user knows.
   affinity on, a session already bound to another account may stay there, so the switch can lag until sessions turn
   over.
 
+### kd cli-proxy-api overview [--recent]
+
+- Shows the pool's state from the monitor's log and burn override, without contacting CLIProxyAPI: when the monitor last
+  ran, the last pass's error or pause, the burn override, and for each enabled Claude account its priority, weekly and
+  5-hour usage with reset times, and flags. A failed usage lookup (often a dead login, which blocks all priority writes)
+  is called out on its account. Disabled Claude accounts are listed by email.
+- When the latest pass saw no accounts (paused, or failed before listing them), the accounts and charts come from the
+  newest pass that did, and the output says when that was. A priority is shown as planned only when that pass finished
+  without error; otherwise it is the value the pass found.
+- Warns when the latest log record is more than 30 minutes old, since the monitor then appears to have stopped.
+- Charts each account's weekly-quota consumption, in percent of that account's own weekly quota, one bar per bucket. By
+  default the buckets are 4 hours on the local clock (starting at midnight, 04:00, and so on, also across daylight-
+  saving changes), covering the last 7 days (fewer when the terminal is narrow, wider bars when it has room); `--recent`
+  instead fills the width with 15-minute buckets. Local midnights, and every third hour in `--recent`, are marked under
+  the chart where the labels fit.
+- Consumption is derived from utilization snapshots. A weekly rollover or a pressed limit reset (utilization falling
+  while the reset time stays) starts a new window rather than counting as negative use. A bucket's consumption is the
+  difference of cumulative consumption at its two edges, each interpolated linearly between the last snapshot at or
+  before the edge and the first after it, so a snapshot falling just inside or outside a bucket shifts it only
+  proportionally. A bucket with an edge before the history starts, or inside a gap of more than 40 minutes between
+  snapshots (the monitor was down), is shown as unknown (`·`). After the last snapshot, while it is under 30 minutes
+  old, nothing new has been observed, so the bucket in progress shows the consumption seen so far. Consumption between
+  the last snapshot of a week and its reset is not observed.
+- Both the usage lookups (whole percents) and CLIProxyAPI's quota signals (two decimals, refreshed only when the account
+  serves traffic) feed the chart.
+- Only the last eight days of the log are read.
+- Output is colored only on a terminal and when `NO_COLOR` is unset or empty; otherwise it is plain text at 100 columns.
+
 ## kd devbox
 
 NOTE: This is a solo-developer convenience for bootstrapping disposable environments and moving a stateful instance. The
