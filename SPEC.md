@@ -456,11 +456,22 @@ Whether that is worth it depends on the week ahead, which only the user knows.
   without error; otherwise it is the value the pass found.
 - Warns when the latest log record is more than 30 minutes old, since the monitor then appears to have stopped.
 - Charts each account's weekly-quota consumption, in percent of that account's own weekly quota, one bar per bucket. By
-  default the buckets are 4 hours on the local clock (starting at midnight, 04:00, and so on, also across daylight-
-  saving changes), covering the last 7 days (fewer when the terminal is narrow, wider bars when it has room); `--recent`
-  instead fills the width with 15-minute buckets. Local midnights, and every third hour in `--recent`, are marked under
-  the chart where the labels fit. To the right of each chart, gauges show the account's current weekly and 5-hour usage
-  as bars with the percentage spelled out, yellow from 80% and red from 95%; the chart narrows to make room for them.
+  default each account's chart covers its current weekly window, from the rollover that started it to the one that ends
+  it, plus about 21 hours (an eighth of a week, as close as the grid allows) on either side, in 4-hour buckets on the
+  local clock (starting at midnight, 04:00, and so on, also across daylight-saving changes). Bars widen when the
+  terminal has room. When it is too narrow for the whole range, the chart is cut so that now stays on it: the end of the
+  range is kept when now is within reach of it, otherwise the chart ends a little after now. An account whose week has
+  not started, or whose recorded reset has already passed (the accounts come from an older pass), shows the last week
+  and 42 hours ahead. `--recent` instead fills the width with 15-minute buckets ending now. Local midnights, and every
+  third hour in `--recent`, are marked under the chart where the labels fit.
+- In the default view, both rollovers are marked by periwinkle vertical lines and now by a thin white one, each with a
+  tick on the axis and, on a line of their own below the dates, a label whose marker glyph sits in the same column. A
+  label is shortened when it would run into the next marker. When now shares a column with a rollover, the rollover's
+  line is drawn and the labels are joined. Markers are drawn only where the chart is empty, so no bar is hidden. The
+  bucket in progress is drawn white: a thick white bar is use in progress, the thin line alone means none yet. Buckets
+  after now are blank. `--recent` has no markers.
+- To the right of each chart, gauges show the account's current weekly and 5-hour usage as bars with the percentage
+  spelled out, yellow from 80% and red from 95%; the chart narrows to make room for them.
 - Consumption is derived from utilization snapshots. A weekly rollover or a pressed limit reset (utilization falling
   while the reset time stays) starts a new window rather than counting as negative use. A bucket's consumption is the
   difference of cumulative consumption at its two edges, each interpolated linearly between the last snapshot at or

@@ -128,8 +128,9 @@ kd cli-proxy-api monitor run
 kd cli-proxy-api burn someone@example.com
 kd cli-proxy-api burn --clear
 
-# Show the pool's state and each account's weekly-quota use over the last
-# week (4-hour bars), or the last hours in 15-minute bars.
+# Show the pool's state and each account's weekly-quota use across its
+# current week (4-hour bars, rollovers and now marked), or the last hours in
+# 15-minute bars.
 kd cli-proxy-api overview
 kd cli-proxy-api overview --recent
 ```
