@@ -114,6 +114,15 @@ say so in the report rather than deleting it by hand, since it may be the only l
 For router work, remember the probe checks health, loopback-only listeners, the CLIProxyAPI key gate and client wiring,
 but not accounts: a fresh box's plain `codex` and `claude` fail until someone logs accounts in through the printed
 tunnel. Proving routing needs that login plus a request through each default CLI, which is a separate, user-driven step.
+For Codex native image work, verify `requires_openai_auth = false` and the static
+`x-openai-actor-authorization = "codex-lb"` header under `[model_providers.codex-lb]`. The marker keeps the native image
+tool eligible without a local ChatGPT login; it is not a secret, authentication or image entitlement. The probe checks
+this configuration, but a text request does not prove image generation or editing. After router accounts are available,
+start a fresh Codex session through the default provider, generate an image with the native tool, then edit that image
+with the native tool. Existing sessions may retain their old tool inventory. Inspect the resulting artifacts and confirm
+requests went through codex-lb; using a shell or Python image script does not validate the native tool. See the
+[native image host setup snippet](https://snippets.scode.org/s/codex-lb-native-imagegen-host-setup/) for the setup and
+manual checks that motivated this marker. Report the configuration check and the native generation/edit test separately.
 On a host whose routers already serve real sessions, a changed compose file can make a rerun recreate a container and
 cut active streams; check `docker compose ... up -d --dry-run` first when that matters.
 

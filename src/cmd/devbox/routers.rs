@@ -25,7 +25,7 @@
 
 use super::transport::Transport;
 use anyhow::{Context, bail};
-use toml_edit::{DocumentMut, Item, Table, Value};
+use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike, Value};
 use tracing::info;
 
 /// codex-lb's dashboard and proxy. Codex, SSH tunnels and the probe all use
@@ -320,15 +320,26 @@ if [ -L "$f" ]; then exit 3; elif [ -e "$f" ]; then printf '%s\n' KD-CODEX-CONFI
 const CODEX_CONFIG_SENTINEL: &str = "KD-CODEX-CONFIG-BEGIN\n";
 
 /// Replace the pushed config in one rename, so a reader never sees a
-/// truncated file. This does not serialize against a Codex process writing
+/// truncated file. Keep the previous config at `config.toml.kd-backup` with
+/// mode 0600; staging the backup also avoids following an old backup symlink.
+/// This does not serialize against a Codex process writing
 /// the same file (project trust); interactive sessions must be closed during
 /// bootstrap, as for Claude.
-const INSTALL_CODEX_CONFIG: &str =
-    r#"mv -- "$HOME/.codex/config.toml.kd" "$HOME/.codex/config.toml""#;
+const INSTALL_CODEX_CONFIG: &str = r#"umask 077
+config="$HOME/.codex/config.toml"
+if [ -e "$config" ]; then
+  backup=$(mktemp "$HOME/.codex/config.toml.backup.XXXXXXXX") || exit 1
+  trap 'rm -f -- "$backup"' EXIT
+  cat -- "$config" > "$backup" && chmod 600 "$backup" || exit 1
+  mv -T -- "$backup" "$config.kd-backup" || exit 1
+fi
+mv -T -- "$config.kd" "$config""#;
 
 /// Read Codex's config over the transport, merge the codex-lb provider, and
 /// write it back only if it changed. The edit happens on the controller
-/// because the target has no TOML writer; the file holds no secrets.
+/// because the target has no TOML writer. Config may contain user-supplied
+/// headers or credentials, so neither the original nor the result is logged.
+/// A changed existing file is backed up before replacement.
 fn wire_codex(t: &Transport) -> anyhow::Result<()> {
     let captured = t.capture(READ_CODEX_CONFIG)?;
     let existing = match captured.status {
@@ -369,10 +380,16 @@ fn wire_codex(t: &Transport) -> anyhow::Result<()> {
 /// even though codex-lb ignores the token it sends, and a dead login drops
 /// the TUI to the sign-in screen. See [`REQUIRES_OPENAI_AUTH_COMMENT`].
 ///
+/// The static actor-authorization header lets Codex expose native image
+/// tools in this login-skipping mode. It is a capability marker, not a proxy
+/// credential. See [`ACTOR_AUTHORIZATION_COMMENT`] for the verified setup.
+///
 /// Values kd replaces keep their surrounding whitespace and trailing
 /// comments, so an already-wired file is a byte-for-byte no-op and reruns do
 /// not rewrite it. Keys inside `[model_providers.codex-lb]` that kd does not
-/// set survive, so hand additions such as extra headers are kept. An inline
+/// set survive, and the actor marker is merged into existing headers. A
+/// different nonempty actor value is an error rather than a silent overwrite.
+/// An inline
 /// `model_providers = { ... }` (legal, and accepted by Codex) is converted to
 /// a standard table; that changes its layout, not its meaning. A
 /// `model_providers` or `codex-lb` entry that is not a table is an error.
@@ -402,7 +419,93 @@ fn codex_config(existing: Option<&str>) -> anyhow::Result<String> {
     );
     set_keeping_decor(provider, "wire_api", "responses".into());
     set_requires_openai_auth_false(provider);
+    set_actor_authorization(provider)?;
     Ok(doc.to_string())
+}
+
+/// Codex checks this static header case-insensitively when deciding whether
+/// a provider that skips local login can expose native image tools.
+const ACTOR_AUTHORIZATION_HEADER: &str = "x-openai-actor-authorization";
+
+/// Explain the marker in generated config so it is not removed as an unused
+/// credential or replaced with a secret. The snippet records both client
+/// eligibility gates and a fresh-session generation/edit probe.
+const ACTOR_AUTHORIZATION_COMMENT: &str = "\
+# Native image tools need this static capability marker when local login is skipped.
+# The codex-lb value is not a secret and does not authenticate proxy requests.
+# https://snippets.scode.org/s/codex-lb-native-imagegen-host-setup/
+";
+
+/// Merge the actor marker without discarding headers or their table layout.
+///
+/// Codex compares header names without regard to case and trims values for
+/// eligibility. Keep an existing matching entry byte-for-byte, repair empty
+/// strings, and reject other values without including them in the error.
+/// Reject duplicate case variants too: they could send ambiguous HTTP headers
+/// even though the TOML keys are distinct. Environment headers do not satisfy
+/// Codex's eligibility predicate, so this always edits static `http_headers`.
+fn set_actor_authorization(provider: &mut Table) -> anyhow::Result<()> {
+    let item = provider
+        .entry("http_headers")
+        .or_insert_with(|| Item::Value(Value::InlineTable(InlineTable::new())));
+    let headers = item
+        .as_table_like_mut()
+        .context("model_providers.codex-lb.http_headers is not a table")?;
+    let matching: Vec<String> = headers
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case(ACTOR_AUTHORIZATION_HEADER))
+        .map(|(key, _)| key.to_owned())
+        .collect();
+    if matching.len() > 1 {
+        bail!(
+            "codex-lb.http_headers has duplicate actor-authorization header names; resolve them before rerunning bootstrap"
+        );
+    }
+    let key = matching
+        .first()
+        .map(String::as_str)
+        .unwrap_or(ACTOR_AUTHORIZATION_HEADER);
+    if let Some(old) = headers.get(key) {
+        let value = old
+            .as_str()
+            .context("codex-lb actor-authorization header must be a string")?;
+        match value.trim() {
+            "codex-lb" => return Ok(()),
+            "" => {}
+            _ => bail!(
+                "codex-lb has a different actor-authorization value; resolve it before rerunning bootstrap"
+            ),
+        }
+    }
+    set_keeping_decor(headers, key, "codex-lb".into());
+    // Dotted tables serialize their leaf entries, not the parent key's
+    // decoration. Put the explanation on the marker itself for tables;
+    // inline maps need it outside the braces to keep their syntax valid.
+    if let Some(headers) = provider
+        .get_mut("http_headers")
+        .and_then(Item::as_table_mut)
+    {
+        prepend_key_comment(headers, key, ACTOR_AUTHORIZATION_COMMENT);
+    } else {
+        prepend_key_comment(provider, "http_headers", ACTOR_AUTHORIZATION_COMMENT);
+    }
+    Ok(())
+}
+
+/// Add a signpost to an existing key without losing the user's leading
+/// comments. Callers choose a key emitted by the table's representation:
+/// a dotted table does not serialize decoration on its parent key.
+fn prepend_key_comment(table: &mut Table, name: &str, comment: &str) {
+    if let Some(mut key) = table.key_mut(name) {
+        let previous = key
+            .leaf_decor()
+            .prefix()
+            .and_then(|p| p.as_str())
+            .unwrap_or("")
+            .to_owned();
+        key.leaf_decor_mut()
+            .set_prefix(format!("{previous}{comment}"));
+    }
 }
 
 /// Comment kd puts above `requires_openai_auth` whenever it writes that key,
@@ -455,7 +558,7 @@ fn standard_table<'a>(
 /// Set a scalar, reusing the old value's decor (spacing and trailing
 /// comment) when there is one. Plain `table[key] = value(..)` resets the
 /// decor, which drops comments and makes an unchanged file differ.
-fn set_keeping_decor(table: &mut Table, key: &str, new: Value) {
+fn set_keeping_decor(table: &mut dyn TableLike, key: &str, new: Value) {
     match table.get_mut(key).and_then(Item::as_value_mut) {
         Some(old) => {
             let decor = old.decor().clone();
@@ -749,7 +852,12 @@ esac
         );
         assert_eq!(provider["wire_api"].as_str(), Some("responses"));
         assert_eq!(provider["requires_openai_auth"].as_bool(), Some(false));
+        assert_eq!(
+            provider["http_headers"][ACTOR_AUTHORIZATION_HEADER].as_str(),
+            Some("codex-lb")
+        );
         assert!(fresh.contains(REQUIRES_OPENAI_AUTH_COMMENT));
+        assert!(fresh.contains(ACTOR_AUTHORIZATION_COMMENT));
         assert_eq!(codex_config(Some(&fresh)).unwrap(), fresh);
 
         let existing = r#"# my settings
@@ -807,8 +915,149 @@ http_headers = { "X-Extra" = "1" }
                 .starts_with("model_provider = \"codex-lb\" # mine\n")
         );
 
-        let compact = "model_provider=\"codex-lb\"\n[model_providers.codex-lb]\nname=\"openai\"\nbase_url=\"http://127.0.0.1:2455/backend-api/codex\"\nwire_api=\"responses\"\nrequires_openai_auth=false\n";
+        let compact = "model_provider=\"codex-lb\"\n[model_providers.codex-lb]\nname=\"openai\"\nbase_url=\"http://127.0.0.1:2455/backend-api/codex\"\nwire_api=\"responses\"\nrequires_openai_auth=false\nhttp_headers={x-openai-actor-authorization=\"codex-lb\"}\n";
         assert_eq!(codex_config(Some(compact)).unwrap(), compact);
+    }
+
+    /// Existing headers can contain credentials and use either TOML table
+    /// form. Adding image eligibility must preserve their values, comments
+    /// and layout; reruns must not accumulate comments or duplicate keys.
+    #[test]
+    fn actor_marker_merges_into_inline_and_standard_header_tables() {
+        for headers in [
+            "http_headers = { X-Extra = \"kept\" } # headers\n",
+            "[model_providers.codex-lb.http_headers]\n# user header\nX-Extra = \"kept\" # value\n",
+        ] {
+            let existing = format!("[model_providers.codex-lb]\n{headers}");
+            let merged = codex_config(Some(&existing)).unwrap();
+            let parsed: toml::Table = toml::from_str(&merged).unwrap();
+            let map = &parsed["model_providers"]["codex-lb"]["http_headers"];
+            assert_eq!(map["X-Extra"].as_str(), Some("kept"));
+            assert_eq!(map[ACTOR_AUTHORIZATION_HEADER].as_str(), Some("codex-lb"));
+            assert!(merged.contains(ACTOR_AUTHORIZATION_COMMENT));
+            if headers.starts_with('[') {
+                assert!(merged.contains("# user header\nX-Extra = \"kept\" # value"));
+            } else {
+                assert!(merged.contains("http_headers = {"));
+                assert!(merged.contains("# headers"));
+            }
+            assert_eq!(codex_config(Some(&merged)).unwrap(), merged);
+        }
+    }
+
+    /// Dotted keys are legal TOML too. Their implicit header table omits
+    /// parent key decoration, so the explanation must survive on a leaf.
+    /// Parsing and idempotency alone miss a lost marker comment.
+    #[test]
+    fn actor_marker_preserves_dotted_header_definitions() {
+        for existing in [
+            "[model_providers.codex-lb]\nhttp_headers.X-Extra = \"kept\"\n",
+            "[model_providers.codex-lb]\nhttp_headers . X-Extra = \"kept\"\n",
+            "[model_providers.codex-lb]\n\"http_headers\".\"X-Extra\" = \"kept\"\n",
+            "model_providers.codex-lb.http_headers = { X-Extra = \"kept\" }\n",
+        ] {
+            let merged = codex_config(Some(existing)).unwrap();
+            let parsed: toml::Table = toml::from_str(&merged).unwrap();
+            let headers = &parsed["model_providers"]["codex-lb"]["http_headers"];
+            assert!(merged.contains(ACTOR_AUTHORIZATION_COMMENT));
+            assert_eq!(headers["X-Extra"].as_str(), Some("kept"));
+            assert_eq!(
+                headers[ACTOR_AUTHORIZATION_HEADER].as_str(),
+                Some("codex-lb")
+            );
+            assert_eq!(codex_config(Some(&merged)).unwrap(), merged);
+        }
+    }
+
+    /// Codex's actor predicate ignores header-name case and trims values.
+    /// Matching markers must retain user spelling and comments; empty ones
+    /// need repair without adding a second differently cased header.
+    #[test]
+    fn actor_marker_preserves_casing_and_repairs_empty_values() {
+        for value in ["codex-lb", " codex-lb ", "", "  "] {
+            let existing = format!(
+                "[model_providers.codex-lb.http_headers]\nX-OpenAI-Actor-Authorization = \"{value}\" # mine\n"
+            );
+            let merged = codex_config(Some(&existing)).unwrap();
+            let parsed: toml::Table = toml::from_str(&merged).unwrap();
+            let map = parsed["model_providers"]["codex-lb"]["http_headers"]
+                .as_table()
+                .unwrap();
+            assert_eq!(map.len(), 1);
+            let expected = if value.trim().is_empty() {
+                "codex-lb"
+            } else {
+                value
+            };
+            assert_eq!(map["X-OpenAI-Actor-Authorization"].as_str(), Some(expected));
+            assert!(merged.contains("# mine"));
+            if !value.trim().is_empty() {
+                assert!(merged.contains(&existing));
+            }
+            assert_eq!(codex_config(Some(&merged)).unwrap(), merged);
+        }
+    }
+
+    /// Conflicting actor values can be user credentials. Refuse ambiguous
+    /// header maps and invalid types without copying their contents into
+    /// diagnostics; a provisioning rerun must not silently replace them.
+    #[test]
+    fn actor_marker_rejects_conflicts_duplicates_and_invalid_shapes() {
+        for headers in [
+            "http_headers = 1",
+            "http_headers = { x-openai-actor-authorization = 1 }",
+            "http_headers = { x-openai-actor-authorization = \"private-value\" }",
+            "http_headers = { x-openai-actor-authorization = \"codex-lb\", X-OpenAI-Actor-Authorization = \"codex-lb\" }",
+        ] {
+            let existing = format!("[model_providers.codex-lb]\n{headers}\n");
+            let error = codex_config(Some(&existing)).unwrap_err().to_string();
+            assert!(!error.contains("private-value"));
+        }
+    }
+
+    /// Execute the exact installer against a fixture home. Keeping HOME in
+    /// the child environment avoids racing other tests' process settings.
+    fn install_codex_config(home: &std::path::Path) -> std::process::Output {
+        std::process::Command::new("bash")
+            .args(["-c", INSTALL_CODEX_CONFIG])
+            .env("HOME", home)
+            .output()
+            .unwrap()
+    }
+
+    /// A converged config replaces the live file only after preserving its
+    /// previous bytes privately. Fresh installs need no backup, and a failed
+    /// backup must leave the original file in place for recovery.
+    #[test]
+    fn codex_config_install_backs_up_existing_files_and_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let codex = dir.path().join(".codex");
+        fs::create_dir(&codex).unwrap();
+        let config = codex.join("config.toml");
+        let staged = codex.join("config.toml.kd");
+        let backup = codex.join("config.toml.kd-backup");
+        fs::write(&staged, "first").unwrap();
+        assert!(install_codex_config(dir.path()).status.success());
+        assert_eq!(fs::read_to_string(&config).unwrap(), "first");
+        assert!(!backup.exists());
+        fs::write(&staged, "second").unwrap();
+        assert!(install_codex_config(dir.path()).status.success());
+        assert_eq!(fs::read_to_string(&config).unwrap(), "second");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "first");
+        assert_eq!(
+            fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        fs::remove_file(&backup).unwrap();
+        fs::create_dir(&backup).unwrap();
+        // A nonempty destination directory forces the backup rename to
+        // fail with -T, instead of moving the backup inside that directory.
+        fs::write(backup.join("keep"), "unrelated").unwrap();
+        fs::write(&staged, "third").unwrap();
+        assert!(!install_codex_config(dir.path()).status.success());
+        assert_eq!(fs::read_to_string(&config).unwrap(), "second");
     }
 
     /// Boxes wired before logins stopped being copied carry

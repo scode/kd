@@ -169,14 +169,20 @@ fn router_checks() -> [(&'static str, String); 5] {
         (
             // An active `profile` can override the top-level provider, and
             // a wrong base_url routes past codex-lb; check what Codex will
-            // actually use, not just the key kd wrote.
+            // actually use, not just the key kd wrote. The actor marker
+            // keeps native image tools eligible without a local login;
+            // a working text route alone does not establish that setup.
             "codex uses codex-lb",
             format!(
                 "python3 -c 'import tomllib, os
 c = tomllib.load(open(os.path.expanduser(\"~/.codex/config.toml\"), \"rb\"))
 profile = c.get(\"profiles\", {{}}).get(c.get(\"profile\"), {{}})
 assert profile.get(\"model_provider\", c.get(\"model_provider\")) == \"codex-lb\"
-assert c[\"model_providers\"][\"codex-lb\"][\"base_url\"] == \"http://127.0.0.1:{CODEX_LB_PORT}/backend-api/codex\"'"
+provider = c[\"model_providers\"][\"codex-lb\"]
+assert provider[\"base_url\"] == \"http://127.0.0.1:{CODEX_LB_PORT}/backend-api/codex\"
+assert provider.get(\"requires_openai_auth\") is False
+actors = [value for name, value in provider.get(\"http_headers\", {{}}).items() if name.lower() == \"x-openai-actor-authorization\"]
+assert len(actors) == 1 and isinstance(actors[0], str) and actors[0].strip() == \"codex-lb\"'"
             ),
         ),
     ]
@@ -472,7 +478,9 @@ exit {status}
         assert!(!run(&both, 1));
     }
 
-    /// Run one named router check with `HOME` pointed at a fixture home.
+    /// Run the generated shell check against fixture files without changing
+    /// the test process's environment. Only the child gets the fixture HOME,
+    /// so concurrent tests cannot redirect one another's configuration reads.
     fn router_check_passes(name: &str, home: &Path) -> bool {
         let (_, command) = router_checks()
             .into_iter()
@@ -489,8 +497,10 @@ exit {status}
     /// The wiring checks must fail when the wiring is subtly wrong, not only
     /// when it is absent: a stale Claude token, a Codex profile overriding
     /// the provider, or a provider pointing somewhere other than codex-lb.
+    /// Text routing alone also misses the actor marker that keeps native
+    /// image tools eligible when Codex does not have its own ChatGPT login.
     #[test]
-    fn wiring_checks_catch_stale_tokens_profiles_and_wrong_urls() {
+    fn wiring_checks_catch_stale_tokens_profiles_urls_and_image_markers() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         for sub in [".config/cliproxy", ".claude", ".codex"] {
@@ -514,10 +524,18 @@ exit {status}
         assert!(claude("sk-cpa-live"));
         assert!(!claude("sk-cpa-stale"));
 
-        let wired = "model_provider = \"codex-lb\"\n[model_providers.codex-lb]\nbase_url = \"http://127.0.0.1:2455/backend-api/codex\"\n";
+        let wired = "model_provider = \"codex-lb\"\n[model_providers.codex-lb]\nbase_url = \"http://127.0.0.1:2455/backend-api/codex\"\nrequires_openai_auth = false\nhttp_headers = { \"x-openai-actor-authorization\" = \"codex-lb\" }\n";
         let codex = |config: &str| {
             fs::write(home.join(".codex/config.toml"), config).unwrap();
             router_check_passes("codex uses codex-lb", home)
+        };
+        // Keep the routing constant while changing the image eligibility
+        // marker; these failures must not depend on text routing failing.
+        let with_headers = |headers: &str| {
+            wired.replace(
+                "http_headers = { \"x-openai-actor-authorization\" = \"codex-lb\" }\n",
+                headers,
+            )
         };
         assert!(codex(wired));
         assert!(codex(&format!(
@@ -528,6 +546,36 @@ exit {status}
         )));
         assert!(!codex(&wired.replace("2455", "9999")));
         assert!(!codex(&wired.replace("\"codex-lb\"\n[", "\"openai\"\n[")));
+        assert!(!codex(&wired.replace("requires_openai_auth = false\n", "")));
+        assert!(!codex(&wired.replace(
+            "requires_openai_auth = false",
+            "requires_openai_auth = true"
+        )));
+        assert!(!codex(&with_headers("")));
+        assert!(!codex(&with_headers(
+            "http_headers = { \"x-openai-actor-authorization\" = \"\" }\n"
+        )));
+        assert!(!codex(&with_headers(
+            "http_headers = { \"x-openai-actor-authorization\" = \" \" }\n"
+        )));
+        assert!(!codex(&with_headers(
+            "http_headers = { \"x-openai-actor-authorization\" = \"other\" }\n"
+        )));
+        assert!(codex(&with_headers(
+            "http_headers = { \"X-OpenAI-Actor-Authorization\" = \" codex-lb \" }\n"
+        )));
+        assert!(codex(&with_headers(
+            "[model_providers.codex-lb.http_headers]\nX-OpenAI-Actor-Authorization = \"codex-lb\"\n"
+        )));
+        assert!(!codex(&with_headers(
+            "http_headers = { \"x-openai-actor-authorization\" = \"codex-lb\", \"X-OpenAI-Actor-Authorization\" = \"other\" }\n"
+        )));
+        assert!(!codex(&with_headers(
+            "http_headers = { \"x-openai-actor-authorization\" = \"codex-lb\", \"X-OpenAI-Actor-Authorization\" = \"codex-lb\" }\n"
+        )));
+        assert!(!codex(&with_headers(
+            "env_http_headers = { \"x-openai-actor-authorization\" = \"ACTOR_MARKER\" }\n"
+        )));
     }
 
     /// The git-install check must accept exactly the line `cargo install

@@ -390,12 +390,14 @@ Client wiring:
   onboarding repair: symlinks, invalid JSON, a non-object root or a non-object `env` fail; a wired file is left
   byte-for-byte unchanged.
 - Codex: `model_provider = "codex-lb"` plus `[model_providers.codex-lb]` (`name = "openai"`,
-  `http://127.0.0.1:2455/backend-api/codex`, `wire_api = "responses"`, `requires_openai_auth = false`). The target has
-  no TOML writer, so kd reads the file over the transport, merges with `toml_edit`, and replaces the file with a rename
-  only if it changed. The read is framed by a sentinel line, because the transport's `bash -lc` lets profile scripts
-  write to stdout. Replaced values keep their spacing and trailing comments, so a wired file is a byte-identical no-op;
-  an inline `model_providers = { ... }` is converted to a standard table. The display name stays `openai` because other
-  names lost remote compaction through codex-lb during the manual setup. `model` and effort are untouched.
+  `http://127.0.0.1:2455/backend-api/codex`, `wire_api = "responses"`, `requires_openai_auth = false`, and static
+  `http_headers` containing `x-openai-actor-authorization = "codex-lb"`). The target has no TOML writer, so kd reads the
+  file over the transport, merges with `toml_edit`, and replaces the file with a rename only if it changed. Before
+  replacing an existing config, kd saves its old contents to `~/.codex/config.toml.kd-backup` with mode `0600`; a no-op
+  does not update that backup. The read is framed by a sentinel line, because the transport's `bash -lc` lets profile
+  scripts write to stdout. Replaced values keep their spacing and trailing comments, so a wired file is a byte-identical
+  no-op; an inline `model_providers = { ... }` is converted to a standard table. The display name stays `openai` because
+  other names lost remote compaction through codex-lb during the manual setup. `model` and effort are untouched.
   `requires_openai_auth` is false although the [codex-lb README](https://github.com/Soju06/codex-lb) marks `true`
   "required for codex app": the desktop app does not run on these Linux targets. With `true`, Codex insists on its own
   ChatGPT login even though codex-lb (with API key auth off) ignores the token Codex sends, and a dead login drops the
@@ -403,7 +405,16 @@ Client wiring:
   Codex still loads an `auth.json` that exists and keeps trying to refresh it, so the file must be absent, which the
   lent-login lifecycle in "Secrets" guarantees. kd writes a comment above the key saying so, and replaces the key
   together with its old trailing comment when the value was anything else; an already-false key is left alone. Remote
-  compaction with `false` has not been exercised.
+  compaction with `false` has not been exercised. The static actor header keeps native image generation and editing
+  eligible with the login-skipping provider; without it, text requests can work while Codex withholds the native image
+  tool. This is a nonsecret compatibility marker, not authentication or image entitlement. The setup and manual
+  generation/edit checks are recorded in the
+  [native image host setup snippet](https://snippets.scode.org/s/codex-lb-native-imagegen-host-setup/). Merge
+  `http_headers` whether it is an inline table or a standard table, preserving unrelated headers. Header names compare
+  case-insensitively: preserve matching values and casing, repair empty or whitespace-only values, and reject any
+  different nonempty actor value rather than changing its meaning. Compare the marker after trimming whitespace.
+  Non-string values and multiple case-insensitive matches also fail, avoiding ambiguous or invalid outgoing headers. The
+  comment on newly written or repaired markers explains why `requires_openai_auth = false` still needs this header.
 - OpenCode is not wired: a custom provider needs a hardcoded model catalog and default model, which is model pinning
   that rots. Hermes is not touched.
 
@@ -630,7 +641,9 @@ through CLIProxyAPI would fail on every fresh box. Router checks: codex-lb `/hea
 `/v1/models` without a key and succeeds with the client key (passed to curl as a config file on stdin); `ss` shows both
 router ports listening and every listener on `127.0.0.1`; Claude settings carry the router URL and the current client
 key from secrets.env; Codex's effective provider (after any active `profile`) is `codex-lb` and its `base_url` is the
-router's. Account presence is not checked. Every check is reported; none is fatal.
+router's. The same check requires `requires_openai_auth = false` and exactly one static actor header, matched
+case-insensitively and equal to `codex-lb` after trimming. Account presence and native image generation/editing are not
+checked. Every check is reported; none is fatal.
 
 Timezone checks compare `/etc/localtime` with the named zoneinfo file using `cmp`, check `/etc/timezone` if present, and
 query `timedatectl` when `/run/systemd/system` exists. None can mask another's failure. Comparing zoneinfo data covers
