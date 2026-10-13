@@ -114,6 +114,27 @@ say so in the report rather than deleting it by hand, since it may be the only l
 For router work, remember the probe checks health, loopback-only listeners, the CLIProxyAPI key gate and client wiring,
 but not accounts: a fresh box's plain `codex` and `claude` fail until someone logs accounts in through the printed
 tunnel. Proving routing needs that login plus a request through each default CLI, which is a separate, user-driven step.
+
+For Codex model discovery, check `[features].api_key_model_discovery = true` and the provider's
+`model_catalog_url = "http://127.0.0.1:2455/backend-api/codex/models"` and `experimental_bearer_token = "codex-lb"`. The
+bearer is a nonsecret discovery marker for LB's default, disabled client authentication. There must be no top-level
+`model_catalog_json` override. An existing nonempty bearer is preserved instead of replaced with the marker, since
+retained LB settings may require that client credential. Command authentication is preserved without adding a bearer;
+Codex rejects a command combined with a bearer or `env_key`. Header-only Authorization authentication must be migrated
+to provider authentication explicitly before bootstrap can safely add the discovery marker. A configured `env_key` is
+also preserved without a marker; the probe checks its nonblank variable name, not the target's runtime credential. After
+router accounts are available, run `codex debug models` in a fresh process and compare the selected model's metadata
+with the router's `/models` response; `codex debug models --bundled` provides the embedded comparison. A successful
+request alone does not prove current model resolution. Measure the catalog response body in bytes, using the same
+`client_version` query and authentication as the fresh Codex process. Both verified clients cap explicit catalogs at
+1,048,576 bytes; record the remaining headroom. Model instructions can make a few added models exceed that cap, causing
+every refresh to fail until the response shrinks or the client limit changes. Do not treat this as a transient outage.
+This path was verified with Codex 0.160.1 and 0.162.1 and suppresses the bundled catalog in those versions. Older
+clients may still use bundled metadata. A valid cache can avoid a refresh, but an attempted refresh failure clears the
+provider catalog and invalidates its matching cache. An unresolved selected model can still use generic fallback
+metadata. Codex 0.160.1 prints an under-development feature warning for this flag; in 0.162.1 the feature is stable and
+enabled by default. Report the configuration check, live discovery and inference separately.
+
 For Codex native image work, verify `requires_openai_auth = false` and the static
 `x-openai-actor-authorization = "codex-lb"` header under `[model_providers.codex-lb]`. The marker keeps the native image
 tool eligible without a local ChatGPT login; it is not a secret, authentication or image entitlement. The probe checks

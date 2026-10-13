@@ -414,7 +414,35 @@ Client wiring:
   case-insensitively: preserve matching values and casing, repair empty or whitespace-only values, and reject any
   different nonempty actor value rather than changing its meaning. Compare the marker after trimming whitespace.
   Non-string values and multiple case-insensitive matches also fail, avoiding ambiguous or invalid outgoing headers. The
-  comment on newly written or repaired markers explains why `requires_openai_auth = false` still needs this header.
+  comment on newly written or repaired markers explains why `requires_openai_auth = false` still needs this header. Live
+  model discovery also needs `[features].api_key_model_discovery = true`, the provider's explicit
+  `model_catalog_url = "http://127.0.0.1:2455/backend-api/codex/models"`, and `experimental_bearer_token = "codex-lb"`.
+  With no local ChatGPT login, Codex skips ordinary remote discovery; the feature, URL and bearer value enable its
+  API-key discovery path. The bearer is a nonsecret marker, ignored by LB with client authentication disabled, which is
+  the router's default. Preserve an existing nonempty bearer string because it may be a real client credential for
+  retained router authentication settings; missing or blank strings get the marker, and non-string values fail. Command
+  authentication (`auth`) already enables discovery, so preserve it without adding a bearer; reject its incompatible
+  combinations with a bearer or `env_key`. A nonblank string `env_key` also enables discovery and takes precedence over
+  a bearer; preserve it without adding the marker, and leave credential resolution to Codex on the target. Reject
+  non-string or blank `env_key` settings without printing their values. Before adding the marker, reject static or
+  environment-backed Authorization headers case-insensitively: Codex applies provider bearer authentication after those
+  headers, which would replace a retained client credential. The error directs the user to configure provider
+  authentication explicitly, and does not print header values. Upstream authentication still belongs to LB's accounts.
+  This bearer setting and the static actor header serve separate client eligibility gates. Merge the feature table
+  without discarding other features, including inline and nested tables. Remove the top-level `model_catalog_json`
+  override because it supersedes remote discovery, but leave the catalog file untouched. No model metadata or context
+  limits are copied or pinned. Preserve user profiles; the probe retains its legacy profile-override checks, but these
+  do not establish compatibility with current Codex profile semantics. Discovery was verified with Codex 0.160.1 and
+  0.162.1. In 0.160.1 the discovery feature is under development and enabling it prints a startup warning; in 0.162.1 it
+  is stable and enabled by default. Older clients may still use bundled metadata. The explicit provider catalog
+  suppresses the bundled catalog in these verified versions. A valid provider cache can avoid a refresh. An attempted
+  refresh that fails clears the provider catalog and invalidates its matching cache; an unresolved selected model can
+  still use generic fallback metadata. Failed discovery does not necessarily stop inference. Both verified clients cap
+  explicit catalog responses at 1 MiB (1,048,576 bytes). Model instructions contribute to that size; catalog growth can
+  exceed the cap and make every refresh fail until the response shrinks or the client limit changes. This leaves generic
+  fallback metadata rather than bundled metadata, and the configuration-only probe cannot detect it. Measure the actual
+  response size and remaining headroom during live validation. See the
+  [Codex 0.162.1 endpoint limit](https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/model-provider/src/models_endpoint.rs).
 - OpenCode is not wired: a custom provider needs a hardcoded model catalog and default model, which is model pinning
   that rots. Hermes is not touched.
 
@@ -642,8 +670,12 @@ through CLIProxyAPI would fail on every fresh box. Router checks: codex-lb `/hea
 router ports listening and every listener on `127.0.0.1`; Claude settings carry the router URL and the current client
 key from secrets.env; Codex's effective provider (after any active `profile`) is `codex-lb` and its `base_url` is the
 router's. The same check requires `requires_openai_auth = false` and exactly one static actor header, matched
-case-insensitively and equal to `codex-lb` after trimming. Account presence and native image generation/editing are not
-checked. Every check is reported; none is fatal.
+case-insensitively and equal to `codex-lb` after trimming. It also requires the live catalog URL, the nonsecret
+discovery bearer value (the generated marker or a preserved client credential), a nonblank environment-key setting, or
+command authentication without conflicting bearer/env_key settings, the discovery feature enabled after any active
+profile override, and no top-level file-catalog override. These are configuration checks: a fresh router has no
+accounts, so the probe does not fetch or establish the provenance of a live catalog. Account presence and native image
+generation/editing are not checked. Every check is reported; none is fatal.
 
 Timezone checks compare `/etc/localtime` with the named zoneinfo file using `cmp`, check `/etc/timezone` if present, and
 query `timedatectl` when `/run/systemd/system` exists. None can mask another's failure. Comparing zoneinfo data covers

@@ -680,16 +680,21 @@ Terms used below:
   in `~/.claude/settings.json` (created if missing, then mode `0600` because it holds the proxy key); Codex gets
   `model_provider = "codex-lb"` and a `[model_providers.codex-lb]` table in `~/.codex/config.toml` (created if missing),
   with `requires_openai_auth = false` so Codex does not ask for a local ChatGPT login that codex-lb would ignore anyway.
-  Its static `http_headers` include `x-openai-actor-authorization = "codex-lb"` so Codex keeps native image generation
-  and editing eligible with that login-skipping provider. This marker is not a secret, login credential or image
-  entitlement. Existing headers are preserved; a matching actor header keeps its casing and value, and an empty value is
-  repaired. A different nonempty actor value, a non-string value or multiple case-insensitive matches fail bootstrap
-  rather than being overwritten. When an existing Codex config changes, its previous contents are saved to
-  `~/.codex/config.toml.kd-backup` with mode `0600`; an unchanged config leaves the backup alone. Other settings,
-  including the Codex model and reasoning effort, are preserved. If `~/.config/cliproxy/secrets.env` is lost while the
-  `cliproxy-data` volume keeps its config, bootstrap fails and says how to recover rather than generating keys the proxy
-  would reject. Symlinked or unmergeable files fail bootstrap rather than being replaced. OpenCode and Hermes are not
-  pointed at the routers.
+  Codex is configured to discover current model metadata through the router once accounts are available, rather than
+  relying only on the catalog bundled with its installation. Reruns remove the old `model_catalog_json` file override;
+  the referenced file is left alone. Model and context limits are not hardcoded by bootstrap. Its static `http_headers`
+  include `x-openai-actor-authorization = "codex-lb"` so Codex keeps native image generation and editing eligible with
+  that login-skipping provider. This marker is not a secret, login credential or image entitlement. Existing headers are
+  preserved; a matching actor header keeps its casing and value, and an empty value is repaired. A different nonempty
+  actor value, a non-string value or multiple case-insensitive matches fail bootstrap rather than being overwritten.
+  Existing provider bearer credentials, environment-key settings or command authentication are preserved. Header-only
+  Authorization credentials cannot be migrated automatically without overriding authentication; bootstrap refuses that
+  configuration before writing and asks the user to configure provider authentication explicitly. When an existing Codex
+  config changes, its previous contents are saved to `~/.codex/config.toml.kd-backup` with mode `0600`; an unchanged
+  config leaves the backup alone. Other settings, including the Codex model and reasoning effort, are preserved. If
+  `~/.config/cliproxy/secrets.env` is lost while the `cliproxy-data` volume keeps its config, bootstrap fails and says
+  how to recover rather than generating keys the proxy would reject. Symlinked or unmergeable files fail bootstrap
+  rather than being replaced. OpenCode and Hermes are not pointed at the routers.
 - Reruns keep router state: accounts, settings and history in the `codex-lb-data` and `cliproxy-data` volumes,
   CLIProxyAPI's `config.yaml`, and its generated keys in `~/.config/cliproxy/secrets.env`. Compose files and image pins
   are kd's and are rewritten on every run, so a rerun with a newer kd can upgrade a router. codex-lb database migrations
@@ -709,11 +714,11 @@ Terms used below:
   onboarding flag, one real request through Codex (past codex-lb, on the lent login) and Muse (Claude has no login to
   test before router accounts exist; OpenCode is installed but not probed), router health, loopback-only router
   listeners, CLIProxyAPI's client-key check, and the Codex and Claude router wiring (including the Codex actor marker
-  and login-skipping setting). It does not check router accounts or generate or edit images. Restores additionally check
-  Hermes gateway state and, outside rehearsals, dashboard reachability. Tailscale is checked only with
-  `--enroll-tailscale`. Probe failures are reported, never fatal: bootstrap exits 0 once the probe has run. After the
-  probe, each agent phase's final message is printed whole, which is where the agent lists anything it had to work
-  around, even when the run succeeded.
+  and login-skipping and model-discovery settings). It does not check router accounts, fetch a live model catalog or
+  generate or edit images. Restores additionally check Hermes gateway state and, outside rehearsals, dashboard
+  reachability. Tailscale is checked only with `--enroll-tailscale`. Probe failures are reported, never fatal: bootstrap
+  exits 0 once the probe has run. After the probe, each agent phase's final message is printed whole, which is where the
+  agent lists anything it had to work around, even when the run succeeded.
 - After a rehearsal the worker is left running for inspection with a reminder that it holds real credentials (the GitHub
   login, OpenCode's, Muse's and Hermes's); `kd` does not destroy it.
 - Manually starting restored services after a rehearsal leaves the rehearsal's safety conditions. If the source is still
