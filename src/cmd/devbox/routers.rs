@@ -365,8 +365,9 @@ fn wire_codex(t: &Transport) -> anyhow::Result<()> {
     t.run(INSTALL_CODEX_CONFIG)
 }
 
-/// Make codex-lb the default provider in a Codex config.toml, preserving
-/// everything else.
+/// Route Codex requests and live model discovery through codex-lb.
+/// Unrelated settings survive; the old file-catalog override is removed so
+/// a frozen snapshot cannot supersede the router's current model metadata.
 ///
 /// The provider's display name stays `openai` on purpose: with any other name
 /// Codex stopped using remote compaction through codex-lb (observed during
@@ -384,6 +385,15 @@ fn wire_codex(t: &Transport) -> anyhow::Result<()> {
 /// tools in this login-skipping mode. It is a capability marker, not a proxy
 /// credential. See [`ACTOR_AUTHORIZATION_COMMENT`] for the verified setup.
 ///
+/// Skipping local login also skips ordinary ChatGPT model discovery. Enable
+/// the API-key discovery path with an explicit catalog URL and a nonsecret
+/// bearer marker. LB's client authentication is disabled by default and it
+/// uses its own accounts upstream; the marker satisfies Codex's discovery
+/// gate, not upstream authentication. No model or context limits are pinned.
+/// Existing command authentication enables discovery without that marker.
+/// Header-only Authorization credentials require an explicit migration to
+/// provider authentication; refuse to overwrite their runtime behavior.
+///
 /// Values kd replaces keep their surrounding whitespace and trailing
 /// comments, so an already-wired file is a byte-for-byte no-op and reruns do
 /// not rewrite it. Keys inside `[model_providers.codex-lb]` that kd does not
@@ -399,6 +409,25 @@ fn codex_config(existing: Option<&str>) -> anyhow::Result<String> {
         .parse()
         .context("~/.codex/config.toml is not valid TOML")?;
     set_keeping_decor(doc.as_table_mut(), "model_provider", "codex-lb".into());
+    doc.remove("model_catalog_json");
+    let features = standard_table(
+        doc.as_table_mut(),
+        "features",
+        false,
+        "features in ~/.codex/config.toml is not a table",
+    )?;
+    if features
+        .get("api_key_model_discovery")
+        .and_then(Item::as_bool)
+        != Some(true)
+    {
+        set_keeping_decor(features, "api_key_model_discovery", true.into());
+        prepend_key_comment(
+            features,
+            "api_key_model_discovery",
+            "# Discover current model metadata through the router without a local ChatGPT login.\n",
+        );
+    }
     let providers = standard_table(
         doc.as_table_mut(),
         "model_providers",
@@ -412,15 +441,79 @@ fn codex_config(existing: Option<&str>) -> anyhow::Result<String> {
         "model_providers.codex-lb in ~/.codex/config.toml is not a table",
     )?;
     set_keeping_decor(provider, "name", "openai".into());
+    let base_url = format!("http://127.0.0.1:{CODEX_LB_PORT}/backend-api/codex");
+    set_keeping_decor(provider, "base_url", base_url.clone().into());
     set_keeping_decor(
         provider,
-        "base_url",
-        format!("http://127.0.0.1:{CODEX_LB_PORT}/backend-api/codex").into(),
+        "model_catalog_url",
+        format!("{base_url}/models").into(),
     );
+    set_codex_discovery_auth(provider)?;
     set_keeping_decor(provider, "wire_api", "responses".into());
     set_requires_openai_auth_false(provider);
     set_actor_authorization(provider)?;
     Ok(doc.to_string())
+}
+
+/// Supply discovery authentication without replacing router credentials.
+/// Command authentication already enables discovery, and Codex rejects it
+/// when combined with a bearer or env_key. Environment-key authentication
+/// takes precedence over a bearer and needs no marker. Header-only
+/// authentication does not enable API-key discovery; refuse that migration
+/// before writing rather than letting the marker override an Authorization
+/// credential at runtime.
+fn set_codex_discovery_auth(provider: &mut Table) -> anyhow::Result<()> {
+    if provider.contains_key("auth") {
+        anyhow::ensure!(
+            !provider.contains_key("experimental_bearer_token")
+                && !provider.contains_key("env_key"),
+            "codex-lb auth cannot be combined with experimental_bearer_token or env_key"
+        );
+        return Ok(());
+    }
+    // Router auth settings survive bootstrap. An existing bearer may be a
+    // real client credential, and it already satisfies the discovery gate.
+    let bearer_missing = provider
+        .get("experimental_bearer_token")
+        .map(|item| {
+            item.as_str()
+                .context("codex-lb experimental_bearer_token must be a string")
+                .map(|value| value.trim().is_empty())
+        })
+        .transpose()?
+        .unwrap_or(true);
+    if let Some(item) = provider.get("env_key") {
+        let name = item.as_str().context("codex-lb env_key must be a string")?;
+        anyhow::ensure!(
+            !name.trim().is_empty(),
+            "codex-lb env_key must not be blank"
+        );
+        // Resolve this credential in Codex on the target, not in bootstrap's
+        // controller environment. A configured env_key already enables discovery.
+        return Ok(());
+    }
+    if bearer_missing {
+        for name in ["http_headers", "env_http_headers"] {
+            if let Some(item) = provider.get(name) {
+                let headers = item
+                    .as_table_like()
+                    .with_context(|| format!("model_providers.codex-lb.{name} is not a table"))?;
+                anyhow::ensure!(
+                    !headers
+                        .iter()
+                        .any(|(key, _)| key.eq_ignore_ascii_case("authorization")),
+                    "codex-lb Authorization header would be overridden by the discovery marker; configure provider authentication with experimental_bearer_token, env_key, or auth before rerunning bootstrap"
+                );
+            }
+        }
+        set_keeping_decor(provider, "experimental_bearer_token", "codex-lb".into());
+        prepend_key_comment(
+            provider,
+            "experimental_bearer_token",
+            "# Nonsecret discovery marker: LB ignores this bearer with client authentication disabled.\n",
+        );
+    }
+    Ok(())
 }
 
 /// Codex checks this static header case-insensitively when deciding whether
@@ -844,6 +937,12 @@ esac
         let fresh = codex_config(None).unwrap();
         let parsed: toml::Table = toml::from_str(&fresh).unwrap();
         assert_eq!(parsed["model_provider"].as_str(), Some("codex-lb"));
+        assert_eq!(
+            parsed["features"]["api_key_model_discovery"].as_bool(),
+            Some(true)
+        );
+        assert!(!parsed.contains_key("model_catalog_json"));
+        assert!(!parsed.contains_key("model_context_window"));
         let provider = &parsed["model_providers"]["codex-lb"];
         assert_eq!(provider["name"].as_str(), Some("openai"));
         assert_eq!(
@@ -851,6 +950,14 @@ esac
             Some("http://127.0.0.1:2455/backend-api/codex")
         );
         assert_eq!(provider["wire_api"].as_str(), Some("responses"));
+        assert_eq!(
+            provider["model_catalog_url"].as_str(),
+            Some("http://127.0.0.1:2455/backend-api/codex/models")
+        );
+        assert_eq!(
+            provider["experimental_bearer_token"].as_str(),
+            Some("codex-lb")
+        );
         assert_eq!(provider["requires_openai_auth"].as_bool(), Some(false));
         assert_eq!(
             provider["http_headers"][ACTOR_AUTHORIZATION_HEADER].as_str(),
@@ -864,6 +971,11 @@ esac
 model = "gpt-6-sol"
 model_provider = "openai"
 model_reasoning_effort = "high"
+model_catalog_json = "/old-catalog.json"
+
+[features]
+api_key_model_discovery = false
+other_feature = true
 
 [projects."/home/u/git/kd"]
 trust_level = "trusted"
@@ -880,6 +992,12 @@ http_headers = { "X-Extra" = "1" }
         );
         let parsed: toml::Table = toml::from_str(&merged).unwrap();
         assert_eq!(parsed["model_reasoning_effort"].as_str(), Some("high"));
+        assert!(!parsed.contains_key("model_catalog_json"));
+        assert_eq!(
+            parsed["features"]["api_key_model_discovery"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(parsed["features"]["other_feature"].as_bool(), Some(true));
         assert_eq!(
             parsed["projects"]["/home/u/git/kd"]["trust_level"].as_str(),
             Some("trusted")
@@ -915,8 +1033,154 @@ http_headers = { "X-Extra" = "1" }
                 .starts_with("model_provider = \"codex-lb\" # mine\n")
         );
 
-        let compact = "model_provider=\"codex-lb\"\n[model_providers.codex-lb]\nname=\"openai\"\nbase_url=\"http://127.0.0.1:2455/backend-api/codex\"\nwire_api=\"responses\"\nrequires_openai_auth=false\nhttp_headers={x-openai-actor-authorization=\"codex-lb\"}\n";
+        let compact = "model_provider=\"codex-lb\"\n[features]\napi_key_model_discovery=true\n[model_providers.codex-lb]\nname=\"openai\"\nbase_url=\"http://127.0.0.1:2455/backend-api/codex\"\nmodel_catalog_url=\"http://127.0.0.1:2455/backend-api/codex/models\"\nexperimental_bearer_token=\"codex-lb\"\nwire_api=\"responses\"\nrequires_openai_auth=false\nhttp_headers={x-openai-actor-authorization=\"codex-lb\"}\n";
         assert_eq!(codex_config(Some(compact)).unwrap(), compact);
+    }
+
+    /// Feature tables may be inline or implicit parents of nested settings.
+    /// Enabling discovery must preserve those settings and converge on rerun;
+    /// replacing the entire table would discard the user's other capabilities.
+    #[test]
+    fn codex_discovery_preserves_inline_and_nested_feature_settings() {
+        for existing in [
+            "features = { api_key_model_discovery = false, other_feature = true }\n",
+            "[features.multi_agent_v2]\nmax_concurrent_threads_per_session = 20\n",
+        ] {
+            let merged = codex_config(Some(existing)).unwrap();
+            let parsed: toml::Table = toml::from_str(&merged).unwrap();
+            assert_eq!(
+                parsed["features"]["api_key_model_discovery"].as_bool(),
+                Some(true)
+            );
+            if existing.starts_with("features =") {
+                assert_eq!(parsed["features"]["other_feature"].as_bool(), Some(true));
+            } else {
+                assert_eq!(
+                    parsed["features"]["multi_agent_v2"]["max_concurrent_threads_per_session"]
+                        .as_integer(),
+                    Some(20)
+                );
+            }
+            assert_eq!(codex_config(Some(&merged)).unwrap(), merged);
+        }
+    }
+
+    /// Router settings and accounts survive reruns, so a user may already
+    /// have enabled client authentication. Its bearer must not become the
+    /// dummy marker: either string satisfies Codex's discovery gate, but
+    /// only the original credential can authenticate to that router.
+    #[test]
+    fn codex_discovery_preserves_existing_bearers_and_repairs_blank_values() {
+        for token in ["existing-client-key", "", "  "] {
+            let existing = format!(
+                "[model_providers.codex-lb]\nexperimental_bearer_token = \"{token}\" # kept\n"
+            );
+            let merged = codex_config(Some(&existing)).unwrap();
+            let parsed: toml::Table = toml::from_str(&merged).unwrap();
+            let expected = if token.trim().is_empty() {
+                "codex-lb"
+            } else {
+                token
+            };
+            assert_eq!(
+                parsed["model_providers"]["codex-lb"]["experimental_bearer_token"].as_str(),
+                Some(expected)
+            );
+            assert_eq!(codex_config(Some(&merged)).unwrap(), merged);
+        }
+        let error = codex_config(Some(
+            "[model_providers.codex-lb]\nexperimental_bearer_token = 1\n",
+        ))
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("experimental_bearer_token must be a string")
+        );
+    }
+
+    /// Codex's command-auth path discovers models independently of the
+    /// API-key gate. A marker would make an otherwise valid provider unloadable;
+    /// preserve the command and reject existing conflicting auth fields.
+    #[test]
+    fn codex_discovery_preserves_command_auth_without_a_bearer() {
+        let existing =
+            "[model_providers.codex-lb.auth]\ncommand = \"router-token\"\nargs = [\"--client\"]\n";
+        let merged = codex_config(Some(existing)).unwrap();
+        let parsed: toml::Table = toml::from_str(&merged).unwrap();
+        let provider = parsed["model_providers"]["codex-lb"].as_table().unwrap();
+        assert!(!provider.contains_key("experimental_bearer_token"));
+        assert_eq!(provider["auth"]["command"].as_str(), Some("router-token"));
+        assert_eq!(provider["auth"]["args"][0].as_str(), Some("--client"));
+        assert_eq!(codex_config(Some(&merged)).unwrap(), merged);
+        for conflicting in [
+            "experimental_bearer_token = \"\"",
+            "env_key = \"ROUTER_KEY\"",
+        ] {
+            let config = format!("[model_providers.codex-lb]\n{conflicting}\n{existing}");
+            let error = codex_config(Some(&config)).unwrap_err();
+            assert!(error.to_string().contains("auth cannot be combined"));
+        }
+    }
+
+    /// Static and environment-backed Authorization headers may be the only
+    /// credentials for a retained router. Refuse to inject a marker over them,
+    /// including case variants and both TOML table forms, without leaking values.
+    #[test]
+    fn codex_discovery_refuses_to_override_header_authentication() {
+        for headers in [
+            "http_headers = { Authorization = \"Bearer private-client-key\" }\n",
+            "[model_providers.codex-lb.http_headers]\naUtHoRiZaTiOn = \"Bearer private-client-key\"\n",
+            "env_http_headers = { AUTHORIZATION = \"PRIVATE_ROUTER_KEY\" }\n",
+            "[model_providers.codex-lb.env_http_headers]\nauthorization = \"PRIVATE_ROUTER_KEY\"\n",
+        ] {
+            for bearer in ["", "experimental_bearer_token = \" \"\n"] {
+                let config = format!("[model_providers.codex-lb]\n{bearer}{headers}");
+                let error = codex_config(Some(&config)).unwrap_err().to_string();
+                assert!(error.contains("Authorization header would be overridden"));
+                assert!(!error.contains("private-client-key"));
+                assert!(!error.contains("PRIVATE_ROUTER_KEY"));
+            }
+        }
+    }
+
+    /// An environment key already satisfies the discovery gate and takes
+    /// precedence over Authorization headers. Preserve that working route
+    /// without adding a marker or inspecting the controller's environment.
+    #[test]
+    fn codex_discovery_preserves_environment_key_authentication() {
+        for headers in [
+            "",
+            "http_headers = { Authorization = \"Bearer private-client-key\" }\n",
+            "env_http_headers = { Authorization = \"OTHER_ROUTER_KEY\" }\n",
+        ] {
+            let existing =
+                format!("[model_providers.codex-lb]\nenv_key = \"ROUTER_KEY\" # kept\n{headers}");
+            let merged = codex_config(Some(&existing)).unwrap();
+            let parsed: toml::Table = toml::from_str(&merged).unwrap();
+            let provider = parsed["model_providers"]["codex-lb"].as_table().unwrap();
+            assert_eq!(provider["env_key"].as_str(), Some("ROUTER_KEY"));
+            assert!(!provider.contains_key("experimental_bearer_token"));
+            for name in ["http_headers", "env_http_headers"] {
+                let original: toml::Table = toml::from_str(&existing).unwrap();
+                if let Some(value) = original["model_providers"]["codex-lb"].get(name) {
+                    assert_eq!(provider[name]["Authorization"], value["Authorization"]);
+                }
+            }
+            assert!(merged.contains("env_key = \"ROUTER_KEY\" # kept"));
+            assert_eq!(codex_config(Some(&merged)).unwrap(), merged);
+        }
+        for (invalid, expected) in [
+            ("1", "codex-lb env_key must be a string"),
+            ("\"\"", "codex-lb env_key must not be blank"),
+            ("\" \"", "codex-lb env_key must not be blank"),
+        ] {
+            let config = format!("[model_providers.codex-lb]\nenv_key = {invalid}\n");
+            let error = codex_config(Some(&config)).unwrap_err();
+            // Exact diagnostics establish which guard refused the value and
+            // prevent the configuration value from being added to the error.
+            assert_eq!(error.to_string(), expected);
+        }
     }
 
     /// Existing headers can contain credentials and use either TOML table
@@ -1087,6 +1351,7 @@ http_headers = { "X-Extra" = "1" }
             "not = [valid",
             "model_providers = 1\n",
             "[model_providers]\ncodex-lb = 1\n",
+            "features = 1\n",
         ] {
             assert!(codex_config(Some(bad)).is_err(), "{bad}");
         }

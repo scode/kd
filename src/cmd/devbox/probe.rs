@@ -171,7 +171,8 @@ fn router_checks() -> [(&'static str, String); 5] {
             // a wrong base_url routes past codex-lb; check what Codex will
             // actually use, not just the key kd wrote. The actor marker
             // keeps native image tools eligible without a local login;
-            // a working text route alone does not establish that setup.
+            // a working text route alone does not establish that setup or
+            // live model discovery. A snapshot override defeats discovery.
             "codex uses codex-lb",
             format!(
                 "python3 -c 'import tomllib, os
@@ -181,6 +182,21 @@ assert profile.get(\"model_provider\", c.get(\"model_provider\")) == \"codex-lb\
 provider = c[\"model_providers\"][\"codex-lb\"]
 assert provider[\"base_url\"] == \"http://127.0.0.1:{CODEX_LB_PORT}/backend-api/codex\"
 assert provider.get(\"requires_openai_auth\") is False
+assert provider.get(\"model_catalog_url\") == \"http://127.0.0.1:{CODEX_LB_PORT}/backend-api/codex/models\"
+bearer = provider.get(\"experimental_bearer_token\")
+auth = provider.get(\"auth\")
+if auth is None:
+    env_key = provider.get(\"env_key\")
+    assert bearer is None or isinstance(bearer, str)
+    if env_key is None:
+        assert isinstance(bearer, str) and bearer.strip()
+    else:
+        assert isinstance(env_key, str) and env_key.strip()
+else:
+    assert isinstance(auth, dict) and isinstance(auth.get(\"command\"), str) and auth[\"command\"].strip()
+    assert \"experimental_bearer_token\" not in provider and \"env_key\" not in provider
+assert profile.get(\"features\", {{}}).get(\"api_key_model_discovery\", c.get(\"features\", {{}}).get(\"api_key_model_discovery\")) is True
+assert c.get(\"model_catalog_json\") is None
 actors = [value for name, value in provider.get(\"http_headers\", {{}}).items() if name.lower() == \"x-openai-actor-authorization\"]
 assert len(actors) == 1 and isinstance(actors[0], str) and actors[0].strip() == \"codex-lb\"'"
             ),
@@ -498,7 +514,8 @@ exit {status}
     /// when it is absent: a stale Claude token, a Codex profile overriding
     /// the provider, or a provider pointing somewhere other than codex-lb.
     /// Text routing alone also misses the actor marker that keeps native
-    /// image tools eligible when Codex does not have its own ChatGPT login.
+    /// image tools eligible and the discovery settings needed to load current
+    /// model metadata when Codex does not have its own ChatGPT login.
     #[test]
     fn wiring_checks_catch_stale_tokens_profiles_urls_and_image_markers() {
         let dir = tempfile::tempdir().unwrap();
@@ -524,7 +541,16 @@ exit {status}
         assert!(claude("sk-cpa-live"));
         assert!(!claude("sk-cpa-stale"));
 
-        let wired = "model_provider = \"codex-lb\"\n[model_providers.codex-lb]\nbase_url = \"http://127.0.0.1:2455/backend-api/codex\"\nrequires_openai_auth = false\nhttp_headers = { \"x-openai-actor-authorization\" = \"codex-lb\" }\n";
+        let wired = r#"model_provider = "codex-lb"
+[features]
+api_key_model_discovery = true
+[model_providers.codex-lb]
+base_url = "http://127.0.0.1:2455/backend-api/codex"
+model_catalog_url = "http://127.0.0.1:2455/backend-api/codex/models"
+experimental_bearer_token = "codex-lb"
+requires_openai_auth = false
+http_headers = { "x-openai-actor-authorization" = "codex-lb" }
+"#;
         let codex = |config: &str| {
             fs::write(home.join(".codex/config.toml"), config).unwrap();
             router_check_passes("codex uses codex-lb", home)
@@ -550,6 +576,62 @@ exit {status}
         assert!(!codex(&wired.replace(
             "requires_openai_auth = false",
             "requires_openai_auth = true"
+        )));
+        // Each discovery input is necessary even when text routing works.
+        // Check absence as well as stale values, including a profile that
+        // disables the global feature and a file snapshot taking precedence.
+        for missing in [
+            "api_key_model_discovery = true\n",
+            "model_catalog_url = \"http://127.0.0.1:2455/backend-api/codex/models\"\n",
+            "experimental_bearer_token = \"codex-lb\"\n",
+        ] {
+            assert!(!codex(&wired.replace(missing, "")), "{missing}");
+        }
+        assert!(!codex(&wired.replace(
+            "api_key_model_discovery = true",
+            "api_key_model_discovery = false"
+        )));
+        assert!(!codex(&wired.replace("/codex/models", "/codex/stale")));
+        assert!(!codex(&wired.replace(
+            "experimental_bearer_token = \"codex-lb\"",
+            "experimental_bearer_token = \"\""
+        )));
+        assert!(codex(&wired.replace(
+            "experimental_bearer_token = \"codex-lb\"",
+            "experimental_bearer_token = \"existing-client-key\""
+        )));
+        // An env_key is another provider authentication path. This checks
+        // configuration only; the target's runtime credential is not read.
+        let env_auth = wired.replace(
+            "experimental_bearer_token = \"codex-lb\"",
+            "env_key = \"ROUTER_KEY\"",
+        );
+        assert!(codex(&env_auth));
+        for invalid in ["1", "\"\"", "\" \""] {
+            assert!(!codex(&env_auth.replace("\"ROUTER_KEY\"", invalid)));
+        }
+        // Command auth is an alternative discovery gate; adding even a blank
+        // bearer or env_key makes Codex reject the provider before startup.
+        let command_auth = format!(
+            "{}[model_providers.codex-lb.auth]\ncommand = \"router-token\"\n",
+            wired.replace("experimental_bearer_token = \"codex-lb\"\n", "")
+        );
+        assert!(codex(&command_auth));
+        assert!(!codex(&command_auth.replace("router-token", " ")));
+        for conflicting in [
+            "experimental_bearer_token = \"\"",
+            "env_key = \"ROUTER_KEY\"",
+        ] {
+            assert!(!codex(&command_auth.replace(
+                "requires_openai_auth = false",
+                &format!("requires_openai_auth = false\n{conflicting}")
+            )));
+        }
+        assert!(!codex(&format!(
+            "profile = \"p\"\n{wired}[profiles.p.features]\napi_key_model_discovery = false\n"
+        )));
+        assert!(!codex(&format!(
+            "model_catalog_json = \"/old-catalog.json\"\n{wired}"
         )));
         assert!(!codex(&with_headers("")));
         assert!(!codex(&with_headers(

@@ -203,6 +203,10 @@ fails. They start with no accounts, and logging accounts in is a manual step aft
 tunnel command and where to go). Until then `codex` and `claude` on that box fail; there is no native login to fall back
 to. Router accounts and history live in Docker volumes and are not backed up.
 
+Codex also discovers current model metadata through codex-lb once accounts are available. Rerunning bootstrap removes an
+old file-catalog override so it cannot freeze model capabilities and context limits; the file itself is left alone. The
+probe checks discovery configuration, not a live catalog fetch from the initially accountless router.
+
 Bootstrap installs `kd` itself from this repository's default branch with `cargo install --locked --git`. On a
 bootstrapped box, `kd cargo scode update` updates kd, and any other tool installed from a github.com/scode repository,
 to the latest commit of its branch.
