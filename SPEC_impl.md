@@ -368,6 +368,11 @@ security contract rather than a preference, and because it generates secrets:
   `pull_policy: always` (its upstream compose) would move a box onto whatever shipped that morning. kd owns both compose
   files under `~/.config/codex-lb/` and `~/.config/cliproxy/` and rewrites them every run; a pin bump plus a rerun is
   the upgrade path.
+- The CLIProxyAPI v8.0.36 image was checked on amd64 and arm64 for Go 1.26.10 and all eight intermediate SPKI hashes
+  blocked by that Go release after the eMudhra incident. Its Debian CA package remains older; the protection is in Go's
+  verifier. The pinned codex-lb image still needs a corrected upstream build: its Python client combines system roots
+  with an old certifi bundle, so correcting only the host's trust store does not repair it. See
+  [router trust status](docs/router-trust.md) before treating a bootstrap as incident-remediated.
 - Named volumes `codex-lb-data` and `cliproxy-data`, created by kd and marked `external`, so `docker compose down -v`
   cannot delete account logins. Everything accumulated inside them is left alone, including CLIProxyAPI's `config.yaml`,
   which is seeded only when absent because its management UI edits it in place. The seed sets
