@@ -19,6 +19,9 @@ Rerunning the one-liner rebuilds kd from the current default branch. It needs a 
 macOS; `cc`, e.g. from `build-essential`, on Linux) and says so if one is missing. Read [`install.sh`](install.sh)
 before piping it if you (sensibly) don't run shell scripts off the internet blind.
 
+The pinned codex-lb router image still has an unresolved eMudhra trust-store issue. The Rust client and CLIProxyAPI
+updates do not repair that separate image; see [router trust status](docs/router-trust.md) before a new deployment.
+
 Earlier versions of this installer cloned kd into `~/git/kd` and installed from that checkout. Rerunning the one-liner
 replaces such an install; the old checkout is no longer used and can be deleted.
 

@@ -120,13 +120,17 @@ volumes:
 /// not here. `WRITABLE_PATH` puts logs and the downloaded management panel in
 /// the volume next to config and auths; `TZ` overrides the image's hardcoded
 /// Asia/Shanghai with the timezone bootstrap gives every devbox.
+///
+/// The v8.0.36 amd64 and arm64 binaries include Go 1.26.10's intermediate-key
+/// distrust list. The image's older Debian CA package is not evidence of
+/// that protection; keep checking the binary when changing this pin.
 const CLIPROXY_COMPOSE: &str = r#"# Written by kd devbox bootstrap; rewritten on every run. See kd's SPEC_impl.md.
 # Host networking with the listener pinned to 127.0.0.1 in config.yaml; Docker
 # port publishing would bind every interface and bypass UFW. The image is
 # pinned by digest because upstream releases almost daily.
 services:
   cliproxy:
-    image: eceasy/cli-proxy-api:v7.3.17@sha256:a1dffb9c2300099039d9e2dd3dbf6396a72b798c891fe170940d2d8106222a8c
+    image: eceasy/cli-proxy-api:v8.0.36@sha256:bc25ea627f675e4e3714f48d3b1dd22643e45464dcc1c3c7c5688f51bc6b49fb
     container_name: cliproxy
     restart: unless-stopped
     network_mode: host
