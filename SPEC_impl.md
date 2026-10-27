@@ -291,6 +291,12 @@ agent's problem; an explicitly chosen upstream installer overrides the general p
 - SSH: key-only, `PermitRootLogin no`, `PasswordAuthentication no`. Validate with `sshd -t` before restarting.
 - UFW: default deny inbound, allow OpenSSH, `ufw allow in on tailscale0`, enable.
 - Unattended security upgrades with automatic reboot disabled.
+- Inotify: persist `fs.inotify.max_user_instances=1024` in root-owned, mode 0644 `/etc/sysctl.d/99-kd-inotify.conf`,
+  replacing the managed file on reruns. Resolve later overrides of this key without changing unrelated settings, apply
+  the file immediately with `sudo -n sysctl -p`, and verify the live value with
+  `sysctl -n fs.inotify.max_user_instances`. Development tools need more instances per user; a runtime-only write would
+  lose the setting on reboot. If a restricted host prevents applying it, retain the persistent configuration where
+  possible and report the runtime failure in Workarounds.
 - Base packages: build tools, curl, git, jq, ripgrep, tmux, tree, shellcheck, unzip, ca-certificates, `emacs-nox`, `mg`.
 - Media and browser dependencies: ImageMagick, ffmpeg, Xvfb, Playwright's system dependencies, GTK/WebKit runtime
   packages.

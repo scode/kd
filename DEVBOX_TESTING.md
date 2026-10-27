@@ -152,6 +152,11 @@ checking today's offset alone misses daylight-saving errors. For Git author work
 defaults and remember that repository-local or environment overrides may select another identity for a particular
 commit. For rehearsals, verify restored services remain disabled and stopped.
 
+For inotify setup, inspect `/etc/sysctl.d/99-kd-inotify.conf` and any later overrides, then verify
+`sysctl -n fs.inotify.max_user_instances` reports `1024`. A live value alone does not prove persistence; when testing
+across an authorized reboot, verify it again afterwards. A restricted host may reject the runtime change even if the
+configuration file was written; check the system phase's Workarounds section for that distinction.
+
 Manually starting Hermes on a rehearsal target is no longer a stopped rehearsal. If the source is active too, this forks
 real state and may process external work twice. Do it only when the user explicitly accepts that operation; there is no
 automatic isolation or reconciliation. `resume --profile` acts on the profile's source, not an arbitrary rehearsal
