@@ -705,6 +705,9 @@ Terms used below:
   its query failures cannot be hidden by falling back to a text file. The probe also reports an inherited `TZ` value
   other than `America/Los_Angeles`, including an explicitly empty value. Bootstrap does not silently rewrite existing
   user timezone overrides. Application-specific and container timezone settings are outside the host setup contract.
+- Bootstrap sets `fs.inotify.max_user_instances=1024` immediately and persistently across reboots so development tools
+  can open more inotify instances per user. Hosts that prevent applying the setting are reported in the system phase's
+  Workarounds section; persistent configuration is still written where possible.
 - With `--restore`, Hermes is restored from the newest archive in the backup directory whose name carries this profile's
   hostname, so two profiles can share a backup directory. A rerun re-imports that archive and discards whatever Hermes
   state the previous attempt accumulated. Outside a rehearsal, its gateway and loopback-only dashboard are enabled and
