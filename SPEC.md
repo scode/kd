@@ -676,25 +676,27 @@ Terms used below:
   log in. Until accounts exist, plain `codex` and `claude` requests on the target fail, and there is no native fallback.
   Bootstrap's own setup agent and the probe's Codex request bypass codex-lb with `codex -c 'model_provider="openai"'`
   and the lent login.
-- Router client wiring changes only what it needs. Claude gets `env.ANTHROPIC_BASE_URL` and `env.ANTHROPIC_AUTH_TOKEN`
-  in `~/.claude/settings.json` (created if missing, then mode `0600` because it holds the proxy key); Codex gets
-  `model_provider = "codex-lb"` and a `[model_providers.codex-lb]` table in `~/.codex/config.toml` (created if missing),
-  with `requires_openai_auth = false` so Codex does not ask for a local ChatGPT login that codex-lb would ignore anyway.
-  Codex is configured to discover current model metadata through the router once accounts are available, rather than
-  relying only on the catalog bundled with its installation. Reruns remove the old `model_catalog_json` file override;
-  the referenced file is left alone. Model and context limits are not hardcoded by bootstrap. Its static `http_headers`
-  include `x-openai-actor-authorization = "codex-lb"` so Codex keeps native image generation and editing eligible with
-  that login-skipping provider. This marker is not a secret, login credential or image entitlement. Existing headers are
-  preserved; a matching actor header keeps its casing and value, and an empty value is repaired. A different nonempty
-  actor value, a non-string value or multiple case-insensitive matches fail bootstrap rather than being overwritten.
-  Existing provider bearer credentials, environment-key settings or command authentication are preserved. Header-only
-  Authorization credentials cannot be migrated automatically without overriding authentication; bootstrap refuses that
-  configuration before writing and asks the user to configure provider authentication explicitly. When an existing Codex
-  config changes, its previous contents are saved to `~/.codex/config.toml.kd-backup` with mode `0600`; an unchanged
-  config leaves the backup alone. Other settings, including the Codex model and reasoning effort, are preserved. If
-  `~/.config/cliproxy/secrets.env` is lost while the `cliproxy-data` volume keeps its config, bootstrap fails and says
-  how to recover rather than generating keys the proxy would reject. Symlinked or unmergeable files fail bootstrap
-  rather than being replaced. OpenCode and Hermes are not pointed at the routers.
+- Router client wiring changes only what it needs. Claude gets `env.ANTHROPIC_BASE_URL`, `env.ANTHROPIC_AUTH_TOKEN` and
+  `promptCacheTtl = "1h"` in `~/.claude/settings.json` (created if missing, then mode `0600` because it holds the proxy
+  key). The one-hour main-conversation cache TTL is set on every bootstrap, replacing any existing value while
+  preserving unrelated settings. Codex gets `model_provider = "codex-lb"` and a `[model_providers.codex-lb]` table in
+  `~/.codex/config.toml` (created if missing), with `requires_openai_auth = false` so Codex does not ask for a local
+  ChatGPT login that codex-lb would ignore anyway. Codex is configured to discover current model metadata through the
+  router once accounts are available, rather than relying only on the catalog bundled with its installation. Reruns
+  remove the old `model_catalog_json` file override; the referenced file is left alone. Model and context limits are not
+  hardcoded by bootstrap. Its static `http_headers` include `x-openai-actor-authorization = "codex-lb"` so Codex keeps
+  native image generation and editing eligible with that login-skipping provider. This marker is not a secret, login
+  credential or image entitlement. Existing headers are preserved; a matching actor header keeps its casing and value,
+  and an empty value is repaired. A different nonempty actor value, a non-string value or multiple case-insensitive
+  matches fail bootstrap rather than being overwritten. Existing provider bearer credentials, environment-key settings
+  or command authentication are preserved. Header-only Authorization credentials cannot be migrated automatically
+  without overriding authentication; bootstrap refuses that configuration before writing and asks the user to configure
+  provider authentication explicitly. When an existing Codex config changes, its previous contents are saved to
+  `~/.codex/config.toml.kd-backup` with mode `0600`; an unchanged config leaves the backup alone. Other settings,
+  including the Codex model and reasoning effort, are preserved. If `~/.config/cliproxy/secrets.env` is lost while the
+  `cliproxy-data` volume keeps its config, bootstrap fails and says how to recover rather than generating keys the proxy
+  would reject. Symlinked or unmergeable files fail bootstrap rather than being replaced. OpenCode and Hermes are not
+  pointed at the routers.
 - Reruns keep router state: accounts, settings and history in the `codex-lb-data` and `cliproxy-data` volumes,
   CLIProxyAPI's `config.yaml`, and its generated keys in `~/.config/cliproxy/secrets.env`. Compose files and image pins
   are kd's and are rewritten on every run, so a rerun with a newer kd can upgrade a router. codex-lb database migrations

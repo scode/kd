@@ -263,17 +263,21 @@ docker compose -f "$cliproxy/compose.yaml" up -d || exit 1
 // Claude
 // ---------------------------------------------------------------------------
 
-/// Point plain `claude` at CLIProxyAPI by merging two `env` keys into
-/// `~/.claude/settings.json`, creating the file when missing. settings.json
-/// rather than a shell profile, because it applies however Claude is
-/// launched (tmux, scripts, other agents). The client key sits there as a
+/// Point plain `claude` at CLIProxyAPI and request a one-hour prompt cache
+/// by merging into `~/.claude/settings.json`, creating the file when missing.
+/// Use settings.json rather than a shell profile so this applies however
+/// Claude is launched (tmux, scripts, other agents). The client key sits there as a
 /// literal, so the file ends up mode 0600; it only works against the
 /// loopback proxy.
 ///
-/// Every other key is preserved. The dotfiles installer merges only its own
+/// The explicit `promptCacheTtl` avoids Claude's five-minute default with
+/// proxy authentication, keeping the main conversation cached across longer
+/// pauses and satisfying idle compaction's one-hour TTL requirement. It replaces
+/// an existing TTL on reruns, including already-wired boxes.
+/// Unrelated keys are preserved. The dotfiles installer merges only its own
 /// paths into the same file and keeps both `env` and the file mode, so the
 /// two do not fight over it. Symlinked, invalid, or non-object files and a
-/// non-object `env` fail rather than being replaced. An already-wired file
+/// non-object `env` fail rather than being replaced. A fully configured file
 /// is left byte-for-byte unchanged. The key reaches jq through the
 /// environment, not argv.
 pub const CLAUDE_SETTINGS: &str = r#"
@@ -291,7 +295,7 @@ umask 077
 mkdir -p "$HOME/.claude" || exit 1
 if [ -e "$settings" ]; then
   jq -e 'type == "object"' "$settings" >/dev/null || exit 1
-  if jq -e --arg url "$url" '.env.ANTHROPIC_BASE_URL == $url and .env.ANTHROPIC_AUTH_TOKEN == $ENV.KD_CLIPROXY_KEY' "$settings" >/dev/null; then
+  if jq -e --arg url "$url" '.env.ANTHROPIC_BASE_URL == $url and .env.ANTHROPIC_AUTH_TOKEN == $ENV.KD_CLIPROXY_KEY and .promptCacheTtl == "1h"' "$settings" >/dev/null; then
     chmod 600 "$settings" || exit 1
     exit 0
   fi
@@ -303,7 +307,7 @@ if [ -e "$settings" ]; then
 else
   printf '{}\n' > "$staged" || exit 1
 fi
-updated=$(jq --arg url "$url" '.env = ((.env // {}) + {ANTHROPIC_BASE_URL: $url, ANTHROPIC_AUTH_TOKEN: $ENV.KD_CLIPROXY_KEY})' "$staged") || exit 1
+updated=$(jq --arg url "$url" '.env = ((.env // {}) + {ANTHROPIC_BASE_URL: $url, ANTHROPIC_AUTH_TOKEN: $ENV.KD_CLIPROXY_KEY}) | .promptCacheTtl = "1h"' "$staged") || exit 1
 printf '%s\n' "$updated" > "$staged" || exit 1
 mv -- "$staged" "$settings" || exit 1
 "#;
@@ -873,13 +877,21 @@ esac
     }
 
     /// The merge must work on a fresh box where Claude never wrote settings,
-    /// keep every existing setting including other env vars, lock the file
-    /// down because it now holds a key, and leave a wired file untouched.
+    /// keep unrelated settings including other env vars, lock the file down
+    /// because it now holds a key, and leave a fully configured file untouched.
+    /// Already-wired boxes still need the one-hour TTL on reruns; checking
+    /// only the proxy credentials would silently skip that migration.
     #[test]
     fn claude_settings_merge_creates_preserves_and_is_idempotent() {
         for initial in [
             None,
             Some(r#"{"theme":"dark","env":{"FOO":"bar"},"permissions":{"allow":["x"]}}"#),
+            Some(
+                r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8317","ANTHROPIC_AUTH_TOKEN":"sk-cpa-test"}}"#,
+            ),
+            Some(
+                r#"{"promptCacheTtl":"5m","env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8317","ANTHROPIC_AUTH_TOKEN":"sk-cpa-test"}}"#,
+            ),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let settings = dir.path().join(".claude/settings.json");
@@ -899,6 +911,7 @@ esac
                 serde_json::from_str(initial.unwrap_or("{}")).unwrap();
             expected["env"]["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:8317".into();
             expected["env"]["ANTHROPIC_AUTH_TOKEN"] = "sk-cpa-test".into();
+            expected["promptCacheTtl"] = "1h".into();
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
                 expected

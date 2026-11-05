@@ -394,12 +394,18 @@ security contract rather than a preference, and because it generates secrets:
 
 Client wiring:
 
-- Claude: `env.ANTHROPIC_BASE_URL` and `env.ANTHROPIC_AUTH_TOKEN` merged into `~/.claude/settings.json` with jq,
-  creating the file when Claude never wrote one. settings.json rather than a shell profile, because it applies however
-  Claude is launched. The file becomes 0600 because it now holds the key. The dotfiles installer's `JsonManaged` merges
-  only its own paths into this file and preserves `env` and the file mode, so the two coexist. Same safety rules as the
-  onboarding repair: symlinks, invalid JSON, a non-object root or a non-object `env` fail; a wired file is left
-  byte-for-byte unchanged.
+- Claude: `env.ANTHROPIC_BASE_URL`, `env.ANTHROPIC_AUTH_TOKEN` and `promptCacheTtl = "1h"` merged into
+  `~/.claude/settings.json` with jq, creating the file when Claude never wrote one. settings.json rather than a shell
+  profile, because it applies however Claude is launched. The file becomes 0600 because it now holds the key. The
+  dotfiles installer's `JsonManaged` merges only its own paths into this file and preserves `env` and the file mode, so
+  the two coexist. Same safety rules as the onboarding repair: symlinks, invalid JSON, a non-object root or a non-object
+  `env` fail. The explicit TTL avoids
+  [Claude's five-minute default for API-key authentication](https://code.claude.com/docs/en/prompt-caching#choose-the-ttl-yourself)
+  through the proxy, keeping the main conversation cached across longer pauses and satisfying
+  [idle compaction's one-hour TTL requirement](https://code.claude.com/docs/en/settings-reference#idlecompaction).
+  Reruns replace any existing TTL; the no-op check requires both proxy credentials and the one-hour TTL, so
+  already-wired boxes receive the setting too. A fully configured file is left byte-for-byte unchanged. The probe checks
+  all three values.
 - Codex: `model_provider = "codex-lb"` plus `[model_providers.codex-lb]` (`name = "openai"`,
   `http://127.0.0.1:2455/backend-api/codex`, `wire_api = "responses"`, `requires_openai_auth = false`, and static
   `http_headers` containing `x-openai-actor-authorization = "codex-lb"`). The target has no TOML writer, so kd reads the
