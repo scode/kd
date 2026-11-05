@@ -115,6 +115,12 @@ For router work, remember the probe checks health, loopback-only listeners, the 
 but not accounts: a fresh box's plain `codex` and `claude` fail until someone logs accounts in through the printed
 tunnel. Proving routing needs that login plus a request through each default CLI, which is a separate, user-driven step.
 
+For Claude prompt caching, check `promptCacheTtl = "1h"` in `~/.claude/settings.json`; the wiring probe requires it
+alongside the proxy URL and token. After router accounts are available, run `claude -p "hello" --output-format json` and
+inspect `usage.cache_creation.ephemeral_1h_input_tokens` to confirm one-hour cache writes. The file check alone does not
+prove the effective TTL: environment overrides and gateway header handling can change it. See
+[Claude's TTL controls](https://code.claude.com/docs/en/prompt-caching#choose-the-ttl-yourself).
+
 For Codex model discovery, check `[features].api_key_model_discovery = true` and the provider's
 `model_catalog_url = "http://127.0.0.1:2455/backend-api/codex/models"` and `experimental_bearer_token = "codex-lb"`. The
 bearer is a nonsecret discovery marker for LB's default, disabled client authentication. There must be no top-level

@@ -158,12 +158,14 @@ fn router_checks() -> [(&'static str, String); 5] {
         (
             // Both keys: a stale token (say, secrets.env regenerated) would
             // otherwise pass here while every real request gets a 401. The
-            // key reaches jq through the environment, not argv.
+            // key reaches jq through the environment, not argv. Also require
+            // the one-hour TTL: working routing alone leaves proxy sessions
+            // on Claude's five-minute cache default.
             "claude uses cliproxy",
             format!(
                 "KD_KEY=$(sed -n 's/^CLIPROXY_CLIENT_KEY=//p' \"$HOME/.config/cliproxy/secrets.env\") && \
                  [ -n \"$KD_KEY\" ] && export KD_KEY && \
-                 jq -e '.env.ANTHROPIC_BASE_URL == \"http://127.0.0.1:{CLIPROXY_PORT}\" and .env.ANTHROPIC_AUTH_TOKEN == $ENV.KD_KEY' \"$HOME/.claude/settings.json\""
+                 jq -e '.env.ANTHROPIC_BASE_URL == \"http://127.0.0.1:{CLIPROXY_PORT}\" and .env.ANTHROPIC_AUTH_TOKEN == $ENV.KD_KEY and .promptCacheTtl == \"1h\"' \"$HOME/.claude/settings.json\""
             ),
         ),
         (
@@ -511,8 +513,9 @@ exit {status}
     }
 
     /// The wiring checks must fail when the wiring is subtly wrong, not only
-    /// when it is absent: a stale Claude token, a Codex profile overriding
-    /// the provider, or a provider pointing somewhere other than codex-lb.
+    /// when it is absent: a stale Claude token, a missing or five-minute
+    /// cache TTL, a Codex profile overriding the provider, or a provider
+    /// pointing somewhere other than codex-lb.
     /// Text routing alone also misses the actor marker that keeps native
     /// image tools eligible and the discovery settings needed to load current
     /// model metadata when Codex does not have its own ChatGPT login.
@@ -528,18 +531,25 @@ exit {status}
             "CLIPROXY_CLIENT_KEY=sk-cpa-live\n",
         )
         .unwrap();
-        let claude = |token: &str| {
+        let claude = |token: &str, ttl: Option<&str>| {
+            let mut settings = serde_json::json!({"env": {
+                "ANTHROPIC_BASE_URL": "http://127.0.0.1:8317",
+                "ANTHROPIC_AUTH_TOKEN": token,
+            }});
+            if let Some(ttl) = ttl {
+                settings["promptCacheTtl"] = ttl.into();
+            }
             fs::write(
                 home.join(".claude/settings.json"),
-                format!(
-                    r#"{{"env":{{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8317","ANTHROPIC_AUTH_TOKEN":"{token}"}}}}"#
-                ),
+                serde_json::to_vec(&settings).unwrap(),
             )
             .unwrap();
             router_check_passes("claude uses cliproxy", home)
         };
-        assert!(claude("sk-cpa-live"));
-        assert!(!claude("sk-cpa-stale"));
+        assert!(claude("sk-cpa-live", Some("1h")));
+        assert!(!claude("sk-cpa-stale", Some("1h")));
+        assert!(!claude("sk-cpa-live", None));
+        assert!(!claude("sk-cpa-live", Some("5m")));
 
         let wired = r#"model_provider = "codex-lb"
 [features]
