@@ -330,6 +330,51 @@ the reasoning behind it.
   given after the worker name reaches boat, which then joins everything after it into one string for the ssh client,
   losing argument boundaries; and ubiworker's `kd ubiworker ssh -- -v` escape has no working equivalent, since
   `kd boatworker ssh -- -v` becomes `boat ssh <id> -v`, which boat refuses.
+- `create` makes a boatworker come up on the tailnet exactly as a ubiworker does: a one-use, ephemeral, preauthorized
+  auth key that expires after an hour, the same first-boot script (Tailscale installer, `tailscale up --ssh` with the
+  worker name as hostname and the same retry loop, then the detached `kd-bootstrap` unit running `apt-get dist-upgrade`
+  and `apt-get satisfy` for the `--pkg` packages), and the same no-polling return. The tag is `tag:boat` rather than
+  `tag:ubicloud`, so tailnet policy can treat the two fleets separately, and an OAuth client can be limited to minting
+  keys for one of them. `create` preflights `TS_API_CLIENT_ID` and `TS_API_CLIENT_SECRET` like ubiworker, with no
+  `UBI_TOKEN` and no boat credential.
+- The worker name is the tailnet hostname, so a name given to `create` is held to the DNS label rule: lowercase
+  alphanumerics and hyphens, at most 63 characters, not starting or ending with a hyphen, checked after the prefix is
+  added. Boat itself would accept far more. The default name is `boatworker-YYYYMMDD-HHMMSS` in local time.
+- Boat documents no uniqueness rule for sandbox names and accepts duplicates (observed: renaming one sandbox to
+  another's name succeeds), so `create` refuses a name an owned sandbox already has, naming that sandbox's id, before
+  minting a key or starting anything. kd thereby never creates the ambiguity `destroy` and `ssh` have to handle; a
+  sandbox made by hand can still create it. On a cut-off listing, a collision beyond the first page goes undetected.
+- Every boatworker is started with `boat new --no-auto-stop --no-env --no-snapshots --no-monitoring --type <TYPE>`. It
+  runs, and bills, until `kd boatworker destroy`, like a ubiworker. It never receives the boat account's stored
+  environment variables, secret files or credentials, and boat keeps neither snapshots of its disk nor a record of its
+  commands and process output. With snapshots off, a `boat stop` erases the sandbox; kd offers no stop or resume.
+- `--type` (`small`, `default`, `large` or `xlarge`, default `large`) is the one part of the shape the caller chooses,
+  besides `--pkg`. ubiworker's fixed shape is a decision about one disposable shape; boat's sizes differ enough in price
+  and capacity that a fixed one would push people to `boat new` by hand. `large` has the 16 GB of memory a ubiworker has
+  (and twice its vCPUs). Whether the account's plan allows a size is boat's to say.
+- The first-boot script reaches boat as a setup file (`boat new --setup-file`), which boat runs once, in the background,
+  after the sandbox reports ready, as the unprivileged `user` account. kd puts a short prelude in front of ubiworker's
+  script that re-runs the file under `sudo -n /bin/sh`, since the script assumes root, and then deletes the file: boat
+  leaves setup files on the sandbox readable by every local account, and the key in it stays valid for up to an hour if
+  enrollment fails. The auth key is in the file and never in any process's argv, unlike `kd ubiworker create`, which
+  passes the script to `ubi` as an argument. The key still reaches boat's API, as it reaches Ubicloud's for a ubiworker.
+  kd's local copy is a private temp file removed when `create` finishes or fails; an interrupt while `boat new` runs can
+  leave it behind.
+- `create` returns once `boat new` reports the sandbox ready. Enrollment then runs in the background; `boat info <id>`
+  reports its progress as the setup status (`done` once the worker has joined the tailnet and launched `kd-bootstrap`,
+  `failed` with an exit code otherwise). If `boat new` fails, or succeeds without output kd can read the sandbox id and
+  readiness from, a sandbox may exist and bill anyway, and the error says how to find and destroy it. Lines of
+  `boat new` output that are not JSON events are ignored.
+- In an organization scope whose default visibility is `shared`, a new sandbox is open to every member, including a root
+  shell on a worker that sits on the operator's tailnet. kd passes no visibility flag, because the boatworker flag set
+  is fixed and kd is built for the personal scope; set the organization's default to private, or stay in the personal
+  scope.
+- The Unix account is boat's fixed `user` (passwordless sudo), not the local username ubiworker provisions; boat offers
+  no choice. The printed summary's example tailnet `ssh` rule therefore grants `user` on `tag:boat`, with the same `src`
+  rules as ubiworker's. A tag (for a tagged machine running kd) is also a valid `src`, and the summary says so.
+- While `kd-bootstrap` upgrades `openssh-server`, sshd on the sandbox is briefly down, so `boat ssh` and `boat scp` can
+  fail with "Connection refused" for a moment; Tailscale SSH is unaffected. The upgrade can also leave the system asking
+  for a restart, which kd does not do, as on ubiworkers.
 
 ## kd cargo scode
 

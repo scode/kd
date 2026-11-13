@@ -51,6 +51,22 @@ A GraphQL response with `errors` makes `gh api graphql` exit non-zero even when 
 `NOT_FOUND`s (a PR that became inaccessible after the search). The transport therefore hands on any JSON body regardless
 of exit status, and `query_data` tolerates `NOT_FOUND` while failing on any other error.
 
+## kd boatworker
+
+- The first-boot script is the shared `worker_bootstrap::init_script::render_init_script` that ubiworkers run, called
+  unchanged, with a prelude in front that re-runs the file under `sudo -n /bin/sh "$0"`. Do not fork the script into a
+  boat-specific copy to drop the prelude, and do not edit the shared renderer to run its commands under `sudo` instead:
+  the point is one enrollment and bootstrap sequence for both fleets, and a re-exec leaves the shared script exactly as
+  Ubicloud runs it. Boat runs a setup file as `bash <relative path>` from `/home/user` (observed with boat CLI 1.0.97);
+  `sudo` keeps the working directory, so the relative `$0` still resolves. `-n` makes a missing sudo grant fail instead
+  of hanging on a password prompt.
+- The script travels as a file (`--setup-file` pointing at a `tempfile::NamedTempFile`, mode 0600, removed when it
+  drops), never as an argument. Passing the content inline would put the auth key in argv, the exposure SPEC.md notes
+  for `kd ubiworker create`. Once running as root, the prelude deletes the setup file, which boat would otherwise leave
+  on the sandbox readable by every local account with the auth key in it.
+- `boat` is invoked without `--no-update`. Boat updates its own CLI on invocation unless told not to, and kd leaves that
+  to the user (`BOAT_NO_UPDATE=1`); an update has not been seen to disturb `--json` output. Revisit if it does.
+
 ## kd cli-proxy-api
 
 Why strict priority by weekly reset, rather than weights: using the soonest-expiring quota first never wastes more than

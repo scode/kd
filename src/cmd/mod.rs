@@ -225,6 +225,28 @@ mod tests {
         ]));
     }
 
+    /// `create` takes ubiworker's optional name and repeatable `--pkg`, plus
+    /// `--type`, which only accepts boat's own machine sizes so a typo fails
+    /// before an auth key is minted.
+    #[test]
+    fn boatworker_create_parses_with_type_restricted_to_boat_sizes() {
+        assert!(parses(&["kd", "boatworker", "create"]));
+        assert!(parses(&["kd", "boatworker", "create", "myname"]));
+        assert!(parses(&[
+            "kd",
+            "boatworker",
+            "create",
+            "--pkg",
+            "git",
+            "--pkg",
+            "jq",
+            "--type",
+            "default"
+        ]));
+        assert!(parses(&["kd", "boatworker", "create", "--type", "xlarge"]));
+        assert!(!parses(&["kd", "boatworker", "create", "--type", "huge"]));
+    }
+
     /// The `boatworker` listing and destroy shapes mirror `ubiworker`'s,
     /// including `--all` excluding names and the absence of a `--yes` flag
     /// (there is no prompt to skip; see SPEC.md).
