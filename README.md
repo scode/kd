@@ -118,6 +118,13 @@ kd boatworker destroy
 kd boatworker destroy myname otherworker
 kd boatworker destroy --all
 
+# Shell into a boatworker through `boat ssh`, or run a command there (with no
+# name, the sole boatworker). Arguments are a remote command; boat's own -t
+# gives it a terminal. ssh flags like -L don't pass through; use boat forward.
+kd boatworker ssh
+kd boatworker ssh myname uptime
+kd boatworker ssh myname -t tmux attach
+
 # Update kd and every other tool installed from a github.com/scode repository
 # to the latest commit of its branch.
 kd cargo scode update
@@ -318,8 +325,8 @@ ownership, naming, and the minted tailscale key's lifetime.
 
 `kd boatworker` is the same idea on [boat.dev](https://boat.dev). It shells out to the `boat` CLI, which must be on
 `PATH` and signed in (`boat login`); kd needs no boat credentials of its own. A boatworker is any sandbox whose name
-starts with `boatworker-`, so `list` and `destroy` never touch your other sandboxes. See `SPEC.md` for where it differs
-from `kd ubiworker`.
+starts with `boatworker-`, so `list`, `destroy` and `ssh` never touch your other sandboxes. See `SPEC.md` for where it
+differs from `kd ubiworker`.
 
 ## Logging
 

@@ -239,6 +239,41 @@ mod tests {
         assert!(!parses(&["kd", "boatworker", "frobnicate"]));
     }
 
+    /// `kd boatworker ssh` shares `kd ubiworker ssh`'s single trailing
+    /// capture, so the same split holds: after the name, flag-shaped tokens
+    /// (boat's `-t`, and even `-v`) belong to the forwarded arguments rather
+    /// than to kd; a leading `-t` with no name is captured too.
+    #[test]
+    fn boatworker_ssh_captures_forwarded_args_after_name() {
+        let parse = |args: &[&str]| {
+            let cli = TestCli::try_parse_from(args).expect("expected a successful parse");
+            let Commands::Boatworker {
+                cmd: boatworker::Commands::Ssh(ssh_args),
+            } = cli.command
+            else {
+                panic!("expected `boatworker ssh` args");
+            };
+            let args: Vec<String> = ssh_args
+                .args
+                .iter()
+                .map(|a| a.to_str().unwrap().to_string())
+                .collect();
+            (args, cli.verbose)
+        };
+        assert_eq!(parse(&["kd", "boatworker", "ssh"]), (vec![], 0));
+        assert_eq!(
+            parse(&["kd", "boatworker", "ssh", "foo", "-t", "tmux", "-v"]),
+            (
+                vec!["foo".into(), "-t".into(), "tmux".into(), "-v".into()],
+                0
+            )
+        );
+        assert_eq!(
+            parse(&["kd", "boatworker", "ssh", "-t", "htop"]),
+            (vec!["-t".into(), "htop".into()], 0)
+        );
+    }
+
     #[test]
     fn ubiworker_create_parses() {
         assert!(parses(&["kd", "ubiworker", "create"]));

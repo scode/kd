@@ -1,6 +1,6 @@
 //! boat.dev worker VM lifecycle: the boat counterpart of `kd ubiworker`.
 //! Boat calls its VMs sandboxes; a boatworker is a disposable sandbox that kd
-//! lists and destroys with the same rules as a ubiworker.
+//! lists, connects to and destroys with the same rules as a ubiworker.
 //!
 //! kd drives boat entirely through the `boat` CLI, which keeps its own login
 //! (`boat login` / `boat onboard`), so unlike ubiworker there is no API
@@ -31,6 +31,7 @@
 
 pub mod destroy;
 pub mod list;
+pub mod ssh;
 
 use anyhow::Context;
 use clap::{Args, Subcommand};
@@ -57,6 +58,33 @@ pub struct DestroyArgs {
     pub all: bool,
 }
 
+/// `kd boatworker ssh [ARGS...]` arguments.
+///
+/// A single trailing capture rather than a name positional plus a separate
+/// argument vector, for the reason `kd ubiworker ssh` documents on its own
+/// `SshArgs`: with two positionals, clap's global `-v`/`-q` would steal a
+/// flag-shaped token meant for the remote side once the name was filled.
+/// `ssh::split_target` then reads the first element as an optional worker
+/// name. `OsString` so arguments reach `boat ssh` byte for byte.
+#[derive(Args)]
+pub struct SshArgs {
+    /// Optionally a worker name, then arguments forwarded verbatim to
+    /// `boat ssh` after the sandbox id: a remote command, optionally preceded
+    /// by boat's own `-t` to give it a terminal.
+    ///
+    /// The first element is the worker name unless it starts with `-`. A
+    /// leading `-v`, `-q` or `-h` (or `--verbose`, `--quiet`, `--help`) is
+    /// claimed by kd itself, as anywhere else on the command line. ssh's own
+    /// flags such as `-L` cannot be passed through `boat ssh`; use `boat
+    /// forward` for port forwarding.
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "NAME_OR_BOAT_SSH_ARG"
+    )]
+    pub args: Vec<std::ffi::OsString>,
+}
+
 /// `kd boatworker` subcommands. Each one's doc comment is its `--help` text.
 #[derive(Subcommand)]
 pub enum Commands {
@@ -70,6 +98,16 @@ pub enum Commands {
     Destroy(DestroyArgs),
     /// List existing boatworker sandboxes
     List,
+    /// Open a shell on an owned boatworker, or run a command there, via boat ssh
+    ///
+    /// With no name, targets the sole existing boatworker, like `destroy`.
+    /// The first argument is the worker name unless it starts with `-`;
+    /// everything after it goes to `boat ssh <id>` unchanged: a remote
+    /// command, optionally preceded by `-t` for a terminal. kd execs into
+    /// `boat ssh`, replacing itself. ssh flags such as `-L` do not pass
+    /// through boat (use `boat forward`), and a failing remote command exits
+    /// with status 1 rather than its own status (see SPEC.md).
+    Ssh(SshArgs),
 }
 
 impl Commands {
@@ -77,6 +115,7 @@ impl Commands {
         match self {
             Commands::Destroy(args) => destroy::run(args),
             Commands::List => list::run(),
+            Commands::Ssh(args) => ssh::run(args),
         }
     }
 }
@@ -86,8 +125,8 @@ impl Commands {
 ///
 /// This is all a name used for lookup goes through. It is deliberately not
 /// validated: boat accepts nearly any sandbox name, so an owned sandbox made
-/// by hand can carry a name kd would never have chosen, and `destroy` must
-/// still be able to find it by the name `list` shows.
+/// by hand can carry a name kd would never have chosen, and `destroy` and
+/// `ssh` must still be able to find it by the name `list` shows.
 pub(crate) fn with_prefix(name: &str) -> String {
     if name.starts_with(NAME_PREFIX) {
         name.to_string()
@@ -146,8 +185,9 @@ pub(crate) struct Worker {
 ///
 /// `complete` is false when boat said there were more sandboxes than its
 /// one page held. Callers that would otherwise infer something from what is
-/// *absent* (the no-name "sole worker" forms of `destroy`) must refuse in
-/// that case, since the worker they would pick might not be the only one.
+/// *absent* (the no-name "sole worker" forms of `destroy` and `ssh`) must
+/// refuse in that case, since the worker they would pick might not be the
+/// only one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OwnedWorkers {
     pub(crate) workers: Vec<Worker>,
