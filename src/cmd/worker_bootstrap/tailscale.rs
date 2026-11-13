@@ -40,8 +40,8 @@ use xshell::{Shell, cmd};
 ///
 /// Used only to render a policy-rule *suggestion*, so every failure mode —
 /// no `tailscale` on `PATH`, tailscaled not running, unparseable output, a
-/// machine that is itself a tagged node (whose "user" is the synthetic
-/// `tagged-devices` account and would make a nonsensical `src`) — is
+/// machine that is itself a tagged node (which has no user login, so any
+/// "login" read for it would make a nonsensical `src`) — is
 /// downgraded to a warning and `None`, never an error: a missing
 /// suggestion must not block creating a worker. The caller substitutes an
 /// unmistakable placeholder in that case.
@@ -78,12 +78,26 @@ pub fn local_login(sh: &Shell) -> Option<String> {
 
 /// Pull the signed-in user's login out of `tailscale status --json`: the
 /// node's own `Self.UserID` looked up in the top-level `User` map's
-/// `LoginName`. Rejects the synthetic `tagged-devices` login, which is what
-/// a tagged node reports and is not a usable policy `src`. Pure, so the
-/// JSON shape is pinned by tests without a running tailscaled.
+/// `LoginName`. Pure, so the JSON shape is pinned by tests without a
+/// running tailscaled.
+///
+/// A tagged node has no user, and must yield an error rather than a login.
+/// Checking `Self.Tags` is what catches it. The `LoginName` alone does not:
+/// a tagged node's `Self.UserID` was observed (tailscale 1.104, 2026-11)
+/// pointing at a per-node pseudo-user whose `LoginName` is the node's own
+/// MagicDNS name, which looks like a plausible `src` and is not one. The
+/// synthetic `tagged-devices` login that other nodes' tagged peers map to
+/// is still refused too.
 fn parse_status_login(json: &str) -> anyhow::Result<String> {
     let status: serde_json::Value =
         serde_json::from_str(json).context("tailscale status output is not JSON")?;
+    let tagged = status
+        .pointer("/Self/Tags")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tags| !tags.is_empty());
+    if tagged {
+        bail!("local node is a tagged device, not signed in as a user");
+    }
     let user_id = status
         .pointer("/Self/UserID")
         .and_then(serde_json::Value::as_u64)
@@ -546,13 +560,41 @@ mod tests {
         assert_eq!(parse_status_login(json).unwrap(), "alice@github");
     }
 
-    /// A tagged node reports the synthetic `tagged-devices` login, which
-    /// is not a valid policy `src`; it must be treated as "unknown" so the
-    /// caller prints a placeholder rather than an unusable rule.
+    /// The fallback check: a `tagged-devices` login, with no `Tags` on
+    /// `Self` to go by, is not a valid policy `src` either; it must be
+    /// treated as "unknown" so the caller prints a placeholder rather than
+    /// an unusable rule.
     #[test]
     fn parse_status_login_rejects_tagged_devices() {
         let json = r#"{"Self": {"UserID": 1}, "User": {"1": {"LoginName": "tagged-devices"}}}"#;
         assert!(parse_status_login(json).is_err());
+    }
+
+    /// The shape a tagged node actually reports for itself: `Self.Tags` set,
+    /// and `Self.UserID` resolving to a per-node pseudo-user whose
+    /// `LoginName` is the node's MagicDNS name. Before `Self.Tags` was
+    /// checked, that name went into the printed rule as `src`, which
+    /// Tailscale's policy would not accept as a login.
+    #[test]
+    fn parse_status_login_rejects_tagged_self_with_node_pseudo_user() {
+        let json = r#"{
+            "Self": {"UserID": 3, "Tags": ["tag:server"]},
+            "User": {
+                "1": {"LoginName": "tagged-devices"},
+                "3": {"LoginName": "host.example.ts.net"}
+            }
+        }"#;
+        assert!(parse_status_login(json).is_err());
+    }
+
+    /// Pins "non-empty" rather than "present": Tailscale omits `Tags` for an
+    /// untagged node, but a refactor to a presence check would silently
+    /// send every user to the placeholder if an empty array ever appeared.
+    #[test]
+    fn parse_status_login_accepts_empty_tags() {
+        let json =
+            r#"{"Self": {"UserID": 1, "Tags": []}, "User": {"1": {"LoginName": "alice@github"}}}"#;
+        assert_eq!(parse_status_login(json).unwrap(), "alice@github");
     }
 
     #[test]
