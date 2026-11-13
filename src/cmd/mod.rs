@@ -6,6 +6,7 @@ pub mod cli_proxy_api;
 pub mod devbox;
 pub mod gh;
 pub mod ubiworker;
+pub mod worker_bootstrap;
 pub mod yt;
 
 use clap::Subcommand;

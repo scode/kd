@@ -31,8 +31,8 @@ pub mod create;
 pub mod destroy;
 pub mod list;
 pub mod ssh;
-pub mod tailscale;
 
+use crate::cmd::worker_bootstrap::EnvVar;
 use anyhow::{Context, bail};
 use clap::{Args, Subcommand};
 use tracing::debug;
@@ -58,12 +58,6 @@ pub(crate) const TAILSCALE_TAG: &str = "tag:ubicloud";
 /// Prefix marking a VM as a kd-managed ubiworker (see module docs on the
 /// ownership convention).
 pub(crate) const NAME_PREFIX: &str = "ubiworker-";
-/// Apt packages installed on every worker, in addition to whatever the
-/// operator requests via `--pkg` (see `create::bootstrap_packages`).
-/// Deliberately empty for now — there's no package kd itself needs on every
-/// worker unconditionally.
-pub(crate) const BASE_PACKAGES: &[&str] = &[];
-
 // ── Unix login user ──────────────────────────────────────────────────────
 // The one piece of worker shape that is *not* a constant: it follows the
 // operator running kd.
@@ -316,16 +310,19 @@ pub(crate) fn default_worker_name(now: &jiff::Zoned) -> String {
 /// not start or end with a hyphen. kd enforces this locally so a name
 /// Ubicloud would reject server-side fails fast here, before a one-use
 /// tailscale key gets minted for a VM that will never be created (see
-/// [`tailscale::mint_auth_key`] and its expiry, which bounds — but doesn't
-/// eliminate — the cost of that kind of waste). Because [`NAME_PREFIX`]
+/// [`mint_auth_key`] and its expiry, which bounds — but doesn't eliminate —
+/// the cost of that kind of waste). Because [`NAME_PREFIX`]
 /// eats into the 63-character budget, a custom name's *suffix* only has
 /// `63 - NAME_PREFIX.len()` characters to work with.
 ///
-/// This charset is also what makes `create::render_init_script`'s
-/// unescaped single-quote interpolation of the name safe: no character in
-/// it is a `'`. That charset is strictly narrower than the pattern it
-/// replaced, so the safety property still holds; changing it again means
-/// re-checking that justification.
+/// This charset is also what makes [`render_init_script`]'s unescaped
+/// single-quote interpolation of the name safe: no character in it is a
+/// `'`. That charset is strictly narrower than the pattern it replaced, so
+/// the safety property still holds; changing it again means re-checking
+/// that justification.
+///
+/// [`mint_auth_key`]: crate::cmd::worker_bootstrap::tailscale::mint_auth_key
+/// [`render_init_script`]: crate::cmd::worker_bootstrap::init_script::render_init_script
 ///
 /// Implemented over `chars()` rather than a regex dependency — the pattern
 /// is simple enough that spelling it out as "first/last char alnum, all
@@ -366,28 +363,6 @@ pub(crate) fn normalize_worker_name(name: &str) -> anyhow::Result<String> {
         );
     }
     Ok(prefixed)
-}
-
-// ── Auth-key validation ──────────────────────────────────────────────────
-// Shared by `tailscale::parse_create_key_response` (the first place a
-// minted key value exists at all) and `create::render_init_script` (which
-// interpolates it unescaped into a single-quoted shell argument). One
-// predicate, checked in both places, so the two call sites can't drift.
-
-/// Full charset/shape validation for a tailscale auth key: the
-/// `tskey-auth-` prefix, a non-empty remainder, and — over the *whole*
-/// string, prefix included — nothing outside `[A-Za-z0-9-]`.
-///
-/// This must stay a full-string check, not just a prefix check: the reason
-/// this predicate exists at all is to justify `render_init_script`
-/// interpolating the key unescaped inside a single-quoted shell argument,
-/// and a prefix-only check would let a `'` anywhere after the prefix slip
-/// through into that interpolation.
-pub(crate) fn is_valid_auth_key(key: &str) -> bool {
-    const PREFIX: &str = "tskey-auth-";
-    key.strip_prefix(PREFIX)
-        .is_some_and(|rest| !rest.is_empty())
-        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 // ── Worker listing ───────────────────────────────────────────────────────
@@ -480,25 +455,10 @@ pub(crate) fn owned_workers(sh: &Shell) -> anyhow::Result<Vec<VmRow>> {
     Ok(owned)
 }
 
-// ── Env preflight ────────────────────────────────────────────────────────
-// Every subcommand checks its credentials up front, before any `ubi` call
-// or Tailscale request. Two rules shape the error: report *all* missing
-// variables at once (so a fresh machine is fixed in one round-trip, not
-// one variable per failed run), and tell the reader where to go get each
-// value, since the person hitting this is usually a human with a browser
-// rather than a script.
-
-/// A credential kd needs from the environment, paired with where a human
-/// goes to obtain it.
-///
-/// The `how_to_get` text is console-navigation prose. Vendor consoles move
-/// things around without notice, so treat a stale path here as a bug to
-/// fix, not as a reason to drop the hint — even a slightly-off pointer
-/// beats a bare "is not set".
-pub(crate) struct EnvVar {
-    pub(crate) name: &'static str,
-    pub(crate) how_to_get: &'static str,
-}
+// ── Credentials ──────────────────────────────────────────────────────────
+// What ubiworker's subcommands check with `worker_bootstrap::require_envs`
+// before any `ubi` call or Tailscale request; see there for how missing
+// variables are reported.
 
 /// Ubicloud API token. Read by the `ubi` binary itself, never by kd; kd only
 /// checks it's present so the failure surfaces here rather than as an
@@ -523,122 +483,12 @@ pub(crate) const TS_API_CLIENT_ID: EnvVar = EnvVar {
                  client id is shown on the credential afterwards",
 };
 
-/// Tailscale OAuth client secret, paired with [`TS_API_CLIENT_ID`]. Shown
-/// exactly once at creation, so a lost secret means generating a new client.
-pub(crate) const TS_API_CLIENT_SECRET: EnvVar = EnvVar {
-    name: "TS_API_CLIENT_SECRET",
-    how_to_get: "shown exactly once when the OAuth credential is generated at \
-                 https://console.tailscale.com/admin/settings/trust-credentials (starts with \
-                 tskey-client-); if you no longer have it, create a new credential to get a \
-                 fresh id+secret",
-};
-
-/// Read a set of required env vars, failing with one combined error that
-/// names every missing variable and how to obtain each.
-///
-/// Returns values in the same order as `vars`. Called directly from each
-/// command's `run()`, not from any helper below it — helpers take
-/// credentials as parameters instead, which is both what keeps them
-/// testable without env mutation and what keeps the secret's flow through
-/// the program legible from function signatures alone.
-pub(crate) fn require_envs(vars: &[EnvVar]) -> anyhow::Result<Vec<String>> {
-    require_envs_with(vars, |name| std::env::var(name).ok())
-}
-
-/// [`require_envs`] with the environment lookup injected, so the
-/// report-everything behavior is testable without touching process env.
-/// An empty value counts as unset: an `export FOO=` left behind by a
-/// half-edited shell profile should get the same help as no `export` at all.
-fn require_envs_with(
-    vars: &[EnvVar],
-    lookup: impl Fn(&str) -> Option<String>,
-) -> anyhow::Result<Vec<String>> {
-    let mut values = Vec::with_capacity(vars.len());
-    let mut missing = Vec::new();
-    for var in vars {
-        match lookup(var.name) {
-            Some(value) if !value.is_empty() => values.push(value),
-            _ => missing.push(var),
-        }
-    }
-    if missing.is_empty() {
-        return Ok(values);
-    }
-    use std::fmt::Write as _;
-    let mut msg = String::from("missing required environment variable");
-    if missing.len() > 1 {
-        msg.push('s');
-    }
-    msg.push(':');
-    for var in &missing {
-        // Writing into a String is infallible, so the Result is safe to drop.
-        let _ = write!(
-            msg,
-            "\n  {}\n    how to get it: {}",
-            var.name, var.how_to_get
-        );
-    }
-    bail!(msg)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use jiff::civil::date;
     use jiff::tz::TimeZone;
     use std::path::PathBuf;
-
-    // ── require_envs ─────────────────────────────────────────────────────
-
-    const A: EnvVar = EnvVar {
-        name: "A",
-        how_to_get: "get A here",
-    };
-    const B: EnvVar = EnvVar {
-        name: "B",
-        how_to_get: "get B here",
-    };
-
-    /// The whole point of the batch preflight: a machine missing several
-    /// credentials gets every one named, with its how-to hint, in a single
-    /// failure rather than one per run. Also pins that an empty value is
-    /// reported as missing, not silently passed through as "".
-    #[test]
-    fn require_envs_reports_every_missing_var_with_instructions() {
-        let err = require_envs_with(&[A, B], |name| match name {
-            "A" => None,
-            "B" => Some(String::new()),
-            _ => unreachable!(),
-        })
-        .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("variables:"), "{msg}");
-        assert!(msg.contains("A\n") && msg.contains("get A here"), "{msg}");
-        assert!(msg.contains("B\n") && msg.contains("get B here"), "{msg}");
-    }
-
-    /// With everything set, values come back in request order so callers
-    /// can destructure positionally.
-    #[test]
-    fn require_envs_returns_values_in_request_order() {
-        let values = require_envs_with(&[B, A], |name| Some(format!("{name}-val"))).unwrap();
-        assert_eq!(values, vec!["B-val".to_string(), "A-val".to_string()]);
-    }
-
-    /// A single missing var must not be lumped into a pluralized message:
-    /// singular wording keeps the common case reading naturally.
-    #[test]
-    fn require_envs_uses_singular_for_one_missing_var() {
-        let err =
-            require_envs_with(&[A, B], |name| (name == "A").then(|| "x".to_string())).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("variable:") && !msg.contains("variables:"),
-            "{msg}"
-        );
-        assert!(msg.contains("B\n") && msg.contains("get B here"), "{msg}");
-        assert!(!msg.contains("get A here"), "{msg}");
-    }
 
     /// The Tailscale hint names the tag literally (see the const's docs);
     /// this keeps it from drifting if `TAILSCALE_TAG` is ever changed.
@@ -993,28 +843,5 @@ mod tests {
     #[test]
     fn is_owned_false_for_non_prefixed_name() {
         assert!(!is_owned(&vm_row(LOCATION, "some-other-vm")));
-    }
-
-    #[test]
-    fn is_valid_auth_key_accepts_well_formed_key() {
-        assert!(is_valid_auth_key("tskey-auth-xxxxx-yyyyy"));
-    }
-
-    #[test]
-    fn is_valid_auth_key_rejects_prefix_only() {
-        assert!(!is_valid_auth_key("tskey-auth-"));
-    }
-
-    #[test]
-    fn is_valid_auth_key_rejects_missing_prefix() {
-        assert!(!is_valid_auth_key("xxxxx-yyyyy"));
-    }
-
-    /// The whole point of this predicate is to keep a `'` out of a value
-    /// that gets interpolated inside a single-quoted shell argument, so a
-    /// key that smuggles one in after an otherwise-valid prefix must fail.
-    #[test]
-    fn is_valid_auth_key_rejects_embedded_quote() {
-        assert!(!is_valid_auth_key("tskey-auth-xx'xx"));
     }
 }

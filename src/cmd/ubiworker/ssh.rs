@@ -33,9 +33,8 @@
 //! it by hand outside kd. Login authorization is the tailnet policy's `ssh`
 //! section, not keys; see SPEC.md for the rule the tailnet needs.
 
-use super::{
-    SshArgs, UBI_TOKEN, VmRow, local_unix_user, normalize_worker_name, owned_workers, require_envs,
-};
+use super::{SshArgs, UBI_TOKEN, VmRow, local_unix_user, normalize_worker_name, owned_workers};
+use crate::cmd::worker_bootstrap::require_envs;
 use anyhow::{Context, bail};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::process::CommandExt;

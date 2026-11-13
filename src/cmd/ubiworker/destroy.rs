@@ -21,7 +21,8 @@
 //! rollback. The error names the worker that failed; re-running is the
 //! recovery for whatever's left.
 
-use super::{DestroyArgs, UBI_TOKEN, VmRow, normalize_worker_name, owned_workers, require_envs};
+use super::{DestroyArgs, UBI_TOKEN, VmRow, normalize_worker_name, owned_workers};
+use crate::cmd::worker_bootstrap::require_envs;
 use anyhow::{Context, bail};
 use std::collections::HashSet;
 use tracing::info;
