@@ -276,6 +276,40 @@ non-ImageMagick helpers still behave correctly. It does not prove that thumbnail
   (`<user>@ubiworker-foo`), never the full forwarded argv: forwarded ssh arguments can carry secrets, and joining them
   into one string for an error message would also lose their original argument boundaries.
 
+## kd boatworker
+
+The boat.dev counterpart of `kd ubiworker`; boat calls its VMs sandboxes. This section records where boatworkers differ
+from ubiworkers. For the subcommands documented here, behavior not mentioned matches the ubiworker section, and so does
+the reasoning behind it.
+
+- kd drives boat only through the `boat` CLI, which keeps its own login. There is no boat credential for kd to
+  preflight; a signed-out `boat` fails at its first call with boat's own error, which kd passes through.
+- Ownership is structural, as for ubiworkers, but has one condition instead of two: a sandbox is a boatworker iff its
+  boat name starts with `boatworker-`. Boat has no locations to serve as the second condition. Unnamed sandboxes (boat's
+  default) are never boatworkers. The test applies within the account scope the `boat` CLI is in: the personal account,
+  unless `BOAT_ORG` or `boat org switch` selects an organization. In an organization, boat's listing can include
+  sandboxes other members shared, and one of those named `boatworker-...` counts as owned. Boat's records do carry an
+  `access` field (`owner` for one's own sandboxes), but its other values are undocumented, and filtering on it risks
+  losing track of kd's own workers; kd is built for the personal scope.
+- Names given to `destroy` only get the prefix added if missing; they are not validated, because boat accepts nearly any
+  name up to 120 characters and an owned sandbox made by hand must still be reachable by the name `list` shows.
+- Every subcommand resolves names against one `boat list --all --json` listing and then acts on the sandbox's immutable
+  `bx_...` id. `--all` is there because boat's default listing shows only running sandboxes, and a boatworker that is
+  still provisioning or went to `error` is still owned. Output kd cannot parse is a hard error, never an empty listing.
+- The listing is one page of up to 200 sandboxes, the same accepted single-page limit as ubiworker's. The `boat` CLI has
+  no flag for reading further pages. Unlike Ubicloud's listing, boat's says when there are more. kd then warns on stderr
+  that boatworkers beyond the first page are invisible to it, and the no-name form of `destroy` refuses, since it cannot
+  tell whether the one worker it sees is the only one.
+- `list` prints one tab-separated line per boatworker: name, id, machine type, and boat's state. Nothing at all goes to
+  stdout when there are none; an info-level note goes to stderr instead.
+- `destroy` keeps ubiworker's semantics: names, `--all` (a no-op success when there are none), or the sole owned worker;
+  fail-closed resolution of every name before anything is deleted; deduplication of names that normalize to the same
+  worker; no confirmation prompt; sequential deletion with no rollback. Each target is deleted with
+  `boat delete <id> --yes`, which erases the sandbox and its disk. One difference: boat documents no uniqueness rule for
+  sandbox names, so a requested name can match more than one owned sandbox, and all of them are then targets, because
+  the name the user gave covers all of them. Error messages listing several workers name each with its id for the same
+  reason.
+
 ## kd cargo scode
 
 Commands for tools installed with `cargo install --git` from repositories under github.com/scode, kd included.

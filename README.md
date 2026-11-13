@@ -110,6 +110,14 @@ kd ubiworker ssh -L 8080:localhost:80
 kd ubiworker ssh -- -v
 kd ubiworker ssh -- -L 8080:localhost:80
 
+# List boat.dev worker sandboxes (names starting with boatworker-).
+kd boatworker list
+
+# Delete boatworker sandbox(es); same name resolution as ubiworker destroy.
+kd boatworker destroy
+kd boatworker destroy myname otherworker
+kd boatworker destroy --all
+
 # Update kd and every other tool installed from a github.com/scode repository
 # to the latest commit of its branch.
 kd cargo scode update
@@ -307,6 +315,11 @@ whatever access you used before), or destroy and recreate them.
 Every worker gets the same fixed shape: location `us-east-a2`, size `standard-4`, an 80 GiB disk, and the
 `ubuntu-resolute` image — this isn't configurable via flags. See `SPEC.md` for the intentional behavior around
 ownership, naming, and the minted tailscale key's lifetime.
+
+`kd boatworker` is the same idea on [boat.dev](https://boat.dev). It shells out to the `boat` CLI, which must be on
+`PATH` and signed in (`boat login`); kd needs no boat credentials of its own. A boatworker is any sandbox whose name
+starts with `boatworker-`, so `list` and `destroy` never touch your other sandboxes. See `SPEC.md` for where it differs
+from `kd ubiworker`.
 
 ## Logging
 
