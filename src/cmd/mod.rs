@@ -1,5 +1,6 @@
 //! Top-level command dispatch. Each submodule owns a domain of functionality.
 
+pub mod boatworker;
 pub mod cargo;
 pub mod cli_proxy_api;
 pub mod devbox;
@@ -11,6 +12,11 @@ use clap::Subcommand;
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// boat.dev worker sandbox commands
+    Boatworker {
+        #[command(subcommand)]
+        cmd: boatworker::Commands,
+    },
     /// Helpers for tools installed with `cargo install`
     Cargo {
         #[command(subcommand)]
@@ -46,6 +52,7 @@ pub enum Commands {
 impl Commands {
     pub fn run(self) -> anyhow::Result<()> {
         match self {
+            Commands::Boatworker { cmd } => cmd.run(),
             Commands::Cargo { cmd } => cmd.run(),
             Commands::CliProxyApi { cmd } => cmd.run(),
             Commands::Devbox { cmd } => cmd.run(),
@@ -215,6 +222,21 @@ mod tests {
             "a@example.com",
             "--clear"
         ]));
+    }
+
+    /// The `boatworker` listing and destroy shapes mirror `ubiworker`'s,
+    /// including `--all` excluding names and the absence of a `--yes` flag
+    /// (there is no prompt to skip; see SPEC.md).
+    #[test]
+    fn boatworker_list_and_destroy_parse() {
+        assert!(parses(&["kd", "boatworker", "list"]));
+        assert!(parses(&["kd", "boatworker", "destroy"]));
+        assert!(parses(&["kd", "boatworker", "destroy", "a", "b"]));
+        assert!(parses(&["kd", "boatworker", "destroy", "--all"]));
+        assert!(parses(&["kd", "boatworker", "destroy", "-a"]));
+        assert!(!parses(&["kd", "boatworker", "destroy", "--all", "a"]));
+        assert!(!parses(&["kd", "boatworker", "destroy", "a", "--yes"]));
+        assert!(!parses(&["kd", "boatworker", "frobnicate"]));
     }
 
     #[test]
