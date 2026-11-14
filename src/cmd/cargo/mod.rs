@@ -21,6 +21,11 @@
 //! it is released, cargo-update would work here again, but there is no need
 //! to switch back: plain `cargo install` does the same job with fewer moving
 //! parts, and without cargo-update having to be installed.
+//!
+//! `scode status` answers "what would `update` do" without doing it. cargo
+//! has no read-only form of its update check, so status makes its own: the
+//! commit cargo recorded for each tool against what `git ls-remote` reports
+//! for the branch `update` would build.
 
 use anyhow::{Context, bail};
 use clap::{Args, Subcommand};
@@ -51,6 +56,8 @@ pub enum Commands {
 /// repositories, grouped so related verbs sit under one noun.
 #[derive(Subcommand, Debug)]
 pub enum ScodeCommands {
+    /// Show the tools installed from github.com/scode, their versions, and which need an update
+    Status,
     /// Update every tool installed from a github.com/scode repository, kd included
     Update(ScodeUpdateArgs),
     /// Install a tool from github.com/scode/NAME, tracking its default branch
@@ -82,6 +89,7 @@ impl Commands {
     pub fn run(self) -> anyhow::Result<()> {
         match self {
             Commands::Scode { cmd } => match cmd {
+                ScodeCommands::Status => scode_status(&Shell::new()?),
                 ScodeCommands::Update(args) => scode_update(&Shell::new()?, args.dry_run),
                 ScodeCommands::Install(args) => {
                     scode_install(&Shell::new()?, &args.name, args.dry_run)
@@ -99,6 +107,8 @@ impl Commands {
 #[derive(Debug, PartialEq)]
 struct Installed {
     name: String,
+    /// The package version cargo shows, without the leading `v`.
+    version: String,
     source: Option<String>,
 }
 
@@ -112,15 +122,14 @@ fn parse_install_list(text: &str) -> Vec<Installed> {
         .filter_map(|line| {
             let header = line.trim_end().strip_suffix(':')?;
             let (name, rest) = header.split_once(' ')?;
-            if !rest.starts_with('v') {
-                return None;
-            }
+            let version = rest.strip_prefix('v')?.split(' ').next()?;
             let source = rest
                 .split_once(" (")
                 .and_then(|(_, s)| s.strip_suffix(')'))
                 .map(str::to_owned);
             Some(Installed {
                 name: name.to_owned(),
+                version: version.to_owned(),
                 source,
             })
         })
@@ -187,25 +196,37 @@ fn select(installed: &[Installed]) -> Selection {
 /// Only called for unpinned sources (see [`is_pinned`]), whose query holds at
 /// most a `branch`.
 fn update_args(name: &str, source: &str) -> Vec<String> {
-    let without_commit = source.split('#').next().unwrap_or_default();
-    let (url, query) = without_commit
-        .split_once('?')
-        .unwrap_or((without_commit, ""));
+    let (url, branch) = recorded_url_and_branch(source);
     let mut args = vec![
         "install".to_owned(),
         "--locked".to_owned(),
         "--git".to_owned(),
         url.to_owned(),
     ];
-    if let Some(branch) = query
-        .split('&')
-        .find_map(|pair| pair.strip_prefix("branch="))
-    {
+    if let Some(branch) = branch {
         args.push("--branch".to_owned());
-        args.push(percent_decode(branch));
+        args.push(branch);
     }
     args.push(name.to_owned());
     args
+}
+
+/// The URL and branch a git install tracks, as cargo recorded them: the URL
+/// exactly as given at install time, without its query and `#commit`, and
+/// the `?branch=` value percent-decoded (`None` for the default branch).
+/// Shared by `update`, which reinstalls from them, and `status`, which asks
+/// git for the commit they currently point at, so the two cannot disagree
+/// about which branch a tool follows.
+fn recorded_url_and_branch(source: &str) -> (&str, Option<String>) {
+    let without_commit = source.split('#').next().unwrap_or_default();
+    let (url, query) = without_commit
+        .split_once('?')
+        .unwrap_or((without_commit, ""));
+    let branch = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("branch="))
+        .map(percent_decode);
+    (url, branch)
 }
 
 /// Undo the percent-encoding cargo applies to a query value in a recorded
@@ -633,6 +654,326 @@ fn scode_uninstall(sh: &Shell, name: &str, dry_run: bool) -> anyhow::Result<()> 
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// status
+// ---------------------------------------------------------------------------
+
+/// The commit cargo recorded for a git install: the `#` fragment of its
+/// source, which `cargo install --list` shows abbreviated (8 hex digits as
+/// of cargo 1.9x). `None` when there is no fragment to compare against.
+fn installed_commit(source: &str) -> Option<&str> {
+    source
+        .split_once('#')
+        .map(|(_, commit)| commit)
+        .filter(|commit| !commit.is_empty())
+}
+
+/// The ref `status` asks `git ls-remote` for: the recorded branch, or `HEAD`
+/// for an install that tracks the default branch, which is what a plain
+/// `cargo install --git` without `--branch` builds.
+fn tracked_ref(branch: Option<&str>) -> String {
+    match branch {
+        Some(branch) => format!("refs/heads/{branch}"),
+        None => "HEAD".to_owned(),
+    }
+}
+
+/// The commit `git ls-remote <url> <wanted>` reports for exactly `wanted`.
+/// git matches the pattern against the tail of each ref name, so a branch
+/// `main` would also match `refs/heads/x/refs/heads/main`; only the line
+/// naming `wanted` itself counts. `None` when the ref does not exist.
+fn parse_ls_remote(text: &str, wanted: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let (commit, name) = line.split_once('\t')?;
+        (name == wanted && commit.len() >= 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| commit.to_owned())
+    })
+}
+
+/// The ssh command `status` gives git when the user has not chosen one (see
+/// [`user_picks_ssh_command`]). `BatchMode=yes` makes ssh fail instead of
+/// asking for a passphrase or a password, and `ConnectTimeout` makes an
+/// unreachable host fail that tool's check instead of making `status` look
+/// hung.
+const SSH_BATCH_COMMAND: &str = "ssh -o BatchMode=yes -o ConnectTimeout=15";
+
+/// Whether the user chose how git runs ssh: a non-empty `GIT_SSH_COMMAND` or
+/// `GIT_SSH`, or `core.sshCommand` in git's config. `status` then leaves ssh
+/// alone. git gives `GIT_SSH_COMMAND` precedence over `core.sshCommand`, so
+/// setting it would silently replace, say, the key the user selects there,
+/// and `status` would fail where `update` works. An empty variable counts as
+/// unset, as kd treats empty variables elsewhere in this module.
+fn user_picks_ssh_command(sh: &Shell) -> bool {
+    let set = |name: &str| sh.var_os(name).is_some_and(|v| !v.is_empty());
+    if set("GIT_SSH_COMMAND") || set("GIT_SSH") {
+        return true;
+    }
+    cmd!(sh, "git config --get core.sshCommand")
+        .quiet()
+        .ignore_status()
+        .ignore_stderr()
+        .read()
+        .is_ok_and(|value| !value.trim().is_empty())
+}
+
+/// Why `ls-remote` failed, from git's stderr: the last two lines that are
+/// not noise, joined with "; ". Over ssh, git prints ssh's own error
+/// ("Permission denied (publickey).", "Connection refused") and then the
+/// same generic `fatal: Could not read from remote repository.` every time,
+/// so the line before the `fatal:` is the one that tells a missing key from
+/// a firewall. Noise is ssh's `Warning:` lines, `remote:` banners, and
+/// git's "Please make sure you have the correct access rights / and the
+/// repository exists." trailer.
+fn failure_reason(stderr: &str) -> String {
+    let noise = |line: &str| {
+        line.starts_with("Warning:")
+            || line.starts_with("remote:")
+            || line.starts_with("Please make sure you have")
+            || line == "and the repository exists."
+    };
+    let kept: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !noise(l))
+        .collect();
+    if kept.is_empty() {
+        return "no error output".to_owned();
+    }
+    kept[kept.len().saturating_sub(2)..].join("; ")
+}
+
+/// Ask the repository which commit the tool's branch points at now, the
+/// commit `update` would install.
+///
+/// Uses the `git` command, for the same reason the fetching commands do (see
+/// [`GIT_FETCH_WITH_CLI`]): its credentials, including credential helpers,
+/// are the ones that work for private repositories. What it must not do is
+/// stop and wait for someone to type something, so every way git asks is
+/// turned off: `GIT_TERMINAL_PROMPT=0` for terminal prompts, an empty
+/// `GIT_ASKPASS` for askpass programs (an empty value makes git skip
+/// `core.askPass` and `SSH_ASKPASS` too; VS Code's terminal, for one, sets
+/// `GIT_ASKPASS` to a dialog), and [`SSH_BATCH_COMMAND`] for ssh unless the
+/// user chose their own. A transfer that stays under 1 KB/s for 20 seconds
+/// is aborted. A failure comes back as the reason to show, never as an
+/// error, so one unreachable repository does not hide the others.
+///
+/// git runs from `/`, not from wherever `status` was started, so a
+/// repository the user happens to stand in cannot change the answer through
+/// its local config: `update`'s fetch runs in cargo's own directory, where
+/// only global and system config apply, and `status` must see the same.
+fn latest_commit(sh: &Shell, source: &str) -> Result<String, String> {
+    if !git_available(sh) {
+        return Err("cannot check: git is not on PATH".to_owned());
+    }
+    let _neutral = sh.push_dir("/");
+    let (url, branch) = recorded_url_and_branch(source);
+    let wanted = tracked_ref(branch.as_deref());
+    let mut ls_remote = cmd!(
+        sh,
+        "git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 ls-remote {url} {wanted}"
+    )
+    .quiet()
+    .ignore_status()
+    .env("GIT_TERMINAL_PROMPT", "0")
+    .env("GIT_ASKPASS", "");
+    if !user_picks_ssh_command(sh) {
+        ls_remote = ls_remote.env("GIT_SSH_COMMAND", SSH_BATCH_COMMAND);
+    }
+    let output = ls_remote
+        .output()
+        .map_err(|e| format!("cannot check: running git failed: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "cannot check: git ls-remote failed: {}",
+            failure_reason(&stderr)
+        ));
+    }
+    parse_ls_remote(&String::from_utf8_lossy(&output.stdout), &wanted)
+        .ok_or_else(|| format!("cannot check: {url} has no {wanted}"))
+}
+
+/// One line of `status` output.
+#[derive(Debug, PartialEq)]
+struct StatusRow {
+    name: String,
+    version: String,
+    /// The installed commit as cargo shows it, or `?` when it recorded none.
+    installed: String,
+    /// The branch head, abbreviated to the installed commit's length but to
+    /// no fewer than 8 hex digits, or `-` when it was not checked or could
+    /// not be.
+    latest: String,
+    status: String,
+    /// Whether running `update` would change this tool. Drives the closing
+    /// line, so a tool `update` skips never counts.
+    update_would_change: bool,
+    /// Whether the check that should have run could not (git missing or
+    /// failing, the ref missing, no recorded commit). A pinned tool is not
+    /// checked on purpose and does not count.
+    check_failed: bool,
+}
+
+/// Decide one tool's status. Pure, so every combination is testable.
+///
+/// `latest` is `None` for a pinned tool, which is not checked: `update`
+/// skips it whatever its branch does. A tool installed with non-default
+/// options is checked, so the user can see that it fell behind, but it is
+/// not counted as something `update` will fix, since `update` skips it too.
+/// A commit match is a prefix match, because cargo shows the installed
+/// commit abbreviated.
+fn status_row(
+    installed: &Installed,
+    source: &str,
+    non_default: Option<&str>,
+    latest: Option<&Result<String, String>>,
+) -> StatusRow {
+    let commit = installed_commit(source);
+    let mut row = StatusRow {
+        name: installed.name.clone(),
+        version: installed.version.clone(),
+        installed: commit.unwrap_or("?").to_owned(),
+        latest: "-".to_owned(),
+        status: String::new(),
+        update_would_change: false,
+        check_failed: false,
+    };
+    let Some(latest) = latest else {
+        row.status = "pinned to a tag or commit; `update` skips it".to_owned();
+        return row;
+    };
+    let latest = match latest {
+        Ok(latest) => latest,
+        Err(reason) => {
+            row.status = reason.clone();
+            row.check_failed = true;
+            return row;
+        }
+    };
+    // `latest` is at least 40 hex digits (see `parse_ls_remote`), so the
+    // clamp keeps the slice in bounds and on a char boundary.
+    row.latest = latest[..commit.map_or(8, str::len).clamp(8, latest.len())].to_owned();
+    let Some(commit) = commit else {
+        row.status = "cannot compare: cargo recorded no installed commit".to_owned();
+        row.check_failed = true;
+        return row;
+    };
+    let current = latest.starts_with(&commit.to_ascii_lowercase());
+    row.status = match (current, non_default) {
+        (true, None) => "up to date".to_owned(),
+        (false, None) => {
+            row.update_would_change = true;
+            "update available".to_owned()
+        }
+        (true, Some(options)) => format!("up to date (installed with {options})"),
+        (false, Some(options)) => format!(
+            "update available, but `update` skips it: installed with {options}, which it would replace with the defaults"
+        ),
+    };
+    row
+}
+
+/// Status of every tool from a scode repository, in listing order, checking
+/// each unpinned one against its repository (see [`latest_commit`]).
+fn status_rows(sh: &Shell) -> anyhow::Result<Vec<StatusRow>> {
+    let installed = installed_tools(sh)?;
+    // Unlike `update`, an unreadable `.crates2.json` only loses the
+    // non-default-options note; status still reports everything else.
+    let options = installed_options(sh)
+        .inspect_err(|reason| {
+            eprintln!("warning: could not check how the tools were installed ({reason})")
+        })
+        .unwrap_or_default();
+    Ok(installed
+        .iter()
+        .filter_map(|i| {
+            let source = i.source.as_deref().filter(|s| is_scode_source(s))?;
+            let non_default = options.get(&i.name).and_then(InstallOptions::non_default);
+            let latest = (!is_pinned(source)).then(|| latest_commit(sh, source));
+            Some(status_row(
+                i,
+                source,
+                non_default.as_deref(),
+                latest.as_ref(),
+            ))
+        })
+        .collect())
+}
+
+/// Render the rows as aligned columns, then the closing lines: which tools
+/// could not be checked, if any, and what running `update` would change.
+/// "Nothing to do" is only claimed for the tools that were checked, since an
+/// unchecked tool may well be behind.
+fn render_status(rows: &[StatusRow]) -> String {
+    if rows.is_empty() {
+        return "no tools from github.com/scode installed".to_owned();
+    }
+    let header = ["TOOL", "VERSION", "INSTALLED", "LATEST", "STATUS"];
+    let cells: Vec<[&str; 5]> = rows
+        .iter()
+        .map(|r| [&*r.name, &*r.version, &*r.installed, &*r.latest, &*r.status])
+        .collect();
+    let width = |col: usize| {
+        cells
+            .iter()
+            .map(|c| c[col].chars().count())
+            .chain([header[col].len()])
+            .max()
+            .unwrap_or(0)
+    };
+    let widths: Vec<usize> = (0..4).map(width).collect();
+    let line = |c: &[&str; 5]| {
+        let mut out = String::new();
+        for (col, w) in widths.iter().enumerate() {
+            out.push_str(&format!("{:<w$}  ", c[col], w = w));
+        }
+        out.push_str(c[4]);
+        out
+    };
+    let mut lines = vec![line(&header)];
+    lines.extend(cells.iter().map(line));
+    let names = |keep: fn(&StatusRow) -> bool| -> Vec<&str> {
+        rows.iter()
+            .filter(|r| keep(r))
+            .map(|r| r.name.as_str())
+            .collect()
+    };
+    let behind = names(|r| r.update_would_change);
+    let failed = names(|r| r.check_failed);
+    lines.push(String::new());
+    if !failed.is_empty() {
+        lines.push(format!("could not check: {}", failed.join(", ")));
+    }
+    lines.push(match (behind.is_empty(), failed.is_empty()) {
+        (false, _) => format!(
+            "`kd cargo scode update` would update: {}",
+            behind.join(", ")
+        ),
+        (true, true) => "nothing for `kd cargo scode update` to do".to_owned(),
+        (true, false) => {
+            "nothing for `kd cargo scode update` to do among the tools that could be checked"
+                .to_owned()
+        }
+    });
+    lines.join("\n")
+}
+
+/// `kd cargo scode status`: what is installed from github.com/scode, at
+/// which version and commit, and what `update` would change. Read-only: it
+/// runs `cargo install --list` and one `git ls-remote` per unpinned tool,
+/// and never builds or installs anything. A tool whose check fails is shown
+/// with the reason and the others are still checked; the command then exits
+/// non-zero, so a script cannot mistake an incomplete answer for "nothing to
+/// update".
+fn scode_status(sh: &Shell) -> anyhow::Result<()> {
+    let rows = status_rows(sh)?;
+    println!("{}", render_status(&rows));
+    if rows.iter().any(|r| r.check_failed) {
+        bail!("some tools could not be checked; see above");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,6 +1014,7 @@ local v0.1.0 (/home/me/src/local):
             installed[0],
             Installed {
                 name: "cargo-update".to_owned(),
+                version: "22.1.1".to_owned(),
                 source: None
             }
         );
@@ -915,7 +1257,32 @@ local v0.1.0 (/home/me/src/local):
             "#!/bin/sh\nprintf '%s|%s\\n' \"${CARGO_NET_GIT_FETCH_WITH_CLI-unset}\" \"$*\" >> \"$STUB_LOG\"\nif [ \"$1 $2\" = 'install --list' ]; then while IFS= read -r l; do printf '%s\\n' \"$l\"; done < \"$STUB_LISTING\"; fi\nfor last; do :; done\nif [ -n \"$STUB_FAIL\" ] && [ \"$last\" = \"$STUB_FAIL\" ]; then exit 1; fi\nexit 0\n",
         );
         if git {
-            exe("git", "#!/bin/sh\nexit 0\n");
+            // Logs `<GIT_TERMINAL_PROMPT>|<GIT_ASKPASS>|<GIT_SSH_COMMAND>|<args>`
+            // to `$STUB_GIT_LOG`, answers `config --get core.sshCommand` from
+            // `$STUB_CORE_SSH` and `ls-remote` from `$STUB_LS_REMOTE` (each
+            // set only by a test that needs it), and fails `ls-remote` the
+            // way git does for a URL containing "broken", with an ssh warning
+            // ahead of the `fatal:` line, so `status` sees both outcomes.
+            exe(
+                "git",
+                r#"#!/bin/sh
+if [ -n "$STUB_GIT_LOG" ]; then
+  printf '%s|%s|%s|%s\n' "${GIT_TERMINAL_PROMPT-unset}" "${GIT_ASKPASS-unset}" "${GIT_SSH_COMMAND-unset}" "$*" >> "$STUB_GIT_LOG"
+fi
+case "$*" in
+  'config --get core.sshCommand')
+    if [ -n "$STUB_CORE_SSH" ]; then printf '%s\n' "$STUB_CORE_SSH"; exit 0; fi
+    exit 1;;
+  *ls-remote*broken*)
+    echo 'Warning: Permanently added the host key' >&2
+    echo 'fatal: repository not found' >&2
+    exit 128;;
+  *ls-remote*)
+    if [ -n "$STUB_LS_REMOTE" ]; then while IFS= read -r l; do printf '%s\n' "$l"; done < "$STUB_LS_REMOTE"; fi;;
+esac
+exit 0
+"#,
+            );
         }
         let sh = Shell::new().unwrap();
         sh.set_var("PATH", dir.path());
@@ -1117,5 +1484,306 @@ local v0.1.0 (/home/me/src/local):
     #[test]
     fn ignores_malformed_lines() {
         assert!(parse_install_list("warning: something\n\nnot a header\n").is_empty());
+    }
+
+    // ── status ───────────────────────────────────────────────────────────
+
+    const HEAD_KD: &str = "aaaaaaaa11111111111111111111111111111111";
+    const MAIN_VOICE: &str = "bbbbbbbb22222222222222222222222222222222";
+
+    /// git matches an `ls-remote` pattern against the tail of each ref, so
+    /// asking for `refs/heads/main` can also return
+    /// `refs/heads/x/refs/heads/main`. Only the exact ref may decide the
+    /// latest commit, and a missing ref is reported as missing rather than
+    /// read from a neighbouring line.
+    #[test]
+    fn ls_remote_takes_only_the_exact_ref() {
+        let text =
+            format!("{MAIN_VOICE}\trefs/heads/x/refs/heads/main\n{HEAD_KD}\trefs/heads/main\n");
+        assert_eq!(
+            parse_ls_remote(&text, "refs/heads/main").as_deref(),
+            Some(HEAD_KD)
+        );
+        assert_eq!(parse_ls_remote(&text, "HEAD"), None);
+        assert_eq!(parse_ls_remote("", "HEAD"), None);
+        assert_eq!(parse_ls_remote("nothex\tHEAD\n", "HEAD"), None);
+    }
+
+    /// A default-branch install tracks the remote `HEAD`; one with a
+    /// recorded branch tracks that branch, decoded as `update` decodes it.
+    #[test]
+    fn status_asks_for_the_ref_update_would_build() {
+        let (_, branch) = recorded_url_and_branch("https://github.com/scode/kd#abc");
+        assert_eq!(tracked_ref(branch.as_deref()), "HEAD");
+        let (url, branch) =
+            recorded_url_and_branch("https://github.com/scode/tool.git?branch=topic%2Fx#abc");
+        assert_eq!(url, "https://github.com/scode/tool.git");
+        assert_eq!(tracked_ref(branch.as_deref()), "refs/heads/topic/x");
+    }
+
+    fn tool(name: &str) -> Installed {
+        Installed {
+            name: name.to_owned(),
+            version: "0.1.0".to_owned(),
+            source: None,
+        }
+    }
+
+    /// Every status a tool can have. Only a tool that is behind and that
+    /// `update` will actually rebuild counts as "would change": a pinned
+    /// tool or one installed with non-default options is skipped by
+    /// `update`, and claiming otherwise would send the user to a command
+    /// that does nothing for it.
+    #[test]
+    fn status_row_covers_every_case() {
+        let src = "https://github.com/scode/kd#aaaaaaaa";
+        let current: Result<String, String> = Ok(HEAD_KD.to_owned());
+        let moved: Result<String, String> = Ok(MAIN_VOICE.to_owned());
+
+        let row = status_row(&tool("kd"), src, None, Some(&current));
+        assert_eq!(
+            (row.status.as_str(), row.update_would_change),
+            ("up to date", false)
+        );
+        assert_eq!(
+            (row.installed.as_str(), row.latest.as_str()),
+            ("aaaaaaaa", "aaaaaaaa")
+        );
+
+        let row = status_row(&tool("kd"), src, None, Some(&moved));
+        assert_eq!(
+            (row.status.as_str(), row.update_would_change),
+            ("update available", true)
+        );
+        assert_eq!(row.latest, "bbbbbbbb");
+
+        let row = status_row(&tool("kd"), src, Some("--features x"), Some(&moved));
+        assert!(row.status.contains("skips it") && row.status.contains("--features x"));
+        assert!(!row.update_would_change);
+
+        let row = status_row(&tool("kd"), src, Some("--features x"), Some(&current));
+        assert!(row.status.starts_with("up to date"), "{}", row.status);
+
+        let row = status_row(
+            &tool("kd"),
+            "https://github.com/scode/kd?tag=v1#aaaaaaaa",
+            None,
+            None,
+        );
+        assert!(row.status.starts_with("pinned"), "{}", row.status);
+        assert!(!row.update_would_change);
+        assert_eq!(row.latest, "-");
+
+        let failed: Result<String, String> = Err("cannot check: nope".to_owned());
+        let row = status_row(&tool("kd"), src, None, Some(&failed));
+        assert_eq!(
+            (row.status.as_str(), row.update_would_change),
+            ("cannot check: nope", false)
+        );
+
+        let row = status_row(
+            &tool("kd"),
+            "https://github.com/scode/kd",
+            None,
+            Some(&moved),
+        );
+        assert_eq!(row.installed, "?");
+        assert!(row.status.starts_with("cannot compare"), "{}", row.status);
+        assert!(!row.update_would_change);
+    }
+
+    /// The closing line names exactly the tools `update` would change, and
+    /// says plainly when there are none.
+    #[test]
+    fn render_status_names_what_update_would_change() {
+        let src = "https://github.com/scode/kd#aaaaaaaa";
+        let moved: Result<String, String> = Ok(MAIN_VOICE.to_owned());
+        let current: Result<String, String> = Ok(HEAD_KD.to_owned());
+        let behind = status_row(&tool("kd"), src, None, Some(&moved));
+        let fine = status_row(&tool("voice"), src, None, Some(&current));
+        let text = render_status(&[behind, fine]);
+        assert!(text.starts_with("TOOL"), "{text}");
+        assert!(
+            text.ends_with("`kd cargo scode update` would update: kd"),
+            "{text}"
+        );
+
+        let fine = status_row(&tool("voice"), src, None, Some(&current));
+        assert!(render_status(&[fine]).ends_with("nothing for `kd cargo scode update` to do"));
+        assert_eq!(
+            render_status(&[]),
+            "no tools from github.com/scode installed"
+        );
+    }
+
+    /// End to end against stub cargo and git: only scode tools are listed,
+    /// each unpinned one is checked against the ref it tracks, a repository
+    /// git cannot read is reported on its line while the others are still
+    /// checked (the command's exit status is covered separately), and git is
+    /// run with prompts turned off so a status check never stops for a
+    /// password or passphrase.
+    #[test]
+    fn status_checks_each_unpinned_scode_tool() {
+        let listing = "\
+kd v0.1.0 (https://github.com/scode/kd#aaaaaaaa):
+    kd
+voice v0.2.0 (https://github.com/scode/voice?branch=main#cccccccc):
+    voice
+pinned v0.3.0 (https://github.com/scode/pinned?tag=v0.3.0#dddddddd):
+    pinned
+broken v0.1.0 (https://github.com/scode/broken#eeeeeeee):
+    broken
+other v1.0.0 (https://github.com/someone/other#abc123):
+    other
+";
+        let scratch = tempfile::tempdir().unwrap();
+        let ls_remote = scratch.path().join("ls-remote");
+        std::fs::write(
+            &ls_remote,
+            format!("{HEAD_KD}\tHEAD\n{MAIN_VOICE}\trefs/heads/main\n"),
+        )
+        .unwrap();
+        let git_log = scratch.path().join("git-log");
+        let mut rows = Vec::new();
+        let (_, result) = run_with_failing_stub_cargo(listing, "", true, "", EMPTY_CRATES2, |sh| {
+            sh.set_var("STUB_LS_REMOTE", &ls_remote);
+            sh.set_var("STUB_GIT_LOG", &git_log);
+            // The developer's own ssh choice must not leak into the test;
+            // an empty value counts as unset.
+            sh.set_var("GIT_SSH_COMMAND", "");
+            sh.set_var("GIT_SSH", "");
+            rows = status_rows(sh)?;
+            Ok(())
+        });
+        result.unwrap();
+        let summary: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r.name.as_str(), r.status.as_str()))
+            .collect();
+        assert_eq!(summary[0], ("kd", "up to date"));
+        assert_eq!(summary[1], ("voice", "update available"));
+        assert!(
+            summary[2].0 == "pinned" && summary[2].1.starts_with("pinned"),
+            "{summary:?}"
+        );
+        assert!(
+            summary[3].0 == "broken" && summary[3].1.ends_with("fatal: repository not found"),
+            "{summary:?}"
+        );
+        assert!(rows[3].check_failed && !rows[2].check_failed, "{rows:?}");
+        assert_eq!(rows.len(), 4, "{summary:?}");
+
+        let git_log = std::fs::read_to_string(&git_log).unwrap();
+        assert!(
+            git_log.contains(&format!(
+                "0||{SSH_BATCH_COMMAND}|-c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 ls-remote https://github.com/scode/kd HEAD"
+            )),
+            "{git_log}"
+        );
+        assert!(
+            git_log.contains("ls-remote https://github.com/scode/voice refs/heads/main"),
+            "{git_log}"
+        );
+        assert!(!git_log.contains("pinned"), "{git_log}");
+    }
+
+    /// Without git there is nothing to ask; every unpinned tool says why on
+    /// its own line, rather than the listing failing before anything is
+    /// shown.
+    #[test]
+    fn status_without_git_reports_on_each_line() {
+        let mut rows = Vec::new();
+        let (_, result) =
+            run_with_failing_stub_cargo(KD_LISTING, "", false, "", EMPTY_CRATES2, |sh| {
+                rows = status_rows(sh)?;
+                Ok(())
+            });
+        result.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].status.contains("git is not on PATH"),
+            "{}",
+            rows[0].status
+        );
+    }
+
+    /// A user who chose how git runs ssh keeps that choice: `status` must
+    /// not swap in its batch-mode command, or it would fail with a key
+    /// error where `update` works. Covers the variable and
+    /// `core.sshCommand`, which git lets `GIT_SSH_COMMAND` override.
+    #[test]
+    fn status_keeps_the_users_ssh_command() {
+        for (var, core) in [("myssh -i key", ""), ("", "myssh -i key")] {
+            let scratch = tempfile::tempdir().unwrap();
+            let git_log = scratch.path().join("git-log");
+            let (_, result) =
+                run_with_failing_stub_cargo(KD_LISTING, "", true, "", EMPTY_CRATES2, |sh| {
+                    sh.set_var("STUB_GIT_LOG", &git_log);
+                    sh.set_var("GIT_SSH_COMMAND", var);
+                    sh.set_var("GIT_SSH", "");
+                    sh.set_var("STUB_CORE_SSH", core);
+                    status_rows(sh).map(|_| ())
+                });
+            result.unwrap();
+            let git_log = std::fs::read_to_string(&git_log).unwrap();
+            let ls_remote = git_log.lines().find(|l| l.contains("ls-remote")).unwrap();
+            // git must get exactly the user's variable, or none at all so
+            // its `core.sshCommand` applies.
+            assert!(ls_remote.starts_with(&format!("0||{var}|")), "{ls_remote}");
+        }
+    }
+
+    /// The reason shown for a failed check keeps what tells failures apart:
+    /// over ssh, the line before git's generic `fatal:` is ssh's own error,
+    /// and dropping it would make a missing key look like a firewall.
+    /// Warnings, `remote:` banners and git's access-rights trailer are
+    /// noise. The ssh input is real git 2.43 output for a refused
+    /// connection.
+    #[test]
+    fn failure_reason_keeps_the_cause() {
+        let refused = "ssh: connect to host 127.0.0.1 port 1: Connection refused\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n";
+        assert_eq!(
+            failure_reason(refused),
+            "ssh: connect to host 127.0.0.1 port 1: Connection refused; fatal: Could not read from remote repository."
+        );
+        assert_eq!(
+            failure_reason("Warning: Permanently added x\nfatal: nope\n\n"),
+            "fatal: nope"
+        );
+        assert_eq!(
+            failure_reason("remote: hi\nsomething broke\n"),
+            "something broke"
+        );
+        assert_eq!(failure_reason(""), "no error output");
+    }
+
+    /// When a check fails, the closing lines say which tools went unchecked
+    /// and claim "nothing to do" only for the rest, and the command exits
+    /// non-zero, so neither a reader nor a script takes an incomplete answer
+    /// for a complete one.
+    #[test]
+    fn failed_checks_are_named_and_fail_the_command() {
+        let src = "https://github.com/scode/kd#aaaaaaaa";
+        let current: Result<String, String> = Ok(HEAD_KD.to_owned());
+        let failed: Result<String, String> = Err("cannot check: offline".to_owned());
+        let rows = [
+            status_row(&tool("kd"), src, None, Some(&current)),
+            status_row(&tool("voice"), src, None, Some(&failed)),
+        ];
+        let text = render_status(&rows);
+        assert!(text.contains("\ncould not check: voice\n"), "{text}");
+        assert!(
+            text.ends_with("to do among the tools that could be checked"),
+            "{text}"
+        );
+
+        let (_, result) =
+            run_with_failing_stub_cargo(KD_LISTING, "", false, "", EMPTY_CRATES2, scode_status);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("could not be checked")
+        );
     }
 }

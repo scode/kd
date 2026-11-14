@@ -387,6 +387,34 @@ others. Without `git` on PATH, cargo's built-in fetching is left in place, so pu
 machine without git. A non-empty `CARGO_NET_GIT_FETCH_WITH_CLI` in the environment, even `false`, is passed through
 unchanged; a `net.git-fetch-with-cli` setting in cargo's config is overridden when kd sets the variable.
 
+### kd cargo scode status
+
+- Lists every tool installed from a github.com/scode repository, as `update` selects them, with its version and the
+  commit cargo recorded for it (abbreviated, as `cargo install --list` shows it), and says which need an update. It only
+  reads: it never builds, installs or changes anything.
+- For each tool that is not pinned, it asks the repository for the commit the tool's branch points at now, with
+  `git ls-remote <recorded URL> <ref>`: the recorded branch (`refs/heads/<branch>`, percent-decoded), or `HEAD` for a
+  tool installed from the default branch. That is the commit `update` would install. The `git` command is used so the
+  same credentials, credential helpers included, work for private repositories.
+- The check must not stop to wait for input. git runs with `GIT_TERMINAL_PROMPT=0` and an empty `GIT_ASKPASS` (which
+  also keeps `core.askPass` and `SSH_ASKPASS` from being used), and with
+  `GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=15"` unless the user chose how git runs ssh: a non-empty
+  `GIT_SSH_COMMAND` or `GIT_SSH`, or `core.sshCommand` in git's config. That choice is left alone, since overriding it
+  would replace e.g. the key it selects, and an ssh command the user chose may still prompt. A transfer that stays under
+  1 KB/s for 20 seconds is aborted (`http.lowSpeedLimit`/`http.lowSpeedTime`).
+- Statuses: up to date; update available; pinned to a tag or commit (not checked, since `update` skips it); installed
+  with non-default options (checked and shown as up to date or behind, with a note that `update` skips it); or a reason
+  the check failed (no git on PATH, `git ls-remote` failed, with the last two lines of git's error output that are not
+  warnings or boilerplate, so ssh's own error shows next to git's generic one, the ref does not exist, or cargo recorded
+  no commit). git runs from `/`, so the local config of a repository `status` is started in does not apply, as it does
+  not to `update`'s fetch.
+- Closing lines: the tools whose check failed, if any, then the tools `kd cargo scode update` would update (excluding
+  pinned tools and tools installed with non-default options), or that it has nothing to do, qualified as "among the
+  tools that could be checked" when a check failed.
+- A failed check does not stop the other tools from being checked, but the command exits non-zero after printing, so an
+  incomplete answer is not mistaken for "nothing to update".
+- If `.crates2.json` cannot be read, the command warns and shows the rest without the non-default-options note.
+
 ### kd cargo scode update [--dry-run]
 
 - Updates every tool installed with `cargo install --git` from a repository under github.com/scode (owner matched
