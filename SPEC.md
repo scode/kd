@@ -291,15 +291,16 @@ the reasoning behind it.
   sandboxes other members shared, and one of those named `boatworker-...` counts as owned. Boat's records do carry an
   `access` field (`owner` for one's own sandboxes), but its other values are undocumented, and filtering on it risks
   losing track of kd's own workers; kd is built for the personal scope.
-- Names given to `destroy` only get the prefix added if missing; they are not validated, because boat accepts nearly any
-  name up to 120 characters and an owned sandbox made by hand must still be reachable by the name `list` shows.
+- Names given to `destroy` and `ssh` only get the prefix added if missing; they are not validated, because boat accepts
+  nearly any name up to 120 characters and an owned sandbox made by hand must still be reachable by the name `list`
+  shows.
 - Every subcommand resolves names against one `boat list --all --json` listing and then acts on the sandbox's immutable
   `bx_...` id. `--all` is there because boat's default listing shows only running sandboxes, and a boatworker that is
   still provisioning or went to `error` is still owned. Output kd cannot parse is a hard error, never an empty listing.
 - The listing is one page of up to 200 sandboxes, the same accepted single-page limit as ubiworker's. The `boat` CLI has
   no flag for reading further pages. Unlike Ubicloud's listing, boat's says when there are more. kd then warns on stderr
-  that boatworkers beyond the first page are invisible to it, and the no-name form of `destroy` refuses, since it cannot
-  tell whether the one worker it sees is the only one.
+  that boatworkers beyond the first page are invisible to it, and the no-name forms of `destroy` and `ssh` refuse, since
+  they cannot tell whether the one worker they see is the only one.
 - `list` prints one tab-separated line per boatworker: name, id, machine type, and boat's state. Nothing at all goes to
   stdout when there are none; an info-level note goes to stderr instead.
 - `destroy` keeps ubiworker's semantics: names, `--all` (a no-op success when there are none), or the sole owned worker;
@@ -309,6 +310,25 @@ the reasoning behind it.
   sandbox names, so a requested name can match more than one owned sandbox, and all of them are then targets, because
   the name the user gave covers all of them. Error messages listing several workers name each with its id for the same
   reason.
+- `ssh` resolves its target like `destroy` (a name, or the sole owned worker, refusing a cut-off listing for the no-name
+  form), with the same single trailing argument vector as `kd ubiworker ssh`: the first element is the worker name
+  unless it starts with `-`. A name that matches several sandboxes is an error listing their ids, never a connection to
+  an arbitrary one. kd then execs into `boat ssh <id>` followed by the remaining arguments, verbatim, with the Tailscale
+  OAuth variables removed from the environment. On an exec failure, the error names the program and the worker, never
+  the forwarded arguments.
+- `ssh` goes through `boat ssh`, not `tailscale ssh` as `kd ubiworker ssh` does. Boat already looks up the sandbox's
+  address and checks its host key against what boat's API reports, with a key pair of its own, so it needs neither
+  known-hosts pinning nor a tailnet policy grant for the machine running kd, and it works as soon as the sandbox is
+  ready.
+- What `boat ssh` does with the forwarded arguments differs from `tailscale ssh`, and kd passes that through rather than
+  papering over it. The arguments are a remote command, and boat keeps their boundaries (`'a b'` arrives as one
+  argument, unlike plain ssh). Boat's own `-t` may come first to give the command a terminal. Any other leading flag is
+  refused by boat, and ssh's own flags such as `-L` cannot be passed at all; `boat forward` covers port forwarding. A
+  remote command that exits non-zero makes `boat ssh` exit with status 1, not the command's status, and boat prints a
+  one-line JSON error on stdout. kd inserts nothing between the id and the arguments, so `-t` stays reachable. A `--`
+  given after the worker name reaches boat, which then joins everything after it into one string for the ssh client,
+  losing argument boundaries; and ubiworker's `kd ubiworker ssh -- -v` escape has no working equivalent, since
+  `kd boatworker ssh -- -v` becomes `boat ssh <id> -v`, which boat refuses.
 
 ## kd cargo scode
 
