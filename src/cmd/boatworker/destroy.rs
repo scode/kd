@@ -138,6 +138,8 @@ fn describe(workers: &[Worker]) -> String {
 /// give. boat's own output passes straight through.
 fn delete_sandbox(sh: &Shell, id: &str) -> anyhow::Result<()> {
     cmd!(sh, "boat delete {id} --yes")
+        .env_remove("TS_API_CLIENT_ID")
+        .env_remove("TS_API_CLIENT_SECRET")
         .run()
         .context("boat delete failed")
 }

@@ -1,6 +1,9 @@
 //! boat.dev worker VM lifecycle: the boat counterpart of `kd ubiworker`.
-//! Boat calls its VMs sandboxes; a boatworker is a disposable sandbox that kd
-//! lists, connects to and destroys with the same rules as a ubiworker.
+//! Boat calls its VMs sandboxes; a boatworker is a disposable sandbox that
+//! kd creates, lists, connects to and destroys with the same rules as a
+//! ubiworker. Like a ubiworker, it enrolls itself into the tailnet with
+//! Tailscale SSH on first boot (under its own tag, [`TAILSCALE_TAG`]), so
+//! "my workers come up on the tailnet" holds for both fleets.
 //!
 //! kd drives boat entirely through the `boat` CLI, which keeps its own login
 //! (`boat login` / `boat onboard`), so unlike ubiworker there is no API
@@ -29,12 +32,14 @@
 //! the same reason `kd ubiworker destroy` acts on Ubicloud's VM id: a name
 //! can be reused between kd's listing and its action, an id cannot.
 
+pub mod create;
 pub mod destroy;
 pub mod list;
 pub mod ssh;
 
-use anyhow::Context;
-use clap::{Args, Subcommand};
+use crate::cmd::worker_bootstrap::EnvVar;
+use anyhow::{Context, bail};
+use clap::{Args, Subcommand, ValueEnum};
 use serde::Deserialize;
 use tracing::{debug, warn};
 use xshell::{Shell, cmd};
@@ -42,6 +47,77 @@ use xshell::{Shell, cmd};
 /// Prefix marking a boat sandbox as a kd-managed boatworker (see module docs
 /// on the ownership convention).
 pub(crate) const NAME_PREFIX: &str = "boatworker-";
+
+/// Tailscale ACL tag on every auth key `create` mints, and so on every
+/// boatworker's tailnet node. Its own tag, not ubiworker's `tag:ubicloud`,
+/// so tailnet policy can treat the two fleets separately.
+pub(crate) const TAILSCALE_TAG: &str = "tag:boat";
+
+/// The Unix account on every boat sandbox. Boat provisions it (with
+/// passwordless sudo) and offers no way to choose another, so unlike
+/// ubiworker's account it does not follow the operator's local username.
+pub(crate) const UNIX_USER: &str = "user";
+
+/// Tailscale OAuth client id for minting boatworker auth keys. The same
+/// variable ubiworker reads; the hint differs only in naming `tag:boat`,
+/// which the client must own. A test pins the hint to [`TAILSCALE_TAG`].
+pub(crate) const TS_API_CLIENT_ID: EnvVar = EnvVar {
+    name: "TS_API_CLIENT_ID",
+    how_to_get: "open https://console.tailscale.com/admin/settings/trust-credentials, create an \
+                 OAuth credential with the auth_keys write scope and tag tag:boat; the client \
+                 id is shown on the credential afterwards",
+};
+
+/// Boat machine sizes accepted by `create --type`, named as boat names them.
+///
+/// Spelled out rather than passed through as a free string so a typo fails
+/// in kd's own argument parsing, before an auth key is minted. Whether the
+/// account's plan allows a size (`xlarge` needs a higher plan) is boat's
+/// to decide; kd does not look it up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum MachineType {
+    /// 2 vCPU, 4 GB
+    Small,
+    /// 4 vCPU, 8 GB
+    Default,
+    /// 8 vCPU, 16 GB
+    Large,
+    /// 16 vCPU, 32 GB
+    Xlarge,
+}
+
+impl MachineType {
+    /// The value `boat new --type` expects.
+    pub(crate) fn as_boat_type(self) -> &'static str {
+        match self {
+            MachineType::Small => "small",
+            MachineType::Default => "default",
+            MachineType::Large => "large",
+            MachineType::Xlarge => "xlarge",
+        }
+    }
+}
+
+/// `kd boatworker create [NAME] [--pkg PACKAGE]... [--type TYPE]` arguments.
+#[derive(Args)]
+pub struct CreateArgs {
+    /// Worker name. Defaults to `boatworker-<local timestamp>`. A custom
+    /// name gets the `boatworker-` prefix prepended if it's missing, and
+    /// must then be a valid DNS label, since it is also the tailnet
+    /// hostname.
+    pub name: Option<String>,
+
+    /// Apt package to install on the worker after it joins the tailnet
+    /// (repeatable). Installed asynchronously, with an `apt-get
+    /// dist-upgrade`, by the same `kd-bootstrap` unit as on ubiworkers; see
+    /// `kd ubiworker create --help`.
+    #[arg(long = "pkg", value_name = "PACKAGE")]
+    pub pkgs: Vec<String>,
+
+    /// Boat machine size. `large` has the 16 GB of memory a ubiworker has.
+    #[arg(long = "type", value_enum, default_value_t = MachineType::Large)]
+    pub machine_type: MachineType,
+}
 
 /// `kd boatworker destroy [NAME...] [--all]` arguments.
 #[derive(Args)]
@@ -88,6 +164,16 @@ pub struct SshArgs {
 /// `kd boatworker` subcommands. Each one's doc comment is its `--help` text.
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Create a boatworker sandbox that enrolls itself into the tailnet
+    ///
+    /// Mints a one-use tailscale auth key (tag:boat) and starts a boat
+    /// sandbox whose first-boot setup installs tailscale, joins the tailnet
+    /// with Tailscale SSH, and then bootstraps apt packages (`--pkg`) in a
+    /// detached unit, exactly as on ubiworkers. The sandbox runs until
+    /// destroyed and gets none of the boat account's stored secrets.
+    /// Returns once boat reports the sandbox ready, without waiting for
+    /// enrollment.
+    Create(CreateArgs),
     /// Delete one or more boatworker sandboxes
     ///
     /// Takes any number of names, or --all to delete every owned
@@ -113,6 +199,7 @@ pub enum Commands {
 impl Commands {
     pub fn run(self) -> anyhow::Result<()> {
         match self {
+            Commands::Create(args) => create::run(args),
             Commands::Destroy(args) => destroy::run(args),
             Commands::List => list::run(),
             Commands::Ssh(args) => ssh::run(args),
@@ -133,6 +220,63 @@ pub(crate) fn with_prefix(name: &str) -> String {
     } else {
         format!("{NAME_PREFIX}{name}")
     }
+}
+
+// ── Names for new workers ───────────────────────────────────────────────
+// Only `create` validates names; lookups just prefix (see `with_prefix`).
+
+/// Render the default worker name, `boatworker-YYYYMMDD-HHMMSS`, from a
+/// caller-supplied local timestamp (a parameter so tests can pin it).
+pub(crate) fn default_worker_name(now: &jiff::Zoned) -> String {
+    format!(
+        "{}{:04}{:02}{:02}-{:02}{:02}{:02}",
+        NAME_PREFIX,
+        now.year(),
+        now.month(),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second()
+    )
+}
+
+/// The name rule for a new boatworker: lowercase alphanumerics and hyphens,
+/// at most 63 characters, starting and ending with an alphanumeric.
+///
+/// Boat itself accepts nearly any name up to 120 characters, so this is not
+/// mirroring a server-side rule the way ubiworker's check mirrors
+/// Ubicloud's. It is the DNS label rule, because the name doubles as the
+/// worker's tailnet hostname (`tailscale up --hostname`), and a name only
+/// boat would accept would come up on the tailnet under some mangled form.
+/// It is also what makes the name safe to interpolate into the first-boot
+/// script and to pass to `boat new`: no quote, whitespace or shell
+/// metacharacter, and no leading `-`.
+fn has_valid_name_chars(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let is_alnum = |b: &u8| b.is_ascii_digit() || b.is_ascii_lowercase();
+    match (bytes.first(), bytes.last()) {
+        (Some(first), Some(last)) => {
+            bytes.len() <= 63
+                && is_alnum(first)
+                && is_alnum(last)
+                && bytes.iter().all(|b| is_alnum(b) || *b == b'-')
+        }
+        _ => false,
+    }
+}
+
+/// Prefix (see [`with_prefix`]) and validate a name for a new worker against
+/// [`has_valid_name_chars`], before anything is minted or started.
+pub(crate) fn normalize_worker_name(name: &str) -> anyhow::Result<String> {
+    let prefixed = with_prefix(name);
+    if !has_valid_name_chars(&prefixed) {
+        bail!(
+            "invalid worker name '{prefixed}': must be lowercase alphanumerics and hyphens, at \
+             most 63 characters, and must not start or end with a hyphen (the name is also the \
+             worker's tailnet hostname; checked after adding the 'boatworker-' prefix)"
+        );
+    }
+    Ok(prefixed)
 }
 
 // ── Worker listing ───────────────────────────────────────────────────────
@@ -237,7 +381,12 @@ fn owned_workers_from(page: SandboxPage) -> OwnedWorkers {
 /// there is more, so kd warns instead of truncating silently, and reports
 /// the listing as incomplete (see [`OwnedWorkers`]).
 pub(crate) fn owned_workers(sh: &Shell) -> anyhow::Result<OwnedWorkers> {
+    // boat needs none of the Tailscale OAuth pair `create` reads, which is
+    // often exported in the same shell; keep it out of boat's environment
+    // as the `boat new` and `boat ssh` calls do.
     let output = cmd!(sh, "boat list --all --json")
+        .env_remove("TS_API_CLIENT_ID")
+        .env_remove("TS_API_CLIENT_SECRET")
         .read()
         .context("failed to list boat sandboxes")?;
     let page = parse_sandbox_page(&output)?;
@@ -277,6 +426,83 @@ mod tests {
     #[test]
     fn with_prefix_keeps_unusual_names_intact() {
         assert_eq!(with_prefix("My_Box"), "boatworker-My_Box");
+    }
+
+    // ── names for new workers ────────────────────────────────────────────
+
+    /// The default name comes from the supplied local time, so tests (and
+    /// `create`) never depend on the system clock or timezone.
+    #[test]
+    fn default_worker_name_formats_fixed_instant() {
+        let now = jiff::civil::date(2026, 8, 3)
+            .at(15, 4, 5, 0)
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .unwrap();
+        assert_eq!(default_worker_name(&now), "boatworker-20260803-150405");
+    }
+
+    /// The default name must itself pass the name rule, or every `create`
+    /// without a name would fail.
+    #[test]
+    fn default_worker_name_is_a_valid_name() {
+        let now = jiff::civil::date(2026, 12, 31)
+            .at(23, 59, 59, 0)
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .unwrap();
+        assert!(has_valid_name_chars(&default_worker_name(&now)));
+    }
+
+    /// The rule is the DNS-label rule the tailnet hostname needs, so every
+    /// way out of it must be refused: uppercase, underscore, space, quote, a
+    /// trailing hyphen (including the empty custom name, which leaves just
+    /// the prefix), and a name over 63 characters after prefixing.
+    #[test]
+    fn normalize_worker_name_rejects_non_dns_label_names() {
+        let too_long = "a".repeat(64 - NAME_PREFIX.len());
+        for name in ["Foo", "foo_bar", "foo bar", "it's", "foo-", "", &too_long] {
+            assert!(
+                normalize_worker_name(name).is_err(),
+                "{name:?} should be rejected"
+            );
+        }
+    }
+
+    /// The 63-character boundary itself passes, so the limit is exactly the
+    /// DNS label length; and a bare name gets the prefix.
+    #[test]
+    fn normalize_worker_name_accepts_valid_names() {
+        let suffix = "a".repeat(63 - NAME_PREFIX.len());
+        assert_eq!(normalize_worker_name(&suffix).unwrap().len(), 63);
+        assert_eq!(normalize_worker_name("foo-1").unwrap(), "boatworker-foo-1");
+    }
+
+    /// The error is user-facing guidance, so it must describe the rule and
+    /// say why it exists (the tailnet hostname), not just refuse.
+    #[test]
+    fn normalize_worker_name_error_names_the_rule() {
+        let msg = normalize_worker_name("Foo").unwrap_err().to_string();
+        assert!(msg.contains("lowercase") && msg.contains("63"), "{msg}");
+        assert!(msg.contains("tailnet hostname"), "{msg}");
+    }
+
+    // ── create settings ──────────────────────────────────────────────────
+
+    /// `--type` values go to `boat new --type` verbatim, so each variant must
+    /// map to boat's own spelling.
+    #[test]
+    fn machine_type_maps_to_boat_names() {
+        let names: Vec<&str> = MachineType::value_variants()
+            .iter()
+            .map(|t| t.as_boat_type())
+            .collect();
+        assert_eq!(names, vec!["small", "default", "large", "xlarge"]);
+    }
+
+    /// The credential hint names the tag the OAuth client must own; this
+    /// keeps it from drifting if the tag ever changes.
+    #[test]
+    fn tailscale_client_id_hint_names_the_boat_tag() {
+        assert!(TS_API_CLIENT_ID.how_to_get.contains(TAILSCALE_TAG));
     }
 
     /// A trimmed copy of real `boat list --all --json` output (boat CLI

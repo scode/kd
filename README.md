@@ -110,6 +110,13 @@ kd ubiworker ssh -L 8080:localhost:80
 kd ubiworker ssh -- -v
 kd ubiworker ssh -- -L 8080:localhost:80
 
+# Create a disposable boat.dev worker sandbox that enrolls itself into the
+# tailnet (tag:boat) like a ubiworker, runs until destroyed, and gets none of
+# your boat account's stored secrets. Same name and --pkg handling as
+# ubiworker create; --type picks boat's machine size (default large).
+kd boatworker create
+kd boatworker create myname --pkg build-essential --type default
+
 # List boat.dev worker sandboxes (names starting with boatworker-).
 kd boatworker list
 
@@ -325,8 +332,18 @@ ownership, naming, and the minted tailscale key's lifetime.
 
 `kd boatworker` is the same idea on [boat.dev](https://boat.dev). It shells out to the `boat` CLI, which must be on
 `PATH` and signed in (`boat login`); kd needs no boat credentials of its own. A boatworker is any sandbox whose name
-starts with `boatworker-`, so `list`, `destroy` and `ssh` never touch your other sandboxes. See `SPEC.md` for where it
-differs from `kd ubiworker`.
+starts with `boatworker-`, so `list`, `destroy` and `ssh` never touch your other sandboxes. `create` also needs:
+
+- `TS_API_CLIENT_ID` / `TS_API_CLIENT_SECRET` for a Tailscale OAuth client with the `auth_keys` scope, owning
+  `tag:boat`. This can be the client ubiworker uses, if it owns both tags, or one limited to `tag:boat`.
+- for `tailscale ssh` to a worker (not needed for `kd boatworker ssh`, which goes through boat): a tailnet policy `ssh`
+  rule letting you log in to `tag:boat` as `user`, boat's fixed account, and an ACL/grant reaching `tag:boat` on
+  port 22. `create` prints the rule object. Its `src` can be your login or a tag, if the machine you connect from is
+  tagged.
+
+`kd boatworker ssh` passes its arguments to `boat ssh`, which treats them as a remote command (boat's own `-t` may come
+first) and has no way to pass ssh flags such as `-L`; use `boat forward` for ports. See `SPEC.md` for these and the
+other differences from `kd ubiworker`.
 
 ## Logging
 
