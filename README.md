@@ -132,6 +132,10 @@ kd boatworker ssh
 kd boatworker ssh myname uptime
 kd boatworker ssh myname -t tmux attach
 
+# Show what is installed from github.com/scode, at which version and commit,
+# and which tools `update` would update (read-only).
+kd cargo scode status
+
 # Update kd and every other tool installed from a github.com/scode repository
 # to the latest commit of its branch.
 kd cargo scode update
