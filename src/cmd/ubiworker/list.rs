@@ -4,7 +4,8 @@
 //! ([`super::owned_workers`]) so `destroy` (when no name is given) can reuse
 //! it; this module is just the thin printing layer on top.
 
-use super::{UBI_TOKEN, owned_workers, require_envs};
+use super::{UBI_TOKEN, owned_workers};
+use crate::cmd::worker_bootstrap::require_envs;
 use tracing::info;
 use xshell::Shell;
 
