@@ -98,7 +98,7 @@ impl MachineType {
     }
 }
 
-/// `kd boatworker create [NAME] [--pkg PACKAGE]... [--type TYPE]` arguments.
+/// `kd boatworker create [NAME] [--pkg PACKAGE]... [--type TYPE] [--ttl DURATION]` arguments.
 #[derive(Args)]
 pub struct CreateArgs {
     /// Worker name. Defaults to `boatworker-<local timestamp>`. A custom
@@ -117,6 +117,72 @@ pub struct CreateArgs {
     /// Boat machine size. `large` has the 16 GB of memory a ubiworker has.
     #[arg(long = "type", value_enum, default_value_t = MachineType::Large)]
     pub machine_type: MachineType,
+
+    /// Let boat delete the worker after this long, e.g. `500s`, `90m`, `3h`
+    /// or `7d`. Without it the worker runs until `kd boatworker destroy`.
+    /// Nothing of the worker is kept: boatworkers have no snapshots.
+    #[arg(long, value_name = "DURATION", value_parser = parse_ttl)]
+    pub ttl: Option<Ttl>,
+}
+
+/// A `--ttl` value: the lifetime in seconds, as `boat new --ttl` takes it,
+/// and the text the user typed, which the create summary repeats.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Ttl {
+    pub seconds: u64,
+    pub text: String,
+}
+
+/// Parse a `--ttl` value: a positive whole number directly followed by one
+/// unit, `s`, `m`, `h` or `d` (`500s`, `90m`, `3h`, `7d`).
+///
+/// The unit is required. boat itself counts seconds (`boat new --ttl`) but
+/// also hours (`boat extend --hours`), so a bare `3` has no obvious
+/// meaning, and reading it the wrong way is off by a factor of 3600 on a
+/// limit that ends in the worker's disk being erased. Compound values such
+/// as `1h30m` are refused rather than half-parsed; `90m` says the same.
+///
+/// Anything under a minute is refused: setup alone takes about that long,
+/// so such a value is almost certainly a slip (`30s` for `30m`), and acting
+/// on it would spend a sandbox start and a minted key on a worker deleted
+/// before it is usable. Values beyond what a signed 64-bit count of seconds
+/// holds are refused as too large, so kd never hands boat a number the
+/// summary cannot turn into a time either.
+pub(crate) fn parse_ttl(value: &str) -> Result<Ttl, String> {
+    let format = "expected a whole number followed by s, m, h or d, such as 500s, 90m, 3h or 7d";
+    let split = value
+        .find(|c: char| !c.is_ascii_digit())
+        .ok_or_else(|| format!("'{value}' has no unit; {format}"))?;
+    let (number, unit) = value.split_at(split);
+    let scale: u64 = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        "d" => 24 * 60 * 60,
+        _ => return Err(format!("invalid duration '{value}'; {format}")),
+    };
+    if number.is_empty() {
+        return Err(format!("invalid duration '{value}'; {format}"));
+    }
+    // `number` is all ASCII digits here, so the only way to fail parsing
+    // is overflow.
+    let too_large = || format!("duration '{value}' is too large");
+    let seconds = number
+        .parse::<u64>()
+        .ok()
+        .and_then(|count| count.checked_mul(scale))
+        .filter(|&s| i64::try_from(s).is_ok())
+        .ok_or_else(too_large)?;
+    if seconds < 60 {
+        return Err(format!(
+            "duration '{value}' is under a minute; the worker would be deleted before its setup \
+             finishes (did you mean '{number}m'?)"
+        ));
+    }
+    Ok(Ttl {
+        seconds,
+        text: value.to_owned(),
+    })
 }
 
 /// `kd boatworker destroy [NAME...] [--all]` arguments.
@@ -170,7 +236,8 @@ pub enum Commands {
     /// sandbox whose first-boot setup installs tailscale, joins the tailnet
     /// with Tailscale SSH, and then bootstraps apt packages (`--pkg`) in a
     /// detached unit, exactly as on ubiworkers. The sandbox runs until
-    /// destroyed and gets none of the boat account's stored secrets.
+    /// destroyed, or with --ttl until boat deletes it, and gets none of the
+    /// boat account's stored secrets.
     /// Returns once boat reports the sandbox ready, without waiting for
     /// enrollment.
     Create(CreateArgs),
@@ -574,5 +641,67 @@ mod tests {
         ] {
             assert!(parse_sandbox_page(bad).is_err(), "{bad:?} should fail");
         }
+    }
+
+    /// The documented forms parse to boat's seconds, keeping the text the
+    /// summary repeats.
+    #[test]
+    fn parse_ttl_accepts_each_unit() {
+        for (text, seconds) in [
+            ("500s", 500),
+            ("90m", 5400),
+            ("3h", 10_800),
+            ("7d", 604_800),
+        ] {
+            assert_eq!(
+                parse_ttl(text),
+                Ok(Ttl {
+                    seconds,
+                    text: text.to_owned()
+                })
+            );
+        }
+    }
+
+    /// Anything that is not one whole number and one known unit is refused
+    /// rather than guessed at: a bare number (seconds or hours?), a compound
+    /// value, an unknown or upper-case unit, signs, spaces, decimals,
+    /// non-ASCII digits, anything under a minute (a likely slip for
+    /// minutes), and values too large for boat's seconds, which must say
+    /// "too large" rather than claim the input is malformed.
+    #[test]
+    fn parse_ttl_refuses_everything_else() {
+        for bad in [
+            "",
+            "3",
+            "h",
+            "1h30m",
+            "3H",
+            "3 h",
+            " 3h",
+            "+3h",
+            "-3h",
+            "1.5h",
+            "3w",
+            "0s",
+            "0d",
+            "59s",
+            "\u{0663}h",
+            "18446744073709551615d",
+            "99999999999999999999999s",
+            "9223372036854775808s",
+        ] {
+            assert!(parse_ttl(bad).is_err(), "{bad:?} should be refused");
+        }
+        assert!(parse_ttl("3").unwrap_err().contains("no unit"));
+        assert!(parse_ttl("30s").unwrap_err().contains("'30m'"));
+        for huge in [
+            "99999999999999999999999s",
+            "9223372036854775808s",
+            "18446744073709551615d",
+        ] {
+            assert!(parse_ttl(huge).unwrap_err().contains("too large"), "{huge}");
+        }
+        assert!(parse_ttl("60s").is_ok() && parse_ttl("1m").is_ok());
     }
 }

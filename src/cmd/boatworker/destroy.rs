@@ -5,7 +5,8 @@
 //! confirmation prompt (the guard is that targets only ever come from the
 //! owned-worker listing), fail-closed resolution of every requested name
 //! before anything is deleted, deduplication of names that normalize to the
-//! same worker, and sequential, non-atomic execution afterwards. See that
+//! same worker, and sequential, non-atomic execution afterwards. Unlike
+//! ubiworker's, a failed deletion does not stop the rest (see [`run`]). See that
 //! module's docs and SPEC.md for the reasoning; it applies unchanged.
 //!
 //! Two boat-specific differences. Boat documents no uniqueness rule for
@@ -17,7 +18,7 @@
 use super::{DestroyArgs, OwnedWorkers, Worker, owned_workers, with_prefix};
 use anyhow::{Context, bail};
 use std::collections::HashSet;
-use tracing::info;
+use tracing::{error, info};
 use xshell::{Shell, cmd};
 
 /// Entry point for `kd boatworker destroy`: resolve every target against
@@ -39,13 +40,29 @@ pub fn run(args: DestroyArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Every target is attempted even after a failure. A boatworker created
+    // with `--ttl` can vanish on its own between the listing and its
+    // `boat delete`, and stopping there would leave the remaining targets
+    // running and billing. The command still fails at the end, naming each
+    // worker that could not be deleted, so a rerun picks up what is left.
+    let mut failed = Vec::new();
     for target in targets {
-        delete_sandbox(&sh, &target.id)
-            .with_context(|| format!("failed to destroy boatworker '{}'", target.name))?;
-        info!(
-            "requested deletion of boatworker '{}' ({})",
-            target.name, target.id
-        );
+        match delete_sandbox(&sh, &target.id) {
+            Ok(()) => info!(
+                "requested deletion of boatworker '{}' ({})",
+                target.name, target.id
+            ),
+            Err(err) => {
+                error!(
+                    "failed to destroy boatworker '{}' ({}): {err:#}",
+                    target.name, target.id
+                );
+                failed.push(format!("{} ({})", target.name, target.id));
+            }
+        }
+    }
+    if !failed.is_empty() {
+        bail!("failed to destroy: {}", failed.join(", "));
     }
     Ok(())
 }

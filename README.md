@@ -113,9 +113,11 @@ kd ubiworker ssh -- -L 8080:localhost:80
 # Create a disposable boat.dev worker sandbox that enrolls itself into the
 # tailnet (tag:boat) like a ubiworker, runs until destroyed, and gets none of
 # your boat account's stored secrets. Same name and --pkg handling as
-# ubiworker create; --type picks boat's machine size (default large).
+# ubiworker create; --type picks boat's machine size (default large); --ttl
+# (500s, 90m, 3h, 7d) has boat delete it after that long instead.
 kd boatworker create
 kd boatworker create myname --pkg build-essential --type default
+kd boatworker create scratch --ttl 3h
 
 # List boat.dev worker sandboxes (names starting with boatworker-).
 kd boatworker list

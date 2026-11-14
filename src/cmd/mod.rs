@@ -245,6 +245,11 @@ mod tests {
         ]));
         assert!(parses(&["kd", "boatworker", "create", "--type", "xlarge"]));
         assert!(!parses(&["kd", "boatworker", "create", "--type", "huge"]));
+        // `--ttl` goes through `parse_ttl`, so a malformed value fails at
+        // parse time, before anything is minted or started.
+        assert!(parses(&["kd", "boatworker", "create", "--ttl", "3h"]));
+        assert!(!parses(&["kd", "boatworker", "create", "--ttl", "3"]));
+        assert!(!parses(&["kd", "boatworker", "create", "--ttl", "30s"]));
     }
 
     /// The `boatworker` listing and destroy shapes mirror `ubiworker`'s,
