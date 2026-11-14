@@ -306,7 +306,9 @@ the reasoning behind it.
   stdout when there are none; an info-level note goes to stderr instead.
 - `destroy` keeps ubiworker's semantics: names, `--all` (a no-op success when there are none), or the sole owned worker;
   fail-closed resolution of every name before anything is deleted; deduplication of names that normalize to the same
-  worker; no confirmation prompt; sequential deletion with no rollback. Each target is deleted with
+  worker; no confirmation prompt; sequential deletion with no rollback. Unlike ubiworker, a failed deletion does not
+  stop the rest: every target is attempted, and the command then fails naming each worker it could not delete, since a
+  `--ttl` worker can vanish on its own between the listing and its deletion. Each target is deleted with
   `boat delete <id> --yes`, which erases the sandbox and its disk. One difference: boat documents no uniqueness rule for
   sandbox names, so a requested name can match more than one owned sandbox, and all of them are then targets, because
   the name the user gave covers all of them. Error messages listing several workers name each with its id for the same
@@ -344,14 +346,28 @@ the reasoning behind it.
   another's name succeeds), so `create` refuses a name an owned sandbox already has, naming that sandbox's id, before
   minting a key or starting anything. kd thereby never creates the ambiguity `destroy` and `ssh` have to handle; a
   sandbox made by hand can still create it. On a cut-off listing, a collision beyond the first page goes undetected.
-- Every boatworker is started with `boat new --no-auto-stop --no-env --no-snapshots --no-monitoring --type <TYPE>`. It
-  runs, and bills, until `kd boatworker destroy`, like a ubiworker. It never receives the boat account's stored
-  environment variables, secret files or credentials, and boat keeps neither snapshots of its disk nor a record of its
-  commands and process output. With snapshots off, a `boat stop` erases the sandbox; kd offers no stop or resume.
+- Every boatworker is started with `boat new --no-env --no-snapshots --no-monitoring --type <TYPE>`, plus either
+  `--no-auto-stop` (the default: it runs, and bills, until `kd boatworker destroy`, like a ubiworker) or
+  `--ttl <seconds>` (with `--ttl`, below). It never receives the boat account's stored environment variables, secret
+  files or credentials, and boat keeps neither snapshots of its disk nor a record of its commands and process output.
+  With snapshots off, a `boat stop` erases the sandbox; kd offers no stop or resume.
+- `--ttl DURATION` has boat delete the worker after that long instead of running it until destroyed. DURATION is a whole
+  number directly followed by `s`, `m`, `h` or `d` (`500s`, `90m`, `3h`, `7d`), at least one minute. A bare number, a
+  compound value such as `1h30m`, anything under a minute (setup alone takes about that long, so `30s` is likely a slip
+  for `30m`), a value too large for a signed 64-bit count of seconds, or anything else is refused before anything is
+  minted or started. The unit is required because a bare number is ambiguous: boat takes seconds for `boat new --ttl`
+  and hours for `boat extend --hours`. kd passes the seconds to `boat new --ttl`. boat documents that only as the
+  lifetime before the sandbox is eligible for cleanup. What was observed, once, with boat CLI 1.0.97: a boatworker
+  (snapshots off) whose TTL was shortened with `boat extend` was gone about 15 seconds after its deadline (`boat info`
+  404, absent from `boat list --all`), not stopped, so nothing of it is kept; kd describes it as deleted. boat accepted
+  `boat new --ttl 604800` (7 days); upper limits, if any, are boat's to enforce. The summary gives the deletion time in
+  local time: boat's own deadline (`archiveAfter` in `boat new`'s output) when boat reports it, else an estimate counted
+  from when `boat new` returned, marked as such. `boat extend <id> --ttl SECONDS` (or `--hours HOURS`) changes the
+  remaining lifetime of a worker created with `--ttl`.
 - `--type` (`small`, `default`, `large` or `xlarge`, default `large`) is the one part of the shape the caller chooses,
-  besides `--pkg`. ubiworker's fixed shape is a decision about one disposable shape; boat's sizes differ enough in price
-  and capacity that a fixed one would push people to `boat new` by hand. `large` has the 16 GB of memory a ubiworker has
-  (and twice its vCPUs). Whether the account's plan allows a size is boat's to say.
+  besides `--pkg` and `--ttl`. ubiworker's fixed shape is a decision about one disposable shape; boat's sizes differ
+  enough in price and capacity that a fixed one would push people to `boat new` by hand. `large` has the 16 GB of memory
+  a ubiworker has (and twice its vCPUs). Whether the account's plan allows a size is boat's to say.
 - The first-boot script reaches boat as a setup file (`boat new --setup-file`), which boat runs once, in the background,
   after the sandbox reports ready, as the unprivileged `user` account. kd puts a short prelude in front of ubiworker's
   script that re-runs the file under `sudo -n /bin/sh`, since the script assumes root, and then deletes the file: boat

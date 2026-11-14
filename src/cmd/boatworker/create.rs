@@ -22,18 +22,23 @@
 //!
 //! # Shape
 //!
-//! Every boatworker is created with `--no-auto-stop --no-env --no-snapshots
-//! --no-monitoring`: it runs (and bills) until `kd boatworker destroy`, never
-//! receives the boat account's stored secrets, and boat keeps neither
-//! snapshots nor command history of it. The machine type is the one choice
-//! left to the caller (`--type`, default `large`).
+//! Every boatworker is created with `--no-env --no-snapshots
+//! --no-monitoring`: it never receives the boat account's stored secrets, and
+//! boat keeps neither snapshots nor command history of it. By default it also
+//! gets `--no-auto-stop` and runs (and bills) until `kd boatworker destroy`.
+//! `--ttl` swaps that for `boat new --ttl <seconds>`. boat documents the
+//! value only as the lifetime "before the sandbox is eligible for cleanup".
+//! Observed once with boat CLI 1.0.97: a boatworker (snapshots off) whose
+//! TTL was shortened with `boat extend` was gone, not stopped, about 15
+//! seconds after its deadline, so kd calls it deleted. The machine type is
+//! the other choice left to the caller (`--type`, default `large`).
 //!
 //! `create` returns when `boat new` reports the sandbox ready. Like
 //! `kd ubiworker create`, it does not wait for tailnet enrollment or for the
 //! package bootstrap.
 
 use super::{
-    CreateArgs, OwnedWorkers, TAILSCALE_TAG, TS_API_CLIENT_ID, UNIX_USER, default_worker_name,
+    CreateArgs, OwnedWorkers, TAILSCALE_TAG, TS_API_CLIENT_ID, Ttl, UNIX_USER, default_worker_name,
     normalize_worker_name, owned_workers,
 };
 use crate::cmd::worker_bootstrap::init_script::{
@@ -101,7 +106,14 @@ pub fn run(args: CreateArgs) -> anyhow::Result<()> {
         .context("failed to write the setup script temp file")?;
 
     info!("Creating boat sandbox '{name}' ({machine_type})...");
-    let id = create_sandbox(&sh, &name, machine_type, setup_file.path())?;
+    let NewSandbox { id, deadline } = create_sandbox(
+        &sh,
+        &name,
+        machine_type,
+        args.ttl.as_ref(),
+        setup_file.path(),
+    )?;
+    let lifetime = describe_lifetime(args.ttl.as_ref(), deadline, &Zoned::now());
 
     let tailscale_login = tailscale::local_login(&sh);
     println!(
@@ -110,6 +122,7 @@ pub fn run(args: CreateArgs) -> anyhow::Result<()> {
             &name,
             &id,
             machine_type,
+            &lifetime,
             &packages,
             tailscale_login.as_deref()
         )
@@ -165,7 +178,7 @@ fn render_setup_script(auth_key: &str, name: &str, packages: &[String]) -> anyho
     ))
 }
 
-/// Start the sandbox with `boat new` and return its id.
+/// Start the sandbox with `boat new` and return its id and boat's deadline.
 ///
 /// The flags are the fixed boatworker shape (see module docs). The child
 /// gets the Tailscale OAuth pair removed from its environment: boat needs
@@ -180,9 +193,10 @@ fn create_sandbox(
     sh: &Shell,
     name: &str,
     machine_type: &str,
+    ttl: Option<&Ttl>,
     setup_file: &std::path::Path,
-) -> anyhow::Result<String> {
-    let args = boat_new_args(name, machine_type, setup_file);
+) -> anyhow::Result<NewSandbox> {
+    let args = boat_new_args(name, machine_type, ttl, setup_file);
     let output = cmd!(sh, "boat {args...}")
         .env_remove("TS_API_CLIENT_ID")
         .env_remove("TS_API_CLIENT_SECRET")
@@ -200,35 +214,63 @@ fn create_sandbox(
 ///
 /// Split out so a test pins the fixed flags. They are the part most costly
 /// to lose silently: without `--no-env` every worker would receive the boat
-/// account's stored secrets, and without `--no-auto-stop` it would stop
-/// after boat's default hour.
-fn boat_new_args(name: &str, machine_type: &str, setup_file: &std::path::Path) -> Vec<OsString> {
-    let mut args: Vec<OsString> = [
-        "new",
-        "--no-auto-stop",
-        "--no-env",
-        "--no-snapshots",
-        "--no-monitoring",
-        "--type",
-        machine_type,
-        "--name",
-        name,
-        "--setup-file",
-    ]
-    .into_iter()
-    .map(OsString::from)
-    .collect();
+/// account's stored secrets, and without either `--no-auto-stop` or `--ttl`
+/// it would stop after boat's default hour. The two are alternatives: boat
+/// documents `--ttl` as the lifetime before the sandbox is cleaned up and
+/// `--no-auto-stop` as no automatic stop at all, so exactly one is passed.
+fn boat_new_args(
+    name: &str,
+    machine_type: &str,
+    ttl: Option<&Ttl>,
+    setup_file: &std::path::Path,
+) -> Vec<OsString> {
+    let lifetime = match ttl {
+        Some(ttl) => vec!["--ttl".to_owned(), ttl.seconds.to_string()],
+        None => vec!["--no-auto-stop".to_owned()],
+    };
+    let mut args: Vec<OsString> = std::iter::once("new".to_owned())
+        .chain(lifetime)
+        .chain(
+            [
+                "--no-env",
+                "--no-snapshots",
+                "--no-monitoring",
+                "--type",
+                machine_type,
+                "--name",
+                name,
+                "--setup-file",
+            ]
+            .map(str::to_owned),
+        )
+        .map(OsString::from)
+        .collect();
     args.push(setup_file.as_os_str().to_owned());
     args.push("--json".into());
     args
 }
 
-/// One line of `boat new --json` output. Only the event name and the id
-/// matter to kd; boat adds further fields per event.
+/// One line of `boat new --json` output. Only the event name, the id and
+/// the deadline matter to kd; boat adds further fields per event.
 #[derive(Deserialize)]
 struct NewEvent {
     event: String,
     id: Option<String>,
+    /// When boat will clean the sandbox up, an RFC 3339 timestamp, on the
+    /// `ready` event; `null` for a sandbox without a TTL.
+    #[serde(rename = "archiveAfter")]
+    archive_after: Option<String>,
+}
+
+/// What kd takes from `boat new --json`: the sandbox id, and boat's own
+/// deadline for it when it has one.
+#[derive(Debug, PartialEq)]
+struct NewSandbox {
+    id: String,
+    /// `None` without `--ttl`, and also if boat's output lacks the field or
+    /// holds something unparseable: the deadline only feeds the summary, so
+    /// it must never fail a create that already has a running sandbox.
+    deadline: Option<jiff::Timestamp>,
 }
 
 /// Find the new sandbox's id in `boat new --json` output and check that boat
@@ -243,15 +285,19 @@ struct NewEvent {
 /// failing the whole create, and every error says how to find and remove
 /// the sandbox. A missing `ready` line is still reported as an error rather
 /// than a success summary.
-fn parse_new_output(output: &str) -> anyhow::Result<String> {
+fn parse_new_output(output: &str) -> anyhow::Result<NewSandbox> {
     let mut id = None;
     let mut ready = false;
+    let mut deadline = None;
     for line in output.lines() {
         let Ok(event) = serde_json::from_str::<NewEvent>(line) else {
             continue;
         };
         if id.is_none() {
             id = event.id;
+        }
+        if let Some(at) = event.archive_after.as_deref() {
+            deadline = at.parse().ok().or(deadline);
         }
         ready |= event.event == "ready";
     }
@@ -267,7 +313,33 @@ fn parse_new_output(output: &str) -> anyhow::Result<String> {
              check `kd boatworker list`, and remove it with `kd boatworker destroy` if unwanted"
         );
     }
-    Ok(id)
+    Ok(NewSandbox { id, deadline })
+}
+
+/// The summary's lifetime line: how long the worker runs, and for a
+/// `--ttl` worker when boat deletes it, in `now`'s time zone.
+///
+/// The time is boat's own deadline (`archiveAfter` from `boat new`) when
+/// boat reported one, since boat counts from its own creation of the
+/// sandbox and may have waited for a machine first. Without it, the time is
+/// estimated from `now` (just after `boat new` returned) and marked as an
+/// estimate. It says "deletes" rather than "stops" because that is what was
+/// observed (see the module docs), and a reader used to boat's snapshots
+/// would otherwise expect to resume the worker.
+fn describe_lifetime(ttl: Option<&Ttl>, deadline: Option<jiff::Timestamp>, now: &Zoned) -> String {
+    let Some(ttl) = ttl else {
+        return "runs until `kd boatworker destroy`".to_owned();
+    };
+    let local = |at: Zoned| at.strftime("%Y-%m-%d %H:%M %Z").to_string();
+    let when = match deadline {
+        Some(at) => format!(" (at {})", local(at.to_zoned(now.time_zone().clone()))),
+        None => i64::try_from(ttl.seconds)
+            .ok()
+            .and_then(|secs| now.checked_add(jiff::SignedDuration::from_secs(secs)).ok())
+            .map(|at| format!(" (around {}, estimated)", local(at)))
+            .unwrap_or_default(),
+    };
+    format!("boat deletes it after {}{when}, keeping nothing", ttl.text)
 }
 
 /// The human-readable summary printed to stdout after a successful create,
@@ -283,11 +355,13 @@ fn render_summary(
     name: &str,
     id: &str,
     machine_type: &str,
+    lifetime: &str,
     packages: &[String],
     tailscale_login: Option<&str>,
 ) -> String {
     [
         format!("Created boatworker '{name}' ({id}, {machine_type})"),
+        format!("  lifetime: {lifetime}"),
         format!("  unix user: {UNIX_USER}"),
         // Enrollment and the package bootstrap both run after `create`
         // returns; these two lines say where to look instead of implying
@@ -361,7 +435,12 @@ mod tests {
     /// passed by path (the script itself never appears in argv).
     #[test]
     fn boat_new_args_carry_the_fixed_shape() {
-        let args = boat_new_args("boatworker-a", "large", std::path::Path::new("/tmp/x"));
+        let args = boat_new_args(
+            "boatworker-a",
+            "large",
+            None,
+            std::path::Path::new("/tmp/x"),
+        );
         assert_eq!(
             args,
             [
@@ -411,7 +490,13 @@ mod tests {
 
     #[test]
     fn parse_new_output_returns_the_created_id() {
-        assert_eq!(parse_new_output(NEW_FIXTURE).unwrap(), "bx_aaaaaaaa");
+        assert_eq!(
+            parse_new_output(NEW_FIXTURE).unwrap(),
+            NewSandbox {
+                id: "bx_aaaaaaaa".to_owned(),
+                deadline: None
+            }
+        );
     }
 
     /// A line that is not a JSON event (a self-update notice, say) must not
@@ -419,7 +504,7 @@ mod tests {
     #[test]
     fn parse_new_output_skips_non_json_lines() {
         let output = format!("boat: updated to a newer version\n{NEW_FIXTURE}");
-        assert_eq!(parse_new_output(&output).unwrap(), "bx_aaaaaaaa");
+        assert_eq!(parse_new_output(&output).unwrap().id, "bx_aaaaaaaa");
     }
 
     /// Output that never says `ready` is not a success, and the error must
@@ -478,7 +563,8 @@ mod tests {
     /// login is unknown.
     #[test]
     fn render_summary_names_boatworker_commands_and_boat_rule() {
-        let summary = render_summary("boatworker-a", "bx_a", "large", &[], None);
+        let summary = render_summary("boatworker-a", "bx_a", "large", "LIFETIME", &[], None);
+        assert!(summary.contains("\n  lifetime: LIFETIME\n"), "{summary}");
         assert!(summary.contains("connect: kd boatworker ssh boatworker-a"));
         assert!(summary.contains("destroy: kd boatworker destroy boatworker-a"));
         assert!(summary.contains("boat info bx_a"));
@@ -486,5 +572,93 @@ mod tests {
             r#"{ "action": "accept", "src": ["<your-tailscale-login>"], "dst": ["tag:boat"], "users": ["user"] }"#
         ));
         assert!(!summary.contains("ubiworker"), "{summary}");
+    }
+
+    /// `--ttl` replaces `--no-auto-stop` with boat's `--ttl <seconds>`, and
+    /// only that: the rest of the shape (no stored secrets, no snapshots, no
+    /// monitoring) must not change with it. Both flags at once would leave
+    /// boat to decide which wins.
+    #[test]
+    fn boat_new_args_with_ttl_swap_only_the_lifetime_flag() {
+        let ttl = crate::cmd::boatworker::parse_ttl("3h").unwrap();
+        let with = boat_new_args(
+            "boatworker-a",
+            "large",
+            Some(&ttl),
+            std::path::Path::new("/tmp/x"),
+        );
+        let without = boat_new_args(
+            "boatworker-a",
+            "large",
+            None,
+            std::path::Path::new("/tmp/x"),
+        );
+        assert_eq!(&with[..3], ["new", "--ttl", "10800"].map(OsString::from));
+        assert!(
+            !with.contains(&OsString::from("--no-auto-stop")),
+            "{with:?}"
+        );
+        assert_eq!(with[3..], without[2..]);
+    }
+
+    /// The lifetime line says plainly how the worker ends: with `--ttl`,
+    /// deleted after the given time, around a local clock time; without it,
+    /// only when destroyed.
+    #[test]
+    fn describe_lifetime_covers_both_kinds() {
+        let now: Zoned = "2026-11-14T10:00:00[UTC]".parse().unwrap();
+        assert_eq!(
+            describe_lifetime(None, None, &now),
+            "runs until `kd boatworker destroy`"
+        );
+        let ttl = crate::cmd::boatworker::parse_ttl("3h").unwrap();
+        assert_eq!(
+            describe_lifetime(Some(&ttl), None, &now),
+            "boat deletes it after 3h (around 2026-11-14 13:00 UTC, estimated), keeping nothing"
+        );
+    }
+
+    /// boat's own deadline wins over kd's estimate, shown in the local
+    /// zone: boat counts from its creation of the sandbox, which can be
+    /// well before `boat new` returns.
+    #[test]
+    fn describe_lifetime_prefers_boats_deadline() {
+        let now: Zoned = "2026-11-14T10:00:00[America/New_York]".parse().unwrap();
+        let ttl = crate::cmd::boatworker::parse_ttl("3h").unwrap();
+        let deadline: jiff::Timestamp = "2026-11-14T17:58:00Z".parse().unwrap();
+        assert_eq!(
+            describe_lifetime(Some(&ttl), Some(deadline), &now),
+            "boat deletes it after 3h (at 2026-11-14 12:58 EST), keeping nothing"
+        );
+    }
+
+    /// The estimate is a calendar-aware sum in the local zone: across a
+    /// daylight-saving change, 7d of seconds lands one wall-clock hour
+    /// earlier, as the real deadline does.
+    #[test]
+    fn describe_lifetime_estimate_crosses_daylight_saving() {
+        let now: Zoned = "2026-10-31T10:00:00[America/New_York]".parse().unwrap();
+        let ttl = crate::cmd::boatworker::parse_ttl("7d").unwrap();
+        assert_eq!(
+            describe_lifetime(Some(&ttl), None, &now),
+            "boat deletes it after 7d (around 2026-11-07 09:00 EST, estimated), keeping nothing"
+        );
+    }
+
+    /// boat's `ready` event carries the deadline as `archiveAfter`; it is
+    /// picked up when present, and a malformed value is ignored rather than
+    /// failing a create whose sandbox already runs.
+    #[test]
+    fn parse_new_output_reads_boats_deadline() {
+        let with = NEW_FIXTURE.replace(
+            r#""archiveAfter":null"#,
+            r#""archiveAfter":"2026-11-21T01:55:47.325Z""#,
+        );
+        assert_eq!(
+            parse_new_output(&with).unwrap().deadline,
+            Some("2026-11-21T01:55:47.325Z".parse().unwrap())
+        );
+        let junk = NEW_FIXTURE.replace(r#""archiveAfter":null"#, r#""archiveAfter":"soon""#);
+        assert_eq!(parse_new_output(&junk).unwrap().deadline, None);
     }
 }
