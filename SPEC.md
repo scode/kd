@@ -182,11 +182,12 @@ non-ImageMagick helpers still behave correctly. It does not prove that thumbnail
   example `ssh` rule _object_ granting that user on `tag:ubicloud` — an object to append to the policy's existing `ssh`
   array, never a whole `"ssh": [...]` property that would duplicate or replace the rules already there. The rule's `src`
   is the operator's own Tailscale login, resolved best-effort from the local `tailscale status --json` (`Self.UserID` →
-  `User[..].LoginName`); when that can't be determined (no `tailscale`, tailscaled down, or a tagged node, whose login
-  is the synthetic `tagged-devices`) the summary prints an unmistakable `<your-tailscale-login>` placeholder. kd never
-  suggests `autogroup:member`: on a shared tailnet that is every member, and copy-pasted security examples tend to
-  become production policy unchanged. The summary also names the port-22 ACL/grant requirement and the policy editor URL
-  / console path, the latter two being best-effort guidance that Tailscale can move at any time.
+  `User[..].LoginName`); when that can't be determined (no `tailscale`, tailscaled down, or a tagged node, recognized by
+  a non-empty `Self.Tags`, which has no user login: depending on the Tailscale version its `LoginName` reads
+  `tagged-devices` or the node's own MagicDNS name) the summary prints an unmistakable `<your-tailscale-login>`
+  placeholder. kd never suggests `autogroup:member`: on a shared tailnet that is every member, and copy-pasted security
+  examples tend to become production policy unchanged. The summary also names the port-22 ACL/grant requirement and the
+  policy editor URL / console path, the latter two being best-effort guidance that Tailscale can move at any time.
 - The Unix account provisioned on a worker (`ubi vm create --unix-user`) is the local username of whoever runs `create`,
   as reported by `id -un` — not a constant and not a flag. `ssh` logs in as the local username too, so the implied
   contract is that both are run by the same person under the same username; kd records nothing about which user a worker
