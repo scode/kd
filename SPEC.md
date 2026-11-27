@@ -392,6 +392,31 @@ the reasoning behind it.
   fail with "Connection refused" for a moment; Tailscale SSH is unaffected. The upgrade can also leave the system asking
   for a restart, which kd does not do, as on ubiworkers.
 
+## kd tlworker
+
+The Tensorlake counterpart of `kd ubiworker`; Tensorlake calls its VMs sandboxes. This section records where tlworkers
+differ from ubiworkers. For the subcommands documented here, behavior not mentioned matches the ubiworker section, and
+so does the reasoning behind it.
+
+- kd talks to Tensorlake through its REST API, not the `tl` CLI. Credentials come from `TENSORLAKE_API_KEY` when it is
+  set and non-empty (a project-scoped API key from the Tensorlake dashboard), and otherwise from the `tl` CLI's own
+  login in `~/.config/tensorlake/credentials.toml`, so a machine where `tl login` has been run needs nothing else. With
+  neither, every subcommand fails before any network call, telling the user to run `tl login` or set
+  `TENSORLAKE_API_KEY`. NOTE: reusing the `tl` login relies on a file format and request headers Tensorlake does not
+  document, and a `tl` update may break it; `TENSORLAKE_API_KEY` is the stable alternative. Neither secret is logged,
+  shown in an error, or passed in any process's argv.
+- Ownership is structural, as for ubiworkers, with one condition: a sandbox is a tlworker iff its Tensorlake name starts
+  with `tlworker-`. Unnamed sandboxes are never tlworkers. The test applies within the project the credentials select;
+  for the `tl` login that is the project `tl login` last selected. In a project other people also use, their `tlworker-`
+  sandboxes count as owned too; kd is built for a project of one's own.
+- kd reads Tensorlake's listing of sandboxes that have not terminated to the end, following its cursor, so there is no
+  cut-off listing case: kd always sees every tlworker in the project. A listing kd cannot parse is a hard error, never
+  an empty listing.
+- `list` prints one tab-separated line per tlworker: name, sandbox ID, shape, and Tensorlake's status. The shape is
+  vCPUs and memory, as in `4 vCPU/16 GiB`; a fractional CPU count prints as such (`0.5 vCPU`), and memory that is not a
+  whole number of GiB prints in MiB, so a sandbox made by hand is shown exactly. Suspended and pending sandboxes are
+  included. Nothing at all goes to stdout when there are none; an info-level note goes to stderr instead.
+
 ## kd cargo scode
 
 Commands for tools installed with `cargo install --git` from repositories under github.com/scode, kd included.

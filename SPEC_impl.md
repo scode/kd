@@ -67,6 +67,20 @@ of exit status, and `query_data` tolerates `NOT_FOUND` while failing on any othe
 - `boat` is invoked without `--no-update`. Boat updates its own CLI on invocation unless told not to, and kd leaves that
   to the user (`BOAT_NO_UPDATE=1`); an update has not been seen to disturb `--json` output. Revisit if it does.
 
+## kd tlworker
+
+- The `tl` login is used by reading `tl`'s credentials file (a TOML table keyed `["https://api.tensorlake.ai"]` with
+  `token`, `organization` and `project`) and sending the token as a bearer token with `X-Forwarded-Organization-Id` and
+  `X-Forwarded-Project-Id`, which is what `tl` 0.5.125 sends (the header names were found in its binary). Tensorlake
+  documents only API keys for its REST API. Do not "fix" this into shelling out to `tl` for the token: `tl` has no
+  command that prints it, and kd does not run `tl`. An API key is sent without the two headers, since the key carries
+  its own project.
+- The HTTP client is ureq with `http_status_as_error(false)`, so a non-2xx reply is read and its text (a plan limit, a
+  taken name) reaches the user, redacted of the secret and cut to one bounded line. ureq's default turns the status into
+  an error and discards the body. Every request also has an explicit timeout, because ureq 3 has none by default.
+- Tests cover pure functions only (credential resolution with the file read and environment injected, reply decoding,
+  rendering). There is no stub HTTP server or fake API layer; live behavior is checked against Tensorlake itself.
+
 ## kd cli-proxy-api
 
 Why strict priority by weekly reset, rather than weights: using the soonest-expiring quota first never wastes more than

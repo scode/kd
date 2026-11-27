@@ -5,6 +5,7 @@ pub mod cargo;
 pub mod cli_proxy_api;
 pub mod devbox;
 pub mod gh;
+pub mod tlworker;
 pub mod ubiworker;
 pub mod worker_bootstrap;
 pub mod yt;
@@ -38,6 +39,11 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: gh::Commands,
     },
+    /// Tensorlake worker sandbox commands
+    Tlworker {
+        #[command(subcommand)]
+        cmd: tlworker::Commands,
+    },
     /// Ubicloud worker VM commands
     Ubiworker {
         #[command(subcommand)]
@@ -58,6 +64,7 @@ impl Commands {
             Commands::CliProxyApi { cmd } => cmd.run(),
             Commands::Devbox { cmd } => cmd.run(),
             Commands::Gh { cmd } => cmd.run(),
+            Commands::Tlworker { cmd } => cmd.run(),
             Commands::Ubiworker { cmd } => cmd.run(),
             Commands::Yt { cmd } => cmd.run(),
         }
@@ -300,6 +307,14 @@ mod tests {
             parse(&["kd", "boatworker", "ssh", "-t", "htop"]),
             (vec!["-t".into(), "htop".into()], 0)
         );
+    }
+
+    /// The `tlworker` command names are part of the user contract
+    /// (SPEC.md); clap derives them from variant names, so pin them.
+    #[test]
+    fn tlworker_list_parses() {
+        assert!(parses(&["kd", "tlworker", "list"]));
+        assert!(!parses(&["kd", "tlworker", "frobnicate"]));
     }
 
     #[test]
