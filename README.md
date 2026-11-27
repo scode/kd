@@ -138,6 +138,12 @@ kd boatworker ssh myname -t tmux attach
 # TENSORLAKE_API_KEY if set, else the tl CLI's login (`tl login`).
 kd tlworker list
 
+# Terminate tlworker sandbox(es) and delete the snapshots Tensorlake kept of
+# them; same name resolution as ubiworker destroy.
+kd tlworker destroy
+kd tlworker destroy myname otherworker
+kd tlworker destroy --all
+
 # Show what is installed from github.com/scode, at which version and commit,
 # and which tools `update` would update (read-only).
 kd cargo scode status

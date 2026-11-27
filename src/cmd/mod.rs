@@ -317,6 +317,18 @@ mod tests {
         assert!(!parses(&["kd", "tlworker", "frobnicate"]));
     }
 
+    /// `tlworker destroy` mirrors the other fleets' shape: names, `--all`
+    /// excluding names, and no `--yes` (there is no prompt to skip).
+    #[test]
+    fn tlworker_destroy_parses() {
+        assert!(parses(&["kd", "tlworker", "destroy"]));
+        assert!(parses(&["kd", "tlworker", "destroy", "a", "b"]));
+        assert!(parses(&["kd", "tlworker", "destroy", "--all"]));
+        assert!(parses(&["kd", "tlworker", "destroy", "-a"]));
+        assert!(!parses(&["kd", "tlworker", "destroy", "--all", "a"]));
+        assert!(!parses(&["kd", "tlworker", "destroy", "a", "--yes"]));
+    }
+
     #[test]
     fn ubiworker_create_parses() {
         assert!(parses(&["kd", "ubiworker", "create"]));
