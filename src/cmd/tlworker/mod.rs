@@ -22,18 +22,43 @@
 //! sandbox kd looked at.
 
 pub mod api;
+pub mod destroy;
 pub mod list;
 
-use clap::Subcommand;
+use clap::{Args, Subcommand};
 use tracing::debug;
 
 /// Prefix marking a Tensorlake sandbox as a kd-managed tlworker (see module
 /// docs on the ownership convention).
 pub(crate) const NAME_PREFIX: &str = "tlworker-";
 
+/// `kd tlworker destroy [NAME...] [--all]` arguments.
+#[derive(Args)]
+pub struct DestroyArgs {
+    /// Worker name(s) to destroy. If omitted (and `--all` isn't given),
+    /// exactly one owned tlworker must exist and it is targeted
+    /// automatically.
+    pub names: Vec<String>,
+
+    /// Destroy every owned tlworker. A no-op (not an error) if none exist,
+    /// so scripted cleanup doesn't have to special-case an empty listing.
+    #[arg(short, long, conflicts_with = "names")]
+    pub all: bool,
+}
+
 /// `kd tlworker` subcommands. Each one's doc comment is its `--help` text.
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Terminate one or more tlworker sandboxes and delete their snapshots
+    ///
+    /// Takes any number of names, or --all to destroy every owned tlworker.
+    /// With neither, targets the sole existing tlworker (an error if there
+    /// are zero or more than one). There is no confirmation prompt (see
+    /// SPEC.md); resolution is fail-closed, so a name that doesn't match
+    /// destroys nothing rather than partially executing. After terminating,
+    /// deletes every snapshot taken from the terminated sandboxes, since
+    /// Tensorlake keeps (and bills) them otherwise.
+    Destroy(DestroyArgs),
     /// List existing tlworker sandboxes
     ///
     /// Prints one tab-separated line per tlworker: name, sandbox ID,
@@ -45,8 +70,23 @@ pub enum Commands {
 impl Commands {
     pub fn run(self) -> anyhow::Result<()> {
         match self {
+            Commands::Destroy(args) => destroy::run(args),
             Commands::List => list::run(),
         }
+    }
+}
+
+/// Add the `tlworker-` ownership prefix to a user-supplied name if it's
+/// missing, so `foo` and `tlworker-foo` name the same worker.
+///
+/// This is all a name used for lookup goes through. It is deliberately not
+/// validated: a lookup only matches names already in the listing, so an
+/// owned sandbox made by hand stays reachable by the name `list` shows.
+pub(crate) fn with_prefix(name: &str) -> String {
+    if name.starts_with(NAME_PREFIX) {
+        name.to_string()
+    } else {
+        format!("{NAME_PREFIX}{name}")
     }
 }
 
@@ -115,6 +155,14 @@ mod tests {
                 memory_mb: 16384,
             },
         }
+    }
+
+    /// A bare name and its prefixed form must name the same worker, which is
+    /// what lets `destroy foo` find `tlworker-foo`.
+    #[test]
+    fn with_prefix_adds_prefix_only_when_missing() {
+        assert_eq!(with_prefix("foo"), "tlworker-foo");
+        assert_eq!(with_prefix("tlworker-foo"), "tlworker-foo");
     }
 
     /// Ownership is the prefix at the start of the name and nothing else:

@@ -263,6 +263,70 @@ fn next_page(current: Option<&str>, page: &SandboxPage) -> anyhow::Result<Option
     Ok(Some(next.to_string()))
 }
 
+/// One snapshot from `GET /snapshots`, reduced to what `destroy` needs.
+///
+/// `sandbox_id` is the sandbox the snapshot was taken from. Tensorlake
+/// snapshots a named sandbox when it suspends on idle, and those snapshots
+/// outlive the sandbox and bill storage monthly, so `destroy` deletes every
+/// snapshot whose source is a sandbox it terminated.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub(crate) struct Snapshot {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) sandbox_id: Option<String>,
+}
+
+/// `GET /snapshots`. A `next_cursor` is not expected (see
+/// [`Api::list_snapshots`]) and is only read to refuse it.
+#[derive(Debug, Deserialize)]
+struct SnapshotList {
+    snapshots: Vec<Snapshot>,
+    #[serde(default)]
+    next_cursor: Option<String>,
+}
+
+/// Parse `GET /snapshots`, refusing a reply that says there is more.
+fn parse_snapshot_list(body: &str) -> anyhow::Result<Vec<Snapshot>> {
+    let list: SnapshotList =
+        serde_json::from_str(body).context("failed to parse Tensorlake's snapshot listing")?;
+    if list.next_cursor.is_some_and(|c| !c.is_empty()) {
+        bail!(
+            "Tensorlake's snapshot listing is paginated now, which kd does not handle; \
+             refusing to act on a possibly partial list"
+        );
+    }
+    Ok(list.snapshots)
+}
+
+/// `GET /sandboxes/{id}`, reduced to the status `destroy` waits on.
+#[derive(Debug, Deserialize)]
+struct SandboxStatus {
+    status: String,
+}
+
+/// Check that an ID taken from a Tensorlake reply is safe to put in a URL
+/// path as is. Tensorlake's IDs are alphanumeric; anything outside
+/// `[A-Za-z0-9_-]` (a `/`, `?` or `..`) would change which resource the
+/// request names, so it is refused rather than encoded.
+fn path_segment(id: &str) -> anyhow::Result<&str> {
+    let safe = !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if !safe {
+        bail!("Tensorlake returned an ID kd will not put in a URL: {id:?}");
+    }
+    Ok(id)
+}
+
+/// The outcome of a delete that succeeded: the thing was removed now, or it
+/// was already gone (HTTP 404).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Gone {
+    Now,
+    Already,
+}
+
 // ── Client ───────────────────────────────────────────────────────────────
 
 /// A Tensorlake API client bound to one set of credentials.
@@ -294,12 +358,9 @@ impl Api {
         let mut sandboxes = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_PAGES {
-            let mut request = self.agent.get(format!("{API_BASE}/sandboxes"));
+            let mut request = self.authorized(self.agent.get(format!("{API_BASE}/sandboxes")));
             if let Some(cursor) = &cursor {
                 request = request.query("cursor", cursor);
-            }
-            for (name, value) in self.credentials.headers() {
-                request = request.header(name, value);
             }
             let response = request
                 .call()
@@ -315,6 +376,90 @@ impl Api {
             }
         }
         bail!("Tensorlake's sandbox listing did not end after {MAX_PAGES} pages")
+    }
+
+    /// Terminate a sandbox by ID (`DELETE /sandboxes/{id}`).
+    ///
+    /// Tensorlake documents this as idempotent for an already-terminated
+    /// sandbox. A 404 (the sandbox is gone from the project altogether) is
+    /// reported as [`Gone::Already`] rather than an error: the worker went
+    /// away between kd's listing and this call, which is the outcome the
+    /// caller wanted anyway.
+    pub(crate) fn terminate_sandbox(&self, id: &str) -> anyhow::Result<Gone> {
+        let url = format!("{API_BASE}/sandboxes/{}", path_segment(id)?);
+        self.delete(
+            self.authorized(self.agent.delete(url)),
+            "terminating the sandbox",
+        )
+    }
+
+    /// A sandbox's current status (`GET /sandboxes/{id}`), or `None` when
+    /// Tensorlake no longer knows it (404), which for a sandbox kd just
+    /// terminated means it is gone.
+    pub(crate) fn sandbox_status(&self, id: &str) -> anyhow::Result<Option<String>> {
+        let url = format!("{API_BASE}/sandboxes/{}", path_segment(id)?);
+        let response = self
+            .authorized(self.agent.get(url))
+            .call()
+            .map_err(|err| self.transport_error("reading the sandbox", err))?;
+        if response.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let body = self.read_success(response, "reading the sandbox")?;
+        let status: SandboxStatus =
+            serde_json::from_str(&body).context("failed to parse Tensorlake's sandbox record")?;
+        Ok(Some(status.status))
+    }
+
+    /// Every snapshot in the project (`GET /snapshots`).
+    ///
+    /// The listing had no cursor when checked (November 2026), so one reply
+    /// is the whole project. If a reply ever carries a cursor, kd refuses
+    /// rather than act on what may be a partial list: `destroy` uses this to
+    /// find a sandbox's leftover snapshots, and a silently missed one keeps
+    /// billing storage.
+    pub(crate) fn list_snapshots(&self) -> anyhow::Result<Vec<Snapshot>> {
+        let response = self
+            .authorized(self.agent.get(format!("{API_BASE}/snapshots")))
+            .call()
+            .map_err(|err| self.transport_error("listing snapshots", err))?;
+        let body = self.read_success(response, "listing snapshots")?;
+        parse_snapshot_list(&body)
+    }
+
+    /// Delete a snapshot by ID (`DELETE /snapshots/{id}`). A 404 means it is
+    /// already gone, reported as [`Gone::Already`].
+    pub(crate) fn delete_snapshot(&self, id: &str) -> anyhow::Result<Gone> {
+        let url = format!("{API_BASE}/snapshots/{}", path_segment(id)?);
+        self.delete(
+            self.authorized(self.agent.delete(url)),
+            "deleting the snapshot",
+        )
+    }
+
+    /// Send a `DELETE`, treating 404 as already gone and any other non-2xx
+    /// as an error.
+    fn delete(
+        &self,
+        request: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
+        what: &str,
+    ) -> anyhow::Result<Gone> {
+        let response = request
+            .call()
+            .map_err(|err| self.transport_error(what, err))?;
+        if response.status().as_u16() == 404 {
+            return Ok(Gone::Already);
+        }
+        self.read_success(response, what)?;
+        Ok(Gone::Now)
+    }
+
+    /// Attach the credential headers to a request.
+    fn authorized<B>(&self, mut request: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
+        for (name, value) in self.credentials.headers() {
+            request = request.header(name, value);
+        }
+        request
     }
 
     /// Turn a response into its body, or an error that carries the status
@@ -563,6 +708,40 @@ token = "tl_pat_example"
         let json = r#"{"sandboxes": [{"name": "tlworker-a", "status": "running",
                        "resources": {"cpus": 1.0, "memory_mb": 1024}}]}"#;
         assert!(serde_json::from_str::<SandboxPage>(json).is_err());
+    }
+
+    /// The observed `GET /snapshots` shape (November 2026), trimmed: kd
+    /// keeps the ID and source sandbox and ignores the rest, and a snapshot
+    /// with no source sandbox decodes too.
+    #[test]
+    fn snapshot_list_decodes_source_sandbox() {
+        let body = r#"{"snapshots": [
+            {"id": "snap1", "sandbox_id": "sbx1", "status": "completed", "size_bytes": 1},
+            {"id": "snap2", "status": "completed"}
+        ]}"#;
+        let snapshots = parse_snapshot_list(body).unwrap();
+        assert_eq!(snapshots[0].sandbox_id.as_deref(), Some("sbx1"));
+        assert_eq!(snapshots[1].sandbox_id, None);
+    }
+
+    /// A paginated snapshot listing would mean kd sees only part of it, and
+    /// a missed snapshot keeps billing; refuse instead of sweeping a part.
+    #[test]
+    fn snapshot_list_with_cursor_is_refused() {
+        let body = r#"{"snapshots": [], "next_cursor": "more"}"#;
+        assert!(parse_snapshot_list(body).is_err());
+        let body = r#"{"snapshots": [], "next_cursor": null}"#;
+        assert!(parse_snapshot_list(body).is_ok());
+    }
+
+    /// IDs go into URL paths unencoded, so anything that could change which
+    /// resource a request names is refused.
+    #[test]
+    fn path_segment_accepts_ids_and_refuses_path_syntax() {
+        assert_eq!(path_segment("abc-DEF_123").unwrap(), "abc-DEF_123");
+        for bad in ["", "a/b", "..", "a?b", "a b", "a%2f"] {
+            assert!(path_segment(bad).is_err(), "{bad:?}");
+        }
     }
 
     // ── error text ───────────────────────────────────────────────────────

@@ -416,6 +416,26 @@ so does the reasoning behind it.
   vCPUs and memory, as in `4 vCPU/16 GiB`; a fractional CPU count prints as such (`0.5 vCPU`), and memory that is not a
   whole number of GiB prints in MiB, so a sandbox made by hand is shown exactly. Suspended and pending sandboxes are
   included. Nothing at all goes to stdout when there are none; an info-level note goes to stderr instead.
+- `destroy` resolves names against that listing and then acts on the sandbox ID. Names only get the prefix added if
+  missing; they are not validated, so a tlworker made by hand stays reachable by the name `list` shows. Tensorlake
+  refuses a second sandbox with a name already in use, so a name matches at most one worker. Because the listing is
+  complete, the no-name form always sees every tlworker.
+- `destroy` keeps boatworker's semantics: names, `--all` (a no-op success when there are none), or the sole owned
+  worker; fail-closed resolution of every name before anything is terminated; deduplication of names that normalize to
+  the same worker; no confirmation prompt; every target attempted, then failure naming each worker that could not be
+  destroyed. A worker already gone when its termination is sent counts as destroyed.
+- Termination is asynchronous on Tensorlake's side, so after requesting it `destroy` waits, up to 30 seconds per worker,
+  until Tensorlake reports the sandbox terminated or no longer knows it. A worker caught suspending or snapshotting may
+  still be writing a snapshot until then. A worker that has not finished in time is reported as not destroyed and its
+  snapshots are left alone; it is still listed, so rerunning `destroy` picks it up.
+- Then `destroy` deletes every snapshot whose source is a sandbox it terminated in that run. Tensorlake snapshots a
+  named sandbox when it suspends on idle, and those snapshots survive termination and bill storage monthly. No other
+  snapshot is touched: not one whose source is some other sandbox, not one with no recorded source, and not the
+  snapshots of a worker whose termination failed or did not finish. A snapshot kd fails to delete, or a snapshot listing
+  kd cannot read in full, fails the command, naming the worker and the snapshot. Since that worker is already terminated
+  and no longer listed, rerunning `destroy` cannot find it; the error says to delete the snapshot by ID with
+  `tl sbx checkpoint rm`. The snapshot listing has no pagination as of November 2026; if Tensorlake adds it, kd refuses
+  rather than sweep a partial list.
 
 ## kd cargo scode
 

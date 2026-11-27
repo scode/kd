@@ -80,6 +80,17 @@ of exit status, and `query_data` tolerates `NOT_FOUND` while failing on any othe
   an error and discards the body. Every request also has an explicit timeout, because ureq 3 has none by default.
 - Tests cover pure functions only (credential resolution with the file read and environment injected, reply decoding,
   rendering). There is no stub HTTP server or fake API layer; live behavior is checked against Tensorlake itself.
+- `destroy` matches snapshots to workers by the snapshot's `sandbox_id` against the IDs it terminated in that run, never
+  by name. Names are reused, and a snapshot of an unrelated sandbox (a template, say) must survive. Matching after the
+  fact by name, or deleting every snapshot of any `tlworker-` sandbox, would be the "simpler" fix that deletes someone's
+  template.
+- `destroy` waits for each sandbox to reach `terminated` (or 404) before the sweep, polling `GET /sandboxes/{id}` once a
+  second for up to 30 seconds, the same bound farhelm uses before its own sweep. Removing the wait makes `destroy`
+  faster and lets it miss a snapshot a suspend was still writing, while still exiting 0.
+- A 404 from `DELETE /sandboxes/{id}` or `DELETE /snapshots/{id}` counts as success: the thing is already gone, which is
+  what the caller asked for. IDs taken from Tensorlake's replies go into URL paths only if they are plain
+  `[A-Za-z0-9_-]`; anything else is refused rather than encoded, since an ID containing `/` or `..` would name a
+  different resource.
 
 ## kd cli-proxy-api
 
