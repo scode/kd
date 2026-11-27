@@ -134,6 +134,10 @@ kd boatworker ssh
 kd boatworker ssh myname uptime
 kd boatworker ssh myname -t tmux attach
 
+# List Tensorlake worker sandboxes (names starting with tlworker-). Uses
+# TENSORLAKE_API_KEY if set, else the tl CLI's login (`tl login`).
+kd tlworker list
+
 # Show what is installed from github.com/scode, at which version and commit,
 # and which tools `update` would update (read-only).
 kd cargo scode status
