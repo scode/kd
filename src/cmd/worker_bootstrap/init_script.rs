@@ -4,7 +4,9 @@
 //! Each worker command delivers the script its own way. `kd ubiworker
 //! create` hands it to `ubi vm create` as the VM's init script, and `kd
 //! boatworker create` puts it behind a sudo prelude in a setup file for
-//! `boat new`. The script itself is the same for both, so the ordering and
+//! `boat new`, and `kd tlworker create` runs it itself through Tensorlake's
+//! process API, behind a wait for systemd. The script itself is the same for
+//! all of them, so the ordering and
 //! quoting arguments in [`render_init_script`] hold for every worker.
 
 use super::tailscale::is_valid_auth_key;
@@ -13,7 +15,7 @@ use std::collections::HashSet;
 
 /// Apt packages installed on every worker, in addition to whatever the
 /// operator requests via `--pkg` (see [`bootstrap_packages`]). Shared by
-/// both fleets, like the rest of the script. Deliberately empty for now —
+/// every fleet, like the rest of the script. Deliberately empty for now —
 /// there's no package kd itself needs on every worker unconditionally.
 pub(crate) const BASE_PACKAGES: &[&str] = &[];
 
@@ -99,11 +101,11 @@ pub(crate) fn bootstrap_packages(base: &[&str], extra: &[String]) -> Vec<String>
 /// SSH enabled — and, once that succeeds, bootstraps `packages` via apt.
 ///
 /// The script assumes it runs as root. Ubicloud runs its init script that
-/// way; boat runs setup files as an unprivileged user, so `kd boatworker
-/// create` re-runs this script under sudo rather than changing it. The
-/// remarks below about the Ubicloud-provisioned OpenSSH server and billing
-/// from boot are ubiworker's; the ordering and quoting arguments hold for
-/// both fleets.
+/// way; boat and Tensorlake start commands as an unprivileged user, so `kd
+/// boatworker create` and `kd tlworker create` run this script under sudo
+/// rather than changing it. The remarks below about the Ubicloud-provisioned
+/// OpenSSH server and billing from boot are ubiworker's; the ordering and
+/// quoting arguments hold for every fleet.
 ///
 /// # Package bootstrap
 ///
@@ -152,9 +154,9 @@ pub(crate) fn bootstrap_packages(base: &[&str], extra: &[String]) -> Vec<String>
 /// section, not by anything here (see SPEC.md).
 ///
 /// Retries the whole install-and-join sequence up to 5 times, 30 seconds
-/// apart, entirely inside the script (kd itself has already returned by the
-/// time this runs on the VM; neither worker command waits for the tailnet
-/// join). Ubicloud bills a VM from the moment it boots, so a single
+/// apart, entirely inside the script (`create` has usually returned by the
+/// time this runs; `kd tlworker create --wait` waits for the script but adds
+/// no retries of its own). Ubicloud bills a VM from the moment it boots, so a single
 /// transient hiccup during first boot — a flaky `curl`, a slow DNS answer,
 /// tailscaled's package momentarily unavailable — must not permanently
 /// strand an already-billed VM with no working path back to it. Retrying
@@ -258,6 +260,9 @@ bootstrap() {{
   '
 }}
 for attempt in 1 2 3 4 5; do
+  # A progress line for whoever watches the output: the console log on
+  # ubiworkers and boatworkers, `kd tlworker create --wait` on tlworkers.
+  echo "kd: enrollment attempt $attempt of 5" >&2
   if enroll; then
     # Best-effort: a bootstrap that fails to launch must not turn a
     # successfully enrolled worker into a script failure.

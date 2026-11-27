@@ -358,7 +358,7 @@ pub(crate) fn is_valid_auth_key(key: &str) -> bool {
 // ── Tailnet policy rule ──────────────────────────────────────────────────
 // `create` prints the one prerequisite kd can neither set up nor detect: an
 // `ssh` rule in the tailnet policy that lets the operator log in to the new
-// worker. Both worker commands print it, each for its own tag and Unix user.
+// worker. Every create command prints it, each for its own tag and Unix user.
 
 /// Where the tailnet policy file is edited, for the create summary's
 /// "go add the ssh rule" pointer. A console URL is the most precise

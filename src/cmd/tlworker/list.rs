@@ -45,7 +45,7 @@ fn render_row(worker: &Worker) -> String {
 /// so a hand-made sandbox with an odd size is shown exactly rather than
 /// rounded. CPUs are fractional in Tensorlake's API (`0.5` is valid), so a
 /// whole number drops the `.0` and anything else prints as given.
-fn render_shape(cpus: f64, memory_mb: u64) -> String {
+pub(super) fn render_shape(cpus: f64, memory_mb: u64) -> String {
     let memory = if memory_mb % 1024 == 0 {
         format!("{} GiB", memory_mb / 1024)
     } else {

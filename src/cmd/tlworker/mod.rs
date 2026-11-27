@@ -22,16 +22,75 @@
 //! sandbox kd looked at.
 
 pub mod api;
+pub mod create;
 pub mod destroy;
 pub mod list;
 pub mod ssh;
 
+use crate::cmd::worker_bootstrap::EnvVar;
+use anyhow::bail;
 use clap::{Args, Subcommand};
 use tracing::debug;
 
 /// Prefix marking a Tensorlake sandbox as a kd-managed tlworker (see module
 /// docs on the ownership convention).
 pub(crate) const NAME_PREFIX: &str = "tlworker-";
+
+/// Tailscale ACL tag on every auth key `create` mints, and so on every
+/// tlworker's tailnet node. Its own tag, not `tag:ubicloud` or `tag:boat`,
+/// so tailnet policy can treat the fleets separately and an OAuth client
+/// can be limited to minting keys for this one.
+pub(crate) const TAILSCALE_TAG: &str = "tag:tensorlake";
+
+/// Tailscale OAuth client id for minting tlworker auth keys. The same
+/// variable the other fleets read; the hint differs only in naming
+/// `tag:tensorlake`, which the client must own. A test pins the hint to
+/// [`TAILSCALE_TAG`].
+pub(crate) const TS_API_CLIENT_ID: EnvVar = EnvVar {
+    name: "TS_API_CLIENT_ID",
+    how_to_get: "open https://console.tailscale.com/admin/settings/trust-credentials, create an \
+                 OAuth credential with the auth_keys write scope and tag tag:tensorlake; the \
+                 client id is shown on the credential afterwards",
+};
+
+/// `kd tlworker create [NAME] [--cpus N] [--memory GIB] [--disk GIB] [--pkg PACKAGE]... [--wait]`
+/// arguments.
+#[derive(Args)]
+pub struct CreateArgs {
+    /// Worker name. Defaults to `tlworker-<local timestamp>`. A custom name
+    /// gets the `tlworker-` prefix prepended if it's missing, and must then
+    /// be a valid DNS label, since it is also the tailnet hostname.
+    pub name: Option<String>,
+
+    /// Apt package to install on the worker after it joins the tailnet
+    /// (repeatable). Installed asynchronously, with an `apt-get
+    /// dist-upgrade`, by the same `kd-bootstrap` unit as on ubiworkers; see
+    /// `kd ubiworker create --help`.
+    #[arg(long = "pkg", value_name = "PACKAGE")]
+    pub pkgs: Vec<String>,
+
+    /// Number of vCPUs. Whether the plan allows it is Tensorlake's to say.
+    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..))]
+    pub cpus: u32,
+
+    /// Memory in GiB. The default matches a ubiworker's 16 GiB.
+    #[arg(long, value_name = "GIB", default_value_t = 16,
+          value_parser = clap::value_parser!(u32).range(1..))]
+    pub memory: u32,
+
+    /// Root disk in GiB, always sent explicitly (Tensorlake's own default
+    /// is 10 GiB).
+    #[arg(long, value_name = "GIB", default_value_t = 100,
+          value_parser = clap::value_parser!(u32).range(1..))]
+    pub disk: u32,
+
+    /// Wait until the worker has joined the tailnet (usually a minute or
+    /// two), logging progress, and fail with the setup script's output if
+    /// enrollment fails. Without it, `create` returns once the sandbox runs
+    /// and enrollment carries on in the background, as on the other fleets.
+    #[arg(short, long)]
+    pub wait: bool,
+}
 
 /// The Unix account on every Tensorlake sandbox. Tensorlake's image
 /// provisions it (with passwordless sudo) and offers no way to choose
@@ -82,6 +141,18 @@ pub struct DestroyArgs {
 /// `kd tlworker` subcommands. Each one's doc comment is its `--help` text.
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Create a tlworker sandbox and enroll it into the tailnet
+    ///
+    /// Mints a one-use tailscale auth key (tag:tensorlake), starts a
+    /// Tensorlake sandbox from tensorlake/ubuntu-systemd, and runs the same
+    /// first-boot script as ubiworkers on it: install tailscale, join the
+    /// tailnet with Tailscale SSH, then bootstrap apt packages (`--pkg`) in
+    /// a detached unit. Returns once the sandbox runs, with enrollment
+    /// continuing in the background; with --wait, returns only once the
+    /// worker has joined the tailnet (a minute or two). The worker runs
+    /// until destroyed, apart from Tensorlake suspending it when idle past
+    /// the plan's maximum timeout.
+    Create(CreateArgs),
     /// Terminate one or more tlworker sandboxes and delete their snapshots
     ///
     /// Takes any number of names, or --all to destroy every owned tlworker.
@@ -112,6 +183,7 @@ pub enum Commands {
 impl Commands {
     pub fn run(self) -> anyhow::Result<()> {
         match self {
+            Commands::Create(args) => create::run(args),
             Commands::Destroy(args) => destroy::run(args),
             Commands::List => list::run(),
             Commands::Ssh(args) => ssh::run(args),
@@ -131,6 +203,64 @@ pub(crate) fn with_prefix(name: &str) -> String {
     } else {
         format!("{NAME_PREFIX}{name}")
     }
+}
+
+// ── Names for new workers ────────────────────────────────────────────────
+// Only `create` validates names; lookups just prefix (see `with_prefix`).
+
+/// Render the default worker name, `tlworker-YYYYMMDD-HHMMSS`, from a
+/// caller-supplied local timestamp (a parameter so tests can pin it).
+pub(crate) fn default_worker_name(now: &jiff::Zoned) -> String {
+    format!(
+        "{}{:04}{:02}{:02}-{:02}{:02}{:02}",
+        NAME_PREFIX,
+        now.year(),
+        now.month(),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second()
+    )
+}
+
+/// The name rule for a new tlworker: lowercase letters, digits and hyphens,
+/// at most 63 characters, starting with a lowercase letter and ending with
+/// a letter or digit.
+///
+/// This is Tensorlake's own sandbox-name rule, and it is also the DNS label
+/// rule the tailnet hostname needs (the name doubles as `tailscale up
+/// --hostname`), so one check covers both. Tensorlake additionally refuses
+/// names that are exactly 21 lowercase alphanumerics (they look like IDs),
+/// which a prefixed name, containing a hyphen, can never be. The charset
+/// is also what makes the name safe to interpolate into the first-boot
+/// script.
+fn has_valid_name_chars(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let is_alnum = |b: &u8| b.is_ascii_digit() || b.is_ascii_lowercase();
+    match (bytes.first(), bytes.last()) {
+        (Some(first), Some(last)) => {
+            bytes.len() <= 63
+                && first.is_ascii_lowercase()
+                && is_alnum(last)
+                && bytes.iter().all(|b| is_alnum(b) || *b == b'-')
+        }
+        _ => false,
+    }
+}
+
+/// Prefix (see [`with_prefix`]) and validate a name for a new worker against
+/// [`has_valid_name_chars`], before anything is minted or started.
+pub(crate) fn normalize_worker_name(name: &str) -> anyhow::Result<String> {
+    let prefixed = with_prefix(name);
+    if !has_valid_name_chars(&prefixed) {
+        bail!(
+            "invalid worker name '{prefixed}': must be lowercase letters, digits and hyphens, at \
+             most 63 characters, and must not end with a hyphen (Tensorlake's name rule, and the \
+             name is also the worker's tailnet hostname; checked after adding the 'tlworker-' \
+             prefix)"
+        );
+    }
+    Ok(prefixed)
 }
 
 // ── Worker listing ───────────────────────────────────────────────────────
@@ -198,6 +328,43 @@ mod tests {
                 memory_mb: 16384,
             },
         }
+    }
+
+    /// The default name comes from the supplied local time and passes the
+    /// name rule, or every `create` without a name would fail.
+    #[test]
+    fn default_worker_name_formats_fixed_instant_and_is_valid() {
+        let now = jiff::civil::date(2026, 8, 3)
+            .at(15, 4, 5, 0)
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .unwrap();
+        let name = default_worker_name(&now);
+        assert_eq!(name, "tlworker-20260803-150405");
+        assert!(has_valid_name_chars(&name));
+    }
+
+    /// Every way out of the rule is refused: uppercase, underscore, space,
+    /// quote, a trailing hyphen (including the empty custom name, which
+    /// leaves just the prefix), and over 63 characters after prefixing.
+    #[test]
+    fn normalize_worker_name_rejects_names_outside_the_rule() {
+        let too_long = "a".repeat(64 - NAME_PREFIX.len());
+        for name in ["Foo", "foo_bar", "foo bar", "it's", "foo-", "", &too_long] {
+            assert!(
+                normalize_worker_name(name).is_err(),
+                "{name:?} should be rejected"
+            );
+        }
+        let max = "a".repeat(63 - NAME_PREFIX.len());
+        assert_eq!(normalize_worker_name(&max).unwrap().len(), 63);
+        assert_eq!(normalize_worker_name("foo-1").unwrap(), "tlworker-foo-1");
+    }
+
+    /// The credential hint names the tag the OAuth client must own; this
+    /// keeps it from drifting if the tag ever changes.
+    #[test]
+    fn tailscale_client_id_hint_names_the_tensorlake_tag() {
+        assert!(TS_API_CLIENT_ID.how_to_get.contains(TAILSCALE_TAG));
     }
 
     /// A bare name and its prefixed form must name the same worker, which is

@@ -91,6 +91,28 @@ of exit status, and `query_data` tolerates `NOT_FOUND` while failing on any othe
   what the caller asked for. IDs taken from Tensorlake's replies go into URL paths only if they are plain
   `[A-Za-z0-9_-]`; anything else is refused rather than encoded, since an ID containing `/` or `..` would name a
   different resource.
+- `create` runs the shared `worker_bootstrap::init_script::render_init_script` unchanged, behind a tlworker prefix that
+  deletes the script file and waits for systemd. Do not fold that wait into the shared renderer: Ubicloud and boat do
+  not need it, and the shared script is what all three fleets run. Do not replace the stdin-into-`mktemp` delivery with
+  `sh` reading the script from stdin: a command in the script that reads stdin would eat the rest of it. The file API
+  was the other option. It cannot set a mode, so it would need a mode-0700 directory made first and a separate delete;
+  that works, but it is two more calls for the same result. The script runs under `sudo -n` as the image's default user.
+  The process API's `user` field might run it as root directly, but that was not tried, and passwordless sudo for
+  `tl-user` is what the live runs confirmed.
+- The process API is reached at `https://<sandbox-id>.sandbox.tensorlake.ai`, built from the ID, because the create
+  reply does not carry the sandbox URL; every sandbox observed (November 2026) reported exactly that `sandbox_url`.
+- `POST /sandboxes` gets a 600-second timeout (farhelm's), not the 30-second timeout of the other calls, because with
+  `wait` the request stays open until the sandbox runs. `max_pending_secs` is 480, below that timeout, so Tensorlake
+  normally gives up on placement before kd gives up on the request. Only a 4xx reply counts as "nothing was created";
+  treating a timeout or a 5xx the same way would hide a sandbox that may be billing.
+
+- Without `--wait`, `create` returns once the script's process has started and its stdin is closed. That is safe because
+  the process belongs to the sandbox, not to kd's HTTP connection: a live run (November 2026) saw the worker join the
+  tailnet about 16 seconds after kd had exited.
+- `--wait` relays the script's `kd:` lines by content, remembering which it has logged, not by counting lines already
+  seen. Every read of the process output returns all of it, but not as an append-only list: in a live run the combined
+  view put newer stdout lines ahead of older stderr ones, and position-based deduplication logged the same lines
+  repeatedly. Each `kd:` line is distinct within a run (the enrollment attempts are numbered), so content works.
 
 ## kd cli-proxy-api
 

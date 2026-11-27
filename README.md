@@ -134,8 +134,17 @@ kd boatworker ssh
 kd boatworker ssh myname uptime
 kd boatworker ssh myname -t tmux attach
 
-# List Tensorlake worker sandboxes (names starting with tlworker-). Uses
-# TENSORLAKE_API_KEY if set, else the tl CLI's login (`tl login`).
+# Create a Tensorlake worker sandbox that enrolls into the tailnet
+# (tag:tensorlake) like a ubiworker. Same name and --pkg handling as ubiworker
+# create; --cpus/--memory/--disk (GiB) set the shape (default 4/16/100).
+# --wait (-w) waits until the worker is on the tailnet, logging progress,
+# and shows the setup script's output if enrollment fails.
+# Tensorlake access uses TENSORLAKE_API_KEY if set, else the tl CLI's login.
+kd tlworker create
+kd tlworker create myname --pkg build-essential --cpus 2 --memory 8 --disk 40
+kd tlworker create myname --wait
+
+# List Tensorlake worker sandboxes (names starting with tlworker-).
 kd tlworker list
 
 # Terminate tlworker sandbox(es) and delete the snapshots Tensorlake kept of
