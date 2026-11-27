@@ -329,6 +329,28 @@ mod tests {
         assert!(!parses(&["kd", "tlworker", "destroy", "a", "--yes"]));
     }
 
+    /// `kd tlworker ssh` shares `kd ubiworker ssh`'s single trailing
+    /// capture, so after the name every token, flag-shaped or not (even
+    /// `-v`), belongs to ssh rather than to kd.
+    #[test]
+    fn tlworker_ssh_captures_forwarded_args_after_name() {
+        let cli = TestCli::try_parse_from(["kd", "tlworker", "ssh", "foo", "-L", "8:x:80", "-v"])
+            .expect("expected a successful parse");
+        let Commands::Tlworker {
+            cmd: tlworker::Commands::Ssh(ssh_args),
+        } = cli.command
+        else {
+            panic!("expected `tlworker ssh` args");
+        };
+        let args: Vec<String> = ssh_args
+            .args
+            .iter()
+            .map(|a| a.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(args, vec!["foo", "-L", "8:x:80", "-v"]);
+        assert_eq!(cli.verbose, 0);
+    }
+
     #[test]
     fn ubiworker_create_parses() {
         assert!(parses(&["kd", "ubiworker", "create"]));

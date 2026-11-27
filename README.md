@@ -144,6 +144,12 @@ kd tlworker destroy
 kd tlworker destroy myname otherworker
 kd tlworker destroy --all
 
+# Connect to a tlworker over Tailscale SSH as tl-user, with ubiworker ssh's
+# argument rules (with no name, the sole tlworker).
+kd tlworker ssh
+kd tlworker ssh myname uptime
+kd tlworker ssh myname -L 8080:localhost:80
+
 # Show what is installed from github.com/scode, at which version and commit,
 # and which tools `update` would update (read-only).
 kd cargo scode status
