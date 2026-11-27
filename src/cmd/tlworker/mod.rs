@@ -24,6 +24,7 @@
 pub mod api;
 pub mod destroy;
 pub mod list;
+pub mod ssh;
 
 use clap::{Args, Subcommand};
 use tracing::debug;
@@ -31,6 +32,38 @@ use tracing::debug;
 /// Prefix marking a Tensorlake sandbox as a kd-managed tlworker (see module
 /// docs on the ownership convention).
 pub(crate) const NAME_PREFIX: &str = "tlworker-";
+
+/// The Unix account on every Tensorlake sandbox. Tensorlake's image
+/// provisions it (with passwordless sudo) and offers no way to choose
+/// another, so unlike ubiworker's account it does not follow the operator's
+/// local username. kd does not create an account of its own either.
+pub(crate) const UNIX_USER: &str = "tl-user";
+
+/// `kd tlworker ssh [ARGS...]` arguments.
+///
+/// A single trailing capture rather than a name positional plus a separate
+/// argument vector, for the reason `kd ubiworker ssh` documents on its own
+/// `SshArgs`: with two positionals, clap's global `-v`/`-q` would steal a
+/// flag-shaped token meant for ssh once the name was filled.
+/// `ssh::split_target` then reads the first element as an optional worker
+/// name. `OsString` so arguments reach `tailscale ssh` byte for byte.
+#[derive(Args)]
+pub struct SshArgs {
+    /// Optionally a worker name, then arguments forwarded verbatim to
+    /// `tailscale ssh` after the destination: a remote command, or ssh's own
+    /// flags.
+    ///
+    /// The first element is the worker name unless it starts with `-`. A
+    /// leading `-v`, `-q` or `-h` (or `--verbose`, `--quiet`, `--help`) is
+    /// claimed by kd itself, as anywhere else on the command line; use `--`
+    /// to force it through to ssh.
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "NAME_OR_SSH_ARG"
+    )]
+    pub args: Vec<std::ffi::OsString>,
+}
 
 /// `kd tlworker destroy [NAME...] [--all]` arguments.
 #[derive(Args)]
@@ -65,6 +98,15 @@ pub enum Commands {
     /// CPUs/memory, and Tensorlake's status. Suspended and pending
     /// sandboxes are included; terminated ones are not.
     List,
+    /// Connect to an owned tlworker over Tailscale SSH
+    ///
+    /// With no name, targets the sole existing tlworker, like `destroy`.
+    /// The first argument is the worker name unless it starts with `-`;
+    /// everything after it goes to `tailscale ssh tl-user@<name>` unchanged
+    /// (a remote command, or ssh flags such as `-L`). kd execs into
+    /// `tailscale ssh`, replacing itself. A worker that is not running
+    /// (suspended, say) is off the tailnet; kd warns and connects anyway.
+    Ssh(SshArgs),
 }
 
 impl Commands {
@@ -72,6 +114,7 @@ impl Commands {
         match self {
             Commands::Destroy(args) => destroy::run(args),
             Commands::List => list::run(),
+            Commands::Ssh(args) => ssh::run(args),
         }
     }
 }

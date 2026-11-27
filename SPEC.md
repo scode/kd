@@ -436,6 +436,21 @@ so does the reasoning behind it.
   and no longer listed, rerunning `destroy` cannot find it; the error says to delete the snapshot by ID with
   `tl sbx checkpoint rm`. The snapshot listing has no pagination as of November 2026; if Tensorlake adds it, kd refuses
   rather than sweep a partial list.
+- `ssh` is `kd ubiworker ssh` over Tensorlake's listing: the same single trailing argument vector and first-element rule
+  (sound because a Tensorlake name must start with a lowercase letter), the same resolution (a name, or the sole owned
+  worker), and an exec into `tailscale ssh tl-user@<name>` followed by the remaining arguments verbatim, with no
+  host-key options. It relies on the worker having enrolled under its sandbox name as its tailnet hostname, which is
+  what `create` does; a `tlworker-` sandbox made by hand that never enrolled, or one renamed after enrolling, is listed
+  but not reachable this way. The account is Tensorlake's fixed `tl-user` (passwordless sudo); kd creates no account of
+  its own. Reaching it needs the tailnet policy rules ubiworker's section describes, for `tl-user` on `tag:tensorlake`
+  rather than the local username on `tag:ubicloud`. Before the exec, `TENSORLAKE_API_KEY`, `TS_API_CLIENT_ID`,
+  `TS_API_CLIENT_SECRET` and `TS_DEBUG_SSH_EXEC` are removed from the child's environment. On an exec failure, the error
+  names the program and destination, never the forwarded arguments.
+- A tlworker that is not running (suspended, still pending, or in some other state) is not reachable over the tailnet,
+  and kd does not resume it. `ssh` warns, naming the status, and connects anyway, so the connection error says the rest.
+  For a suspended worker the warning also names `tl sbx resume <id>`. A resumed worker may still not come back on the
+  tailnet: it enrolled as an ephemeral node, and Tailscale removes ephemeral nodes that stay offline, so a worker
+  suspended for long may need to be recreated.
 
 ## kd cargo scode
 
