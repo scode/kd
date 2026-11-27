@@ -317,6 +317,26 @@ mod tests {
         assert!(!parses(&["kd", "tlworker", "frobnicate"]));
     }
 
+    /// `tlworker create` takes the other fleets' optional name and
+    /// repeatable `--pkg`, plus whole-number sizes, so a zero or a
+    /// fractional size fails before an auth key is minted.
+    #[test]
+    fn tlworker_create_parses_with_positive_whole_sizes() {
+        assert!(parses(&["kd", "tlworker", "create"]));
+        assert!(parses(&[
+            "kd", "tlworker", "create", "myname", "--pkg", "git"
+        ]));
+        assert!(parses(&[
+            "kd", "tlworker", "create", "--cpus", "2", "--memory", "8", "--disk", "20"
+        ]));
+        assert!(!parses(&["kd", "tlworker", "create", "--cpus", "0"]));
+        assert!(!parses(&["kd", "tlworker", "create", "--memory", "1.5"]));
+        assert!(!parses(&["kd", "tlworker", "create", "--disk", "0"]));
+        assert!(!parses(&["kd", "tlworker", "create", "--ttl", "3h"]));
+        assert!(parses(&["kd", "tlworker", "create", "--wait"]));
+        assert!(parses(&["kd", "tlworker", "create", "myname", "-w"]));
+    }
+
     /// `tlworker destroy` mirrors the other fleets' shape: names, `--all`
     /// excluding names, and no `--yes` (there is no prompt to skip).
     #[test]

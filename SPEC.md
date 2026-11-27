@@ -372,10 +372,11 @@ the reasoning behind it.
   after the sandbox reports ready, as the unprivileged `user` account. kd puts a short prelude in front of ubiworker's
   script that re-runs the file under `sudo -n /bin/sh`, since the script assumes root, and then deletes the file: boat
   leaves setup files on the sandbox readable by every local account, and the key in it stays valid for up to an hour if
-  enrollment fails. The auth key is in the file and never in any process's argv, unlike `kd ubiworker create`, which
-  passes the script to `ubi` as an argument. The key still reaches boat's API, as it reaches Ubicloud's for a ubiworker.
-  kd's local copy is a private temp file removed when `create` finishes or fails; an interrupt while `boat new` runs can
-  leave it behind.
+  enrollment fails. The auth key is in the file and never in the argv of kd or of any process kd starts, unlike
+  `kd ubiworker create`, which passes the script to `ubi` as an argument. The key still reaches boat's API, as it
+  reaches Ubicloud's for a ubiworker, and on the worker it is in `tailscale up`'s argv while that runs, as on every
+  fleet. kd's local copy is a private temp file removed when `create` finishes or fails; an interrupt while `boat new`
+  runs can leave it behind.
 - `create` returns once `boat new` reports the sandbox ready. Enrollment then runs in the background; `boat info <id>`
   reports its progress as the setup status (`done` once the worker has joined the tailnet and launched `kd-bootstrap`,
   `failed` with an exit code otherwise). If `boat new` fails, or succeeds without output kd can read the sandbox id and
@@ -451,6 +452,52 @@ so does the reasoning behind it.
   For a suspended worker the warning also names `tl sbx resume <id>`. A resumed worker may still not come back on the
   tailnet: it enrolled as an ephemeral node, and Tailscale removes ephemeral nodes that stay offline, so a worker
   suspended for long may need to be recreated.
+- `create` makes a tlworker come up on the tailnet as a ubiworker does: a one-use, ephemeral, preauthorized auth key
+  that expires after an hour, tagged `tag:tensorlake` (its own tag, so tailnet policy can treat the fleets separately),
+  and the same first-boot script (Tailscale installer, `tailscale up --ssh` with the worker name as hostname and the
+  same retry loop, then the detached `kd-bootstrap` unit running `apt-get dist-upgrade` and `apt-get satisfy` for the
+  `--pkg` packages). `create` preflights `TS_API_CLIENT_ID` and `TS_API_CLIENT_SECRET`, and the Tensorlake credentials,
+  before minting a key or starting anything.
+- The worker name is the tailnet hostname, so a name given to `create` is held to Tensorlake's own name rule, which is
+  also the DNS label rule: lowercase letters, digits and hyphens, at most 63 characters, starting with a letter and not
+  ending with a hyphen, checked after the prefix is added. The default name is `tlworker-YYYYMMDD-HHMMSS` in local time.
+  A name already in use is Tensorlake's to refuse (HTTP 409); kd then says the name is taken, without the "a sandbox may
+  exist" warning of other failures, since nothing was created. The auth key minted for that attempt is never used and
+  expires within the hour.
+- Every tlworker is started from the `tensorlake/ubuntu-systemd` image, with no fallback image: the first-boot script
+  needs systemd as PID 1. It is named, with the timeout set to the plan's maximum (`timeout_secs: 0`: 24 hours on Usage
+  Credits, unlimited on Pro), auto-resume off (traffic through Tensorlake's proxy cannot wake, and bill, a suspended
+  worker), and an 8-minute bound on waiting for capacity, after which Tensorlake terminates the pending sandbox. kd
+  offers no TTL, no idle-timeout choice and no suspend or resume. The summary says that a worker suspended by Tensorlake
+  is off the tailnet and is better recreated than resumed.
+- `--cpus N` (default 4), `--memory GIB` (default 16, a ubiworker's memory) and `--disk GIB` (default 100) are the shape
+  the caller chooses, each a positive whole number. kd checks nothing that depends on the plan (its caps, the allowed
+  memory-to-CPU ratio, the disk range); Tensorlake refuses what the plan does not allow, and its text is shown. Disk is
+  always sent, never left at Tensorlake's 10 GiB default.
+- Tensorlake has no first-boot hook, so `create` starts the script itself once the sandbox is running, through
+  Tensorlake's process API. Before the shared script, kd's own prefix checks that PID 1 is systemd and waits up to 3
+  minutes for `systemctl is-system-running` to report `running` or `degraded`. By default `create` returns as soon as
+  the script has started, and enrollment carries on in the background, as on the other fleets: the process belongs to
+  the sandbox, not to kd's connection. The summary then says enrollment is in progress and names `tailscale status` and,
+  for a machine with the `tl` CLI, `tl sbx ps <id> <pid>` for checking on it; a failed enrollment shows up only as a
+  worker missing from the tailnet.
+- `-w`/`--wait` makes `create` stay until the script exits, up to 10 minutes: a minute or two in practice, then either a
+  summary saying the worker is enrolled or an error with the end of the script's output. While it waits it logs the
+  script's progress lines (waiting for systemd, systemd up, each enrollment attempt) as they appear, and a "still
+  setting up the worker" line when nothing else has been logged for 30 seconds. The shared script prints one
+  `kd: enrollment attempt N of 5` line per attempt for this; on the other fleets it lands in their boot logs. The
+  `kd-bootstrap` unit runs in the background after `create` returns either way. A create request Tensorlake refuses
+  outright (HTTP 4xx: a taken name, a size the plan forbids, rejected credentials) created nothing and is reported as
+  such. Any other failure after the request was sent (a timeout, a 5xx, a reply kd cannot read) says that a sandbox
+  under the requested name may exist and bill, and how to destroy it; a failure once the sandbox is known to be running
+  names its ID and says it exists until destroyed. With `--wait`, a script still running at the 10-minute bound is left
+  running and reported with the end of its output so far.
+- The script reaches the sandbox on a process's stdin and is copied, as root, into a root-only `mktemp` file that the
+  script deletes as its first step. The auth key is never in the argv of kd or of any process kd starts. It reaches
+  Tensorlake's API, as it reaches Ubicloud's and boat's, and on the worker it is in `tailscale up`'s argv while that
+  runs, as on the other fleets.
+- The Unix account is Tensorlake's fixed `tl-user` (passwordless sudo). The printed summary's example tailnet `ssh` rule
+  grants `tl-user` on `tag:tensorlake`, with the same `src` rules as ubiworker's; a tag is also a valid `src`.
 
 ## kd cargo scode
 

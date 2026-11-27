@@ -1,7 +1,8 @@
-//! What `kd ubiworker create` and `kd boatworker create` share for bringing
-//! up a new worker: Tailscale enrollment and the first-boot script.
+//! What `kd ubiworker create`, `kd boatworker create` and `kd tlworker
+//! create` share for bringing up a new worker: Tailscale enrollment and the
+//! first-boot script.
 //!
-//! Both fleets come up on the tailnet the same way. [`tailscale`] mints a
+//! Every fleet comes up on the tailnet the same way. [`tailscale`] mints a
 //! one-use auth key for the fleet's tag, reads the operator's own login, and
 //! renders the policy rule `create` prints. [`init_script`] renders the root
 //! shell script that joins the tailnet with Tailscale SSH and then
@@ -12,11 +13,11 @@
 //! What differs between the fleets is passed in: the Tailscale tag, the
 //! key's label, and the Unix user in the printed rule. Everything that only
 //! one fleet needs stays with its command, including how the script reaches
-//! the machine (`ubi vm create`'s init script, a setup file for `boat new`)
-//! and the summary `create` prints. A change here changes what every new
-//! worker of both kinds runs on first boot.
+//! the machine (`ubi vm create`'s init script, a setup file for `boat new`,
+//! Tensorlake's process API) and the summary `create` prints. A change here
+//! changes what every new worker of every kind runs on first boot.
 //!
-//! The env preflight below lives here as well because both commands read the
+//! The env preflight below lives here as well because every create command reads the
 //! same Tailscale OAuth pair through it. ubiworker's other subcommands also
 //! use it, for `UBI_TOKEN`.
 

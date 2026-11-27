@@ -56,6 +56,27 @@ pub(crate) const API_KEY_VAR: &str = "TENSORLAKE_API_KEY";
 /// otherwise hang the command forever.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The bound on `POST /sandboxes`, which with `wait` holds the request open
+/// until the sandbox runs. Farhelm uses the same 600 seconds; the 30-second
+/// [`CALL_TIMEOUT`] would cut off an ordinary create and leave a sandbox
+/// running that kd never heard about. See [`MAX_PENDING_SECS`] for how the
+/// two bounds relate.
+const CREATE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The image every tlworker boots: Tensorlake's Ubuntu with systemd as PID
+/// 1, which the shared first-boot script needs (Tailscale's installer
+/// starts `tailscaled` as a service, and the package bootstrap is a
+/// `systemd-run` unit). There is deliberately no fallback image.
+pub(crate) const IMAGE: &str = "tensorlake/ubuntu-systemd";
+
+/// The longest a new sandbox may wait for capacity at Tensorlake before
+/// Tensorlake gives up on it and terminates it (`max_pending_secs`), so a
+/// create whose reply is lost cannot leave a pending sandbox around
+/// indefinitely. Shorter than [`CREATE_TIMEOUT`], so in the ordinary case
+/// Tensorlake gives up on placement before kd gives up on the request, and
+/// a kd timeout means something other than a long capacity wait.
+const MAX_PENDING_SECS: u64 = 480;
+
 /// The most response body kd reads. Listings are a page of sandboxes, far
 /// below this; the cap only stops a misbehaving server from filling memory.
 const MAX_BODY_BYTES: u64 = 16 * 1024 * 1024;
@@ -298,6 +319,63 @@ fn parse_snapshot_list(body: &str) -> anyhow::Result<Vec<Snapshot>> {
     Ok(list.snapshots)
 }
 
+/// `POST /sandboxes` was refused outright (HTTP 4xx): a taken name, a size
+/// the plan does not allow, rejected credentials. A type of its own because
+/// a refusal certainly created nothing, unlike a timeout, a 5xx or an
+/// unreadable reply, after which a sandbox may exist. The `create` command
+/// must not answer a refusal with "a sandbox may exist, destroy it": after
+/// a 409 that would point at the worker that already has the name, and
+/// `destroy` has no prompt.
+#[derive(Debug)]
+pub(crate) struct CreateRefused(String);
+
+impl std::fmt::Display for CreateRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CreateRefused {}
+
+/// `POST /sandboxes` with `wait`, reduced to what `create` checks.
+#[derive(Debug, Deserialize)]
+struct CreatedSandbox {
+    sandbox_id: String,
+    status: String,
+}
+
+/// A sandbox process, from the process API, reduced to what `create` waits
+/// on. `status` is `running` until the process ends, then `exited`,
+/// `signaled` or `oom_killed`; kept as text so a state Tensorlake adds later
+/// reads as "ended" rather than failing the decode.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ProcessInfo {
+    pub(crate) pid: u32,
+    pub(crate) status: String,
+    #[serde(default)]
+    pub(crate) exit_code: Option<i32>,
+    #[serde(default)]
+    pub(crate) signal: Option<i32>,
+}
+
+/// `GET /api/v1/processes/{pid}/output`.
+#[derive(Debug, Deserialize)]
+struct ProcessOutput {
+    lines: Vec<String>,
+}
+
+/// The base URL of a sandbox's own API host, where the process API lives:
+/// `https://<id>.sandbox.tensorlake.ai`, the `sandbox_url` Tensorlake
+/// reports for every sandbox observed (November 2026). It is built from the
+/// ID rather than read from the record because the create reply does not
+/// carry it; the ID is checked first, since it becomes part of a hostname.
+fn sandbox_base(sandbox_id: &str) -> anyhow::Result<String> {
+    Ok(format!(
+        "https://{}.sandbox.tensorlake.ai",
+        path_segment(sandbox_id)?
+    ))
+}
+
 /// `GET /sandboxes/{id}`, reduced to the status `destroy` waits on.
 #[derive(Debug, Deserialize)]
 struct SandboxStatus {
@@ -435,6 +513,154 @@ impl Api {
             self.authorized(self.agent.delete(url)),
             "deleting the snapshot",
         )
+    }
+
+    /// Create and start a named tlworker sandbox (`POST /sandboxes`),
+    /// waiting until Tensorlake reports it running, and return its ID.
+    ///
+    /// The settings are the fixed tlworker shape apart from the size:
+    ///
+    /// - [`IMAGE`], with no fallback.
+    /// - `timeout_secs: 0`, which Tensorlake takes as the plan's maximum (24
+    ///   hours on Usage Credits, unlimited on Pro). The timeout cannot be
+    ///   changed after creation, and a worker is meant to live until
+    ///   destroyed.
+    /// - `auto_resume: false`, so stray traffic through Tensorlake's proxy
+    ///   cannot silently resume, and bill, a suspended worker.
+    /// - `max_pending_secs`, see [`MAX_PENDING_SECS`].
+    ///
+    /// Disk is always sent; Tensorlake's default is 10 GiB. Sizes the plan
+    /// does not allow are Tensorlake's to refuse, and its text says why. A
+    /// taken name is refused with 409, which is how names stay unique.
+    pub(crate) fn create_sandbox(
+        &self,
+        name: &str,
+        cpus: u32,
+        memory_mb: u64,
+        disk_mb: u64,
+    ) -> anyhow::Result<String> {
+        let body = serde_json::json!({
+            "name": name,
+            "image": IMAGE,
+            "resources": {"cpus": cpus, "memory_mb": memory_mb, "disk_mb": disk_mb},
+            "timeout_secs": 0,
+            "auto_resume": false,
+            "max_pending_secs": MAX_PENDING_SECS,
+            "wait": true,
+        });
+        let response = self
+            .authorized(self.agent.post(format!("{API_BASE}/sandboxes")))
+            .config()
+            .timeout_global(Some(CREATE_TIMEOUT))
+            .build()
+            .send_json(&body)
+            .map_err(|err| self.transport_error("creating the sandbox", err))?;
+        let status = response.status().as_u16();
+        if status == 409 {
+            return Err(CreateRefused(format!(
+                "a sandbox named '{name}' already exists; pick another name, or destroy that one \
+                 first"
+            ))
+            .into());
+        }
+        if (400..500).contains(&status) {
+            // `read_success` builds the usual error text (Tensorlake's reason,
+            // the credential remedy for 401/403); only its type changes, so
+            // the caller can tell a refusal from an uncertain outcome.
+            let err = match self.read_success(response, "creating the sandbox") {
+                Ok(_) => anyhow!("creating the sandbox failed: Tensorlake answered HTTP {status}"),
+                Err(err) => err,
+            };
+            return Err(CreateRefused(format!("{err:#}")).into());
+        }
+        let reply = self.read_success(response, "creating the sandbox")?;
+        let created: CreatedSandbox =
+            serde_json::from_str(&reply).context("failed to parse Tensorlake's create reply")?;
+        if created.status != "running" {
+            bail!(
+                "Tensorlake created sandbox {} but reports it {}, not running",
+                created.sandbox_id,
+                created.status
+            );
+        }
+        Ok(created.sandbox_id)
+    }
+
+    /// Start `command` with `args` in a sandbox, with stdin as a pipe and
+    /// output captured (`POST /api/v1/processes` on the sandbox's own host),
+    /// and return its PID. It runs as the image's default user.
+    pub(crate) fn start_process(
+        &self,
+        sandbox_id: &str,
+        command: &str,
+        args: &[&str],
+    ) -> anyhow::Result<u32> {
+        let body = serde_json::json!({
+            "command": command,
+            "args": args,
+            "stdin_mode": "pipe",
+            "stdout_mode": "capture",
+            "stderr_mode": "capture",
+        });
+        let url = format!("{}/api/v1/processes", sandbox_base(sandbox_id)?);
+        let response = self
+            .authorized(self.agent.post(url))
+            .send_json(&body)
+            .map_err(|err| self.transport_error("starting a process", err))?;
+        let reply = self.read_success(response, "starting a process")?;
+        let info: ProcessInfo =
+            serde_json::from_str(&reply).context("failed to parse Tensorlake's process reply")?;
+        Ok(info.pid)
+    }
+
+    /// Write `bytes` to a process's stdin and then close it, delivering EOF.
+    pub(crate) fn feed_stdin(
+        &self,
+        sandbox_id: &str,
+        pid: u32,
+        bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        let base = format!("{}/api/v1/processes/{pid}/stdin", sandbox_base(sandbox_id)?);
+        let response = self
+            .authorized(self.agent.post(&base))
+            .header("Content-Type", "application/octet-stream")
+            .send(bytes)
+            .map_err(|err| self.transport_error("writing to the process", err))?;
+        self.read_success(response, "writing to the process")?;
+        let response = self
+            .authorized(self.agent.post(format!("{base}/close")))
+            .send_empty()
+            .map_err(|err| self.transport_error("closing the process's stdin", err))?;
+        self.read_success(response, "closing the process's stdin")?;
+        Ok(())
+    }
+
+    /// A process's current state (`GET /api/v1/processes/{pid}`).
+    pub(crate) fn process(&self, sandbox_id: &str, pid: u32) -> anyhow::Result<ProcessInfo> {
+        let url = format!("{}/api/v1/processes/{pid}", sandbox_base(sandbox_id)?);
+        let response = self
+            .authorized(self.agent.get(url))
+            .call()
+            .map_err(|err| self.transport_error("reading the process", err))?;
+        let reply = self.read_success(response, "reading the process")?;
+        serde_json::from_str(&reply).context("failed to parse Tensorlake's process reply")
+    }
+
+    /// A process's captured stdout and stderr, combined, one entry per line
+    /// (`GET /api/v1/processes/{pid}/output`).
+    pub(crate) fn process_output(&self, sandbox_id: &str, pid: u32) -> anyhow::Result<Vec<String>> {
+        let url = format!(
+            "{}/api/v1/processes/{pid}/output",
+            sandbox_base(sandbox_id)?
+        );
+        let response = self
+            .authorized(self.agent.get(url))
+            .call()
+            .map_err(|err| self.transport_error("reading the process output", err))?;
+        let reply = self.read_success(response, "reading the process output")?;
+        let output: ProcessOutput =
+            serde_json::from_str(&reply).context("failed to parse Tensorlake's process output")?;
+        Ok(output.lines)
     }
 
     /// Send a `DELETE`, treating 404 as already gone and any other non-2xx
